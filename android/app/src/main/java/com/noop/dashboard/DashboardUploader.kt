@@ -55,14 +55,24 @@ object DashboardUploader {
     private const val WORK = "whoop_garmin_dashboard_upload"
     private const val PREFS = "dashboard_uploader"
 
-    /** How far back to re-send every run. Re-sending an overlapping window is
-     *  intentional: the server upserts, and the strap's own store is only ~14
-     *  days deep, so a gap that scrolls off it is gone for good. */
+    /** How far back to re-send on a ROUTINE run. Re-sending an overlapping
+     *  window is intentional: the server upserts, and the strap's own store is
+     *  only ~14 days deep, so a gap that scrolls off it is gone for good. */
     private const val LOOKBACK_DAYS = 21L
 
-    /** Room requires an explicit LIMIT on the sleep read. Three weeks of nights
-     *  plus naps is nowhere near this. */
-    private const val SLEEP_ROW_LIMIT = 500
+    /** How far back on the FIRST run against an empty server.
+     *
+     * A fixed 21-day window is wrong for the initial sync: a store seeded from
+     * a WHOOP CSV export can hold years of nights, and if none of them fall in
+     * the last three weeks the uploader sends nothing and reports success —
+     * which looks identical to "working, nothing new". Ask the server what it
+     * has; if it has nothing, send everything. */
+    private const val BACKFILL_DAYS = 3650L
+
+    /** Room requires an explicit LIMIT on the sleep read. Sized for a full
+     *  backfill (a multi-year imported history), not just three weeks — a
+     *  silent truncation here would lose the oldest nights without a word. */
+    private const val SLEEP_ROW_LIMIT = 5000
 
     /** What the device registry falls back to before anything is paired — the
      *  same default NoopApplication documents. */
@@ -153,7 +163,9 @@ object DashboardUploader {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val base = prefs.getString("base_url", null) ?: return@runCatching "not configured"
         val token = prefs.getString("token", null) ?: return@runCatching "not configured"
-        val payload = buildPayload(context) ?: return@runCatching "nothing to send"
+        // Ask first: an empty server means backfill, not an incremental window.
+        val lookback = if (serverHasData(base, token)) LOOKBACK_DAYS else BACKFILL_DAYS
+        val payload = buildPayload(context, lookback) ?: return@runCatching "nothing to send"
         post("$base/api/ingest/whoop", token, payload)
     }
 
@@ -165,17 +177,41 @@ object DashboardUploader {
      * than adding `...Since` methods, specifically so `WhoopDao.kt` — a shared
      * upstream file — stays untouched and rebases cleanly.
      */
-    private suspend fun buildPayload(context: Context): String? {
+    /** Does the dashboard already hold rows for this source?
+     *
+     * Failing OPEN (returning true) on any error is deliberate: if the status
+     * check is unreachable we fall back to the small incremental window rather
+     * than blindly shipping a decade of rows over a phone connection. */
+    private fun serverHasData(base: String, token: String): Boolean = try {
+        val conn = (URL("$base/api/ingest/whoop/status").openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 90_000
+            setRequestProperty("X-Ingest-Token", token)
+        }
+        val body = try {
+            if (conn.responseCode in 200..299)
+                conn.inputStream.bufferedReader().use { it.readText() } else ""
+        } finally { conn.disconnect() }
+        // {"ok":true,"whoop":null} when empty; {"whoop":{"days":N,...}} when not.
+        val whoop = JSONObject(body).optJSONObject("whoop")
+        (whoop?.optInt("days") ?: 0) > 0
+    } catch (t: Throwable) {
+        Log.w(TAG, "status check failed; assuming the server has data", t)
+        true
+    }
+
+    private suspend fun buildPayload(context: Context, lookbackDays: Long): String? {
         val dao = WhoopDatabase.get(context).whoopDao()
         val deviceId = dao.activeDeviceId() ?: DEFAULT_DEVICE_ID
 
-        val fromDay = LocalDate.now().minusDays(LOOKBACK_DAYS).toString()
+        val fromDay = LocalDate.now().minusDays(lookbackDays).toString()
         // "9999-12-31" as the upper bound: `day` is a "YYYY-MM-DD" TEXT column
         // compared lexicographically, so this is an open-ended range.
         val metrics = dao.dailyMetricsRange(deviceId, fromDay, "9999-12-31")
         if (metrics.isEmpty()) return null
 
-        val fromTs = System.currentTimeMillis() / 1000 - LOOKBACK_DAYS * 86_400L
+        val fromTs = System.currentTimeMillis() / 1000 - lookbackDays * 86_400L
         // startTs is unix SECONDS, not millis — passing millis here silently
         // returns zero rows rather than failing.
         val sessions = dao.sleepSessions(deviceId, fromTs, Long.MAX_VALUE, SLEEP_ROW_LIMIT)
