@@ -4460,11 +4460,16 @@ class WhoopBleClient(
                     // Connection test mode: report the connect latency + the uptime-start marker the readout
                     // reads. Gated zero-cost (the CONNECTION bool is read before any string is built).
                     // Behaviour-neutral diagnostics only - the connect flow below is unchanged. Twin of macOS.
+                    // #1020: both stamped OUTSIDE the gate. Test Centre is usually switched on AFTER
+                    // something looks wrong, and noteLocalTeardown() writes are themselves ungated - so a
+                    // clear that only ran when the mode was already on would let a PREVIOUS session's origin
+                    // survive, printing a stale via=bondWatchdog where via=unknown is the honest answer.
+                    // Field assignments, not log lines: no cost when the mode is off.
+                    connectedAtMs = System.currentTimeMillis()
+                    lastLocalTeardown = null
                     if (testCentre.active(com.noop.testcentre.TestDomain.CONNECTION)) {
                         val nowUnix = System.currentTimeMillis() / 1000L
                         val latencyMs = connectAttemptStartedAtMs?.let { System.currentTimeMillis() - it }
-                        connectedAtMs = System.currentTimeMillis()   // #1020: for the session-duration readout
-                        lastLocalTeardown = null                     // #1020: a new session, no teardown origin yet
                         log("connect up gen=$connectGeneration latencyMs=${latencyMs ?: "?"} uptimeStart=$nowUnix",
                             com.noop.testcentre.TestDomain.CONNECTION)
                     }

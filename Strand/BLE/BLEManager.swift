@@ -3924,13 +3924,17 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         }
         lastDataAt = Date()
         log("Connected — discovering services")
+        // #1020: stamped OUTSIDE the gate below. Test Centre is usually switched on AFTER something looks
+        // wrong, so a stamp taken only when the mode happened to be on at connect time would either be
+        // missing or, worse, still hold a PREVIOUS session's start - reporting a duration that spans the
+        // gap between them. A field assignment, not a log line, so it costs nothing when the mode is off.
+        connSessionStartedAt = Date()
         // Connection test mode: report the connect latency + the uptime-start marker the readout reads.
         // Gated zero-cost: the .connection bool is read before any string is built, so this is a no-op
         // when the mode is off. Behaviour-neutral diagnostics only - the connect flow above is unchanged.
         if TestCentre.active(.connection) {
             let nowUnix = Int(Date().timeIntervalSince1970)
             let latencyMs = connectAttemptStartedAt.map { Int(Date().timeIntervalSince($0) * 1000) }
-            connSessionStartedAt = Date()   // #1020: for the session-duration readout on the way down
             state.append(log: "connect up gen=\(connectGeneration) "
                 + "latencyMs=\(latencyMs.map(String.init) ?? "?") uptimeStart=\(nowUnix)", domain: .connection)
         }
