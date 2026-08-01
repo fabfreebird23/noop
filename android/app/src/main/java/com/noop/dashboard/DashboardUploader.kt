@@ -76,6 +76,45 @@ object DashboardUploader {
         schedule(context)
     }
 
+    /**
+     * Pick up configuration dropped as a file, so no UI and no rebuild is
+     * needed to point this at a server.
+     *
+     *   adb push dashboard.json /sdcard/Android/data/<applicationId>/files/
+     *
+     * with `{"baseUrl": "...", "token": "..."}`. That directory is the app's
+     * own external files dir, which adb can write WITHOUT root and without any
+     * manifest permission — so this costs the fork nothing.
+     *
+     * The file is DELETED once imported: a bearer token should not sit in
+     * plaintext on shared storage, where any app with media access could read
+     * it. Config lands in SharedPreferences, which is app-private.
+     */
+    fun importConfigFileIfPresent(context: Context): Boolean {
+        val f = java.io.File(context.getExternalFilesDir(null), "dashboard.json")
+        if (!f.exists()) return false
+        return try {
+            val o = JSONObject(f.readText())
+            val url = o.optString("baseUrl").trim()
+            val token = o.optString("token").trim()
+            if (url.isEmpty() || token.isEmpty()) {
+                Log.w(TAG, "dashboard.json missing baseUrl or token; ignoring")
+                false
+            } else {
+                configure(context, url, token)
+                Log.i(TAG, "configured from dashboard.json -> ${url.take(40)}")
+                true
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "dashboard.json is not valid JSON; ignoring", t)
+            false
+        } finally {
+            // Delete on ANY outcome, including a malformed file — leaving a
+            // half-read token on disk is the worst case.
+            runCatching { f.delete() }
+        }
+    }
+
     fun isConfigured(context: Context): Boolean {
         val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         return !p.getString("base_url", null).isNullOrBlank() &&
@@ -92,6 +131,9 @@ object DashboardUploader {
      * starve the job on a phone that reboots often.
      */
     fun schedule(context: Context) {
+        // Check for dropped config before giving up — this is what makes
+        // "adb push, then open the app" work with no UI.
+        if (!isConfigured(context)) importConfigFileIfPresent(context)
         if (!isConfigured(context)) return
         val req = PeriodicWorkRequestBuilder<UploadWorker>(3, TimeUnit.HOURS)
             .setConstraints(
@@ -107,6 +149,7 @@ object DashboardUploader {
     /** Fire now. Worth wiring to a debug button so a failure is diagnosable
      *  without waiting three hours. */
     suspend fun uploadNow(context: Context): Result<String> = runCatching {
+        if (!isConfigured(context)) importConfigFileIfPresent(context)
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val base = prefs.getString("base_url", null) ?: return@runCatching "not configured"
         val token = prefs.getString("token", null) ?: return@runCatching "not configured"
