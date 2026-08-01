@@ -46,6 +46,12 @@ class NoopApplication : Application() {
         // Record any uncaught crash to a file so it rides along in the shareable strap log — a
         // device-specific crash (e.g. Insights #224/#267) is otherwise lost to an unreachable logcat.
         CrashCapture.install(this)
+        // FORK-ONLY: (re)schedule the whoop-garmin dashboard upload. No-ops until
+        // DashboardUploader.configure() has been called once with a URL + token.
+        // This is the ONLY line this fork changes in an upstream file — the rest
+        // lives in com/noop/dashboard/, so rebasing stays a one-line conflict at
+        // worst. See android/app/src/main/java/com/noop/dashboard/README.md.
+        com.noop.dashboard.DashboardUploader.schedule(this)
     }
 
     /** Process-wide Room-backed store. One instance shared by the UI and the background service. */
