@@ -617,6 +617,12 @@ public final class BLEManager: NSObject, ObservableObject {
     private var connectAttemptStartedAt: Date?
     /// Count of INVOLUNTARY reconnects this run (a drop or failed-connect that was not user-initiated),
     /// surfaced as the reconnect-churn count. Reset by an intentional disconnect.
+    /// When the current session reached connected, for the `connect down` duration readout (#1020).
+    /// A session's length separates the causes of a drop at a glance — a bond watchdog fires seconds
+    /// in, a stall bounce minutes in, a radio drop anywhere. `nil` when not connected. Android twin:
+    /// `WhoopBleClient.connectedAtMs`.
+    private var connSessionStartedAt: Date?
+
     private var connReconnectCount = 0
     /// #126 false-alarm guard: tracks CONSECUTIVE console-only completed syncs so the "clock has lost
     /// sync" banner only fires on sustained emptiness, not a single transient empty cycle on a healthy strap.
@@ -3924,6 +3930,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         if TestCentre.active(.connection) {
             let nowUnix = Int(Date().timeIntervalSince1970)
             let latencyMs = connectAttemptStartedAt.map { Int(Date().timeIntervalSince($0) * 1000) }
+            connSessionStartedAt = Date()   // #1020: for the session-duration readout on the way down
             state.append(log: "connect up gen=\(connectGeneration) "
                 + "latencyMs=\(latencyMs.map(String.init) ?? "?") uptimeStart=\(nowUnix)", domain: .connection)
         }
@@ -4103,7 +4110,11 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
             if TestCentre.active(.connection) {
                 let reason = (error as? CBError)?.code == .connectionTimeout
                     ? "connectionTimeout" : connErrorToken(error)
-                state.append(log: "connect down (uptime ends)", domain: .connection)
+                // #1020: the session's length separates the causes of a drop at a glance. Same suffix the
+                // Android twin emits, so the shared ConnectionReadout parser sees one format.
+                let held = ConnectionTrace.sessionHeldSuffix(
+                    millis: connSessionStartedAt.map { Int(Date().timeIntervalSince($0) * 1000) } ?? -1)
+                state.append(log: "connect down (uptime ends\(held))", domain: .connection)
                 state.append(log: "reconnect n=\(connReconnectCount) reason=\(reason)", domain: .connection)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in

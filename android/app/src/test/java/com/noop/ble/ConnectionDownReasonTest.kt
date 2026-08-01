@@ -1,5 +1,6 @@
 package com.noop.ble
 
+import com.noop.analytics.ConnectionTrace
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -58,9 +59,9 @@ class ConnectionDownReasonTest {
 
     /** The session length is what separates a 7-second bond watchdog from a 120-second stall bounce. */
     @Test fun theSessionLengthIsReportedToATenthOfASecond() {
-        assertEquals(" after 6.8s", WhoopBleClient.sessionHeldSuffix(6_800))
-        assertEquals(" after 120.0s", WhoopBleClient.sessionHeldSuffix(120_000))
-        assertEquals(" after 0.4s", WhoopBleClient.sessionHeldSuffix(432))
+        assertEquals(" after 6.8s", ConnectionTrace.sessionHeldSuffix(6_800))
+        assertEquals(" after 120.0s", ConnectionTrace.sessionHeldSuffix(120_000))
+        assertEquals(" after 0.4s", ConnectionTrace.sessionHeldSuffix(432))
     }
 
     /**
@@ -68,6 +69,6 @@ class ConnectionDownReasonTest {
      * an instant drop, which is a different diagnosis from "we do not know".
      */
     @Test fun anUnknownSessionStartYieldsNoSuffix() {
-        assertEquals("", WhoopBleClient.sessionHeldSuffix(-1))
+        assertEquals("", ConnectionTrace.sessionHeldSuffix(-1))
     }
 }

@@ -553,16 +553,6 @@ class WhoopBleClient(
             else -> "status$status"
         }
 
-        /**
-         * The ` after <n>s` suffix on `connect down` (#1020), or empty when the session start is unknown.
-         *
-         * Separates the culprits at a glance: a bond watchdog fires seconds in, the keep-alive stall
-         * bounce two minutes in, a radio drop anywhere. Locale.US so the decimal point does not follow the
-         * phone language into a log people paste into issues.
-         */
-        fun sessionHeldSuffix(heldMs: Long): String =
-            if (heldMs < 0L) "" else " after ${"%.1f".format(java.util.Locale.US, heldMs / 1000.0)}s"
-
         /** Pure battery-adaptive gate (#477), unit-testable without a BLE stack. Keyed on the STRAP's
          *  battery (WHOOP/Oura/Fitbit): the lever is ARMED by [thresholdPct] > 0 (the Settings slider is
          *  10–30; 0 disables it) and engages while the strap is DISCHARGING at/below [thresholdPct]. The
@@ -7111,7 +7101,7 @@ class WhoopBleClient(
                 val reason = connectionDownReason(status, lastLocalTeardown)
                 if (wasConnected) {
                     val heldMs = if (connectedAtMs > 0L) System.currentTimeMillis() - connectedAtMs else -1L
-                    log("connect down (uptime ends${sessionHeldSuffix(heldMs)})",
+                    log("connect down (uptime ends${com.noop.analytics.ConnectionTrace.sessionHeldSuffix(heldMs)})",
                         com.noop.testcentre.TestDomain.CONNECTION)
                     log("reconnect n=$connReconnectCount reason=$reason", com.noop.testcentre.TestDomain.CONNECTION)
                 } else {
