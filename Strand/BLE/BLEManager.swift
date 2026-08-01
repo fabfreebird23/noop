@@ -617,13 +617,17 @@ public final class BLEManager: NSObject, ObservableObject {
     private var connectAttemptStartedAt: Date?
     /// Count of INVOLUNTARY reconnects this run (a drop or failed-connect that was not user-initiated),
     /// surfaced as the reconnect-churn count. Reset by an intentional disconnect.
+    private var connReconnectCount = 0
     /// When the current session reached connected, for the `connect down` duration readout (#1020).
     /// A session's length separates the causes of a drop at a glance — a bond watchdog fires seconds
-    /// in, a stall bounce minutes in, a radio drop anywhere. `nil` when not connected. Android twin:
-    /// `WhoopBleClient.connectedAtMs`.
+    /// in, a stall bounce minutes in, a radio drop anywhere.
+    ///
+    /// Set on EVERY connect, not only when the connection test mode is active: the mode is usually
+    /// switched on after something already looks wrong, so a stamp taken under the gate would carry a
+    /// previous session's start. Never cleared on the way down, so read it only where a session is known
+    /// to have been held (`didDisconnectPeripheral`, which fires only for a peripheral that connected).
+    /// Android twin: `WhoopBleClient.connectedAtMs`.
     private var connSessionStartedAt: Date?
-
-    private var connReconnectCount = 0
     /// #126 false-alarm guard: tracks CONSECUTIVE console-only completed syncs so the "clock has lost
     /// sync" banner only fires on sustained emptiness, not a single transient empty cycle on a healthy strap.
     private var emptySyncTracker = EmptySyncTracker()

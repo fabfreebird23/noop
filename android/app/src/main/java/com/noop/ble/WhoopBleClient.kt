@@ -4005,7 +4005,9 @@ class WhoopBleClient(
     @Volatile private var lastLocalTeardown: String? = null
 
     /** Wall clock when the current session reached STATE_CONNECTED, for the session-duration readout.
-     *  0 when not connected. @Volatile for the same reason as [lastLocalTeardown]. */
+     *  0 until the first connect; set on EVERY connect (not gated on the test mode, which is usually
+     *  switched on only after something looks wrong) and never cleared on the way down, so read it only
+     *  under a `wasConnected` guard. @Volatile for the same reason as [lastLocalTeardown]. */
     @Volatile private var connectedAtMs = 0L
 
     /** Record which local path is about to drop the link. Cheap and unconditional: the string is a
