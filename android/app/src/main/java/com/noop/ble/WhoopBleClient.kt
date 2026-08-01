@@ -1672,6 +1672,38 @@ class WhoopBleClient(
         }
     }
 
+    /**
+     * Escalate to HIGH for the connect handshake (#477 follow-up).
+     *
+     * The handshake is a burst of writes-with-response — version/hello, both SET_CLOCK forms, both
+     * GET_CLOCK forms, stop-raw, get-range — and every one pays a full connection interval. BALANCED is
+     * roughly 30-50 ms against HIGH's 7.5-15 ms, so the burst is where a shorter interval buys the most
+     * and costs the least: it lasts seconds, not hours.
+     *
+     * Placed AFTER `requestMtu` and service discovery deliberately. Three separate hardware-learned
+     * incidents record the same hazard — #85/#50 (MTU before discovery/subscribe), #241 (the RSSI read
+     * deferred 3 s), #533 (2M PHY moved to offload start) — all of them: an extra GATT op BEFORE
+     * `requestMtu` can make it return false, silently capping the offload. This sits past that point.
+     * `requestConnectionPriority` is also an L2CAP parameter update rather than an ATT operation, so it
+     * should not occupy the single-op slot at all; "should not" is why this ships behind the same gate.
+     *
+     * Nothing restores BALANCED here on purpose: the connect-time offload calls
+     * [refreshConnectionPriority] a beat later, which recomputes from the real policy. Worst case the
+     * link holds HIGH for a second longer than needed.
+     *
+     * Swallowed rather than routed through `safeGatt`, same policy as [refreshConnectionPriority]: a
+     * priority HINT must never tear the link down.
+     */
+    private fun escalateConnectionPriorityForHandshake() {
+        if (!connectionPriorityEnabled) return
+        val ops = gattOps ?: return
+        try {
+            ops.requestConnectionPriorityCompat(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+        } catch (t: Throwable) {
+            log("handshake connection-priority request failed (${t.javaClass.simpleName}); skipped")
+        }
+    }
+
     /** #533: hand the link back to the stack default (BALANCED) when connection-priority management is
      *  switched off, undoing any escalation still in force. Same swallow-don't-teardown policy as
      *  [refreshConnectionPriority]: a priority hint must never drop the link. */
@@ -5394,6 +5426,9 @@ class WhoopBleClient(
         // firmware-load opcodes. Pick the family-appropriate one; a strap silently ignores the command
         // meant for the other generation. The response decodes to fw_harvard (4.0) / fw_version (5/MG)
         // in Framing.
+        // #477 follow-up: shorten the interval for the write-with-response burst below. No-op unless
+        // connection-priority management is enabled, which it is not by default — see the helper.
+        escalateConnectionPriorityForHandshake()
         when (connectedFamily) {
             DeviceFamily.WHOOP4 -> send(CommandNumber.REPORT_VERSION_INFO)
             DeviceFamily.WHOOP5 -> send(CommandNumber.GET_HELLO)
