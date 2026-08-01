@@ -53,6 +53,7 @@ object DashboardUploader {
 
     private const val TAG = "DashboardUploader"
     private const val WORK = "whoop_garmin_dashboard_upload"
+    private const val WORK_ONCE = "whoop_garmin_dashboard_upload_once"
     private const val PREFS = "dashboard_uploader"
 
     /** How far back to re-send on a ROUTINE run. Re-sending an overlapping
@@ -68,6 +69,22 @@ object DashboardUploader {
      * which looks identical to "working, nothing new". Ask the server what it
      * has; if it has nothing, send everything. */
     private const val BACKFILL_DAYS = 3650L
+
+    /** Bump this whenever the SERVER changes how it reads the payload.
+     *
+     * A routine run only re-sends [LOOKBACK_DAYS] anchored to *today*, so a
+     * server-side fix can never reach rows older than that window — and if the
+     * strap has not been worn recently, the window is empty and the run is a
+     * no-op that reports success.
+     *
+     * That is not hypothetical. The dashboard bounded Effort to 0-21 (WHOOP's
+     * scale) when NOOP reports it on 0-100, so it dropped the value on 94% of
+     * days. Fixing the bound backfilled nothing: the strap's history ends
+     * ~2025-07-15, every routine run found the last three weeks empty, and
+     * 1,333 days kept a null Effort with the client insisting it was in sync.
+     *
+     * Bumping this forces one full re-send, then records the new epoch. */
+    private const val SYNC_EPOCH = 2
 
     /** Room requires an explicit LIMIT on the sleep read. Sized for a full
      *  backfill (a multi-year imported history), not just three weeks — a
@@ -152,8 +169,28 @@ object DashboardUploader {
                     .build()
             )
             .build()
-        WorkManager.getInstance(context)
-            .enqueueUniquePeriodicWork(WORK, ExistingPeriodicWorkPolicy.KEEP, req)
+        val wm = WorkManager.getInstance(context)
+        wm.enqueueUniquePeriodicWork(WORK, ExistingPeriodicWorkPolicy.KEEP, req)
+
+        // ALSO fire once now. A PeriodicWorkRequest does not run on
+        // registration — WorkManager places the first execution somewhere
+        // inside the first interval, at its own discretion, so "I set it up"
+        // and "it has ever run" can be hours apart with nothing to look at.
+        // Opening the app should sync; this makes that true.
+        //
+        // REPLACE, not KEEP: a stale queued one-shot from a previous launch is
+        // worthless next to a fresh one, and the server upserts anyway.
+        wm.enqueueUniqueWork(
+            WORK_ONCE,
+            androidx.work.ExistingWorkPolicy.REPLACE,
+            androidx.work.OneTimeWorkRequestBuilder<UploadWorker>()
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .build(),
+        )
     }
 
     /** Fire now. Worth wiring to a debug button so a failure is diagnosable
@@ -163,10 +200,18 @@ object DashboardUploader {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val base = prefs.getString("base_url", null) ?: return@runCatching "not configured"
         val token = prefs.getString("token", null) ?: return@runCatching "not configured"
-        // Ask first: an empty server means backfill, not an incremental window.
-        val lookback = if (serverHasData(base, token)) LOOKBACK_DAYS else BACKFILL_DAYS
+        // Send everything when the server has nothing, and when the server has
+        // started reading the payload differently than it did last time we
+        // synced — an incremental window cannot repair rows it never revisits.
+        val full = prefs.getInt("sync_epoch", 0) < SYNC_EPOCH || !serverHasData(base, token)
+        val lookback = if (full) BACKFILL_DAYS else LOOKBACK_DAYS
         val payload = buildPayload(context, lookback) ?: return@runCatching "nothing to send"
-        post("$base/api/ingest/whoop", token, payload)
+        val result = post("$base/api/ingest/whoop", token, payload)
+        // Only after the post returns: post() throws on any non-2xx, so
+        // recording the epoch before this line would mark a failed backfill
+        // as done and there would be no second attempt.
+        if (full) prefs.edit().putInt("sync_epoch", SYNC_EPOCH).apply()
+        result
     }
 
     /**
