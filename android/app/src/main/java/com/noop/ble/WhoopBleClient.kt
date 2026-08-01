@@ -4010,8 +4010,11 @@ class WhoopBleClient(
      *  under a `wasConnected` guard. @Volatile for the same reason as [lastLocalTeardown]. */
     @Volatile private var connectedAtMs = 0L
 
-    /** Record which local path is about to drop the link. Cheap and unconditional: the string is a
-     *  constant at every call site, and knowing the origin is worth more than the trace being gated. */
+    /** Record which local path is about to drop the link. Unconditional rather than gated on the test
+     *  mode, because the clear in the connect path is ungated too - gating one and not the other is what
+     *  let a previous session's origin survive. Four of the five call sites pass a literal; `safeGatt`
+     *  interpolates the failing op, but that is an exception path where a String allocation is noise
+     *  against the teardown it is about to perform. None of the five is on a per-record path. */
     private fun noteLocalTeardown(origin: String) { lastLocalTeardown = origin }
 
     /** Consecutive involuntary reconnect attempts, feeding the capped-exponential [ReconnectBackoff]
