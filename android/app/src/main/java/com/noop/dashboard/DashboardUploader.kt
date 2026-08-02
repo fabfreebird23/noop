@@ -85,7 +85,13 @@ object DashboardUploader {
      * 1,333 days kept a null Effort with the client insisting it was in sync.
      *
      * Bumping this forces one full re-send, then records the new epoch. */
-    private const val SYNC_EPOCH = 2
+    // v4: adds the strap `battery` object to the payload.
+    // v3: the dashboard's skin-temp bound was (-15, 15), written for a field
+    // NAMED skinTempDevC but holding ABSOLUTE degrees C. It rejected every
+    // reading ever sent -- 0 of 1,221. With the bound corrected the server
+    // reads the same payload differently, so the history has to go up again;
+    // a routine 21-day window would never reach it.
+    private const val SYNC_EPOCH = 4
 
     /** Room requires an explicit LIMIT on the sleep read. Sized for a full
      *  backfill (a multi-year imported history), not just three weeks — a
@@ -342,10 +348,25 @@ object DashboardUploader {
             })
         }
 
+        // Strap charge, as a top-level scalar rather than a per-day field.
+        // `dailyMetric` is keyed by day; battery is a timestamp series sampled
+        // every few minutes, so folding it into a day row would either lose
+        // readings or invent a day-level number that does not exist. Only the
+        // newest sample matters for "is my strap about to die".
+        val battery = deviceIds.mapNotNull { dao.latestBattery(it) }.maxByOrNull { it.ts }
+
         return JSONObject().apply {
             put("metrics", mArr)
             put("sessions", sArr)
             put("source", "whoop")
+            if (battery != null) {
+                put("battery", JSONObject().apply {
+                    put("ts", battery.ts)              // unix SECONDS, NOOP's unit
+                    putOrNull("soc", battery.soc)      // percent 0-100
+                    putOrNull("mv", battery.mv)
+                    putOrNull("charging", battery.charging)
+                })
+            }
         }.toString()
     }
 
