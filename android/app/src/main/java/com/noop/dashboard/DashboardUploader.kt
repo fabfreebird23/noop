@@ -267,7 +267,25 @@ object DashboardUploader {
      */
     private fun deviceIdsWithData(context: Context): List<String> =
         WhoopDatabase.get(context).openHelper.readableDatabase
-            .query("SELECT DISTINCT deviceId FROM dailyMetric").use { c ->
+            .query(
+                // STRAP devices only. NOOP can also ingest from Health Connect,
+                // which on this phone is fed by Garmin — and everything sent
+                // from here is tagged source="whoop" on the dashboard. So a
+                // Garmin-derived row reaching dailyMetric would be filed as
+                // WHOOP, quietly pooling two sources that the dashboard keeps
+                // deliberately separate (their HRV is not the same
+                // measurement) and making any WHOOP-vs-Garmin comparison
+                // circular.
+                //
+                // A device absent from `device` is kept: the live strap writes
+                // under a fallback id that is never registered there, and
+                // dropping it would lose exactly the nights that matter.
+                """
+                SELECT DISTINCT d.deviceId FROM dailyMetric d
+                LEFT JOIN device v ON v.id = d.deviceId
+                WHERE v.id IS NULL OR LOWER(v.name) LIKE '%whoop%'
+                """
+            ).use { c ->
                 buildList { while (c.moveToNext()) add(c.getString(0)) }
             }
 
