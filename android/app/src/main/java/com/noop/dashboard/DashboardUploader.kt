@@ -9,6 +9,7 @@ import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.noop.data.DailyMetric
 import com.noop.data.WhoopDatabase
 import org.json.JSONArray
 import org.json.JSONObject
@@ -246,20 +247,64 @@ object DashboardUploader {
         true
     }
 
+    /**
+     * Every deviceId that actually owns rows, not just the active one.
+     *
+     * This wrist can be more than one id: the imported history sits under the
+     * paired device while a stray row can land under [DEFAULT_DEVICE_ID], the
+     * fallback used before pairing resolves. Reading only activeDeviceId() means
+     * that if live capture ever writes under the fallback, every run finds an
+     * empty window, uploads nothing, and reports success — indefinitely.
+     *
+     * Done as a raw query rather than a new @Dao method so `WhoopDao.kt`, a
+     * shared upstream file, stays untouched and keeps rebasing cleanly.
+     */
+    private fun deviceIdsWithData(context: Context): List<String> =
+        WhoopDatabase.get(context).openHelper.readableDatabase
+            .query("SELECT DISTINCT deviceId FROM dailyMetric").use { c ->
+                buildList { while (c.moveToNext()) add(c.getString(0)) }
+            }
+
+    /** How much of a day's row is actually filled in — the tie-break when the
+     *  same day exists under two device ids. */
+    private fun populatedFields(m: DailyMetric): Int = listOf(
+        m.totalSleepMin, m.efficiency, m.deepMin, m.remMin, m.lightMin,
+        m.disturbances, m.restingHr, m.avgHrv, m.recovery, m.strain,
+        m.respRateBpm, m.spo2Pct, m.skinTempDevC, m.steps, m.activeKcalEst,
+    ).count { it != null }
+
     private suspend fun buildPayload(context: Context, lookbackDays: Long): String? {
         val dao = WhoopDatabase.get(context).whoopDao()
-        val deviceId = dao.activeDeviceId() ?: DEFAULT_DEVICE_ID
+        val active = dao.activeDeviceId() ?: DEFAULT_DEVICE_ID
+        val deviceIds = (deviceIdsWithData(context) + active).distinct()
 
         val fromDay = LocalDate.now().minusDays(lookbackDays).toString()
         // "9999-12-31" as the upper bound: `day` is a "YYYY-MM-DD" TEXT column
         // compared lexicographically, so this is an open-ended range.
-        val metrics = dao.dailyMetricsRange(deviceId, fromDay, "9999-12-31")
+        //
+        // One day can appear under two ids. Keep the better-populated row:
+        // the stray fallback rows seen in practice carry a single field and
+        // would otherwise overwrite a real night, and the server upserts whole
+        // days rather than merging fields.
+        val byDay = LinkedHashMap<String, DailyMetric>()
+        for (id in deviceIds) {
+            for (m in dao.dailyMetricsRange(id, fromDay, "9999-12-31")) {
+                val prev = byDay[m.day]
+                if (prev == null || populatedFields(m) > populatedFields(prev)) byDay[m.day] = m
+            }
+        }
+        val metrics = byDay.values.sortedBy { it.day }
         if (metrics.isEmpty()) return null
 
         val fromTs = System.currentTimeMillis() / 1000 - lookbackDays * 86_400L
         // startTs is unix SECONDS, not millis — passing millis here silently
         // returns zero rows rather than failing.
-        val sessions = dao.sleepSessions(deviceId, fromTs, Long.MAX_VALUE, SLEEP_ROW_LIMIT)
+        // Same multi-device read as the metrics above; a night is keyed by its
+        // start so duplicates across ids collapse rather than double-count.
+        val sessions = deviceIds
+            .flatMap { dao.sleepSessions(it, fromTs, Long.MAX_VALUE, SLEEP_ROW_LIMIT) }
+            .distinctBy { it.startTs }
+            .sortedBy { it.startTs }
 
         val mArr = JSONArray()
         for (m in metrics) {
