@@ -85,13 +85,15 @@ object DashboardUploader {
      * 1,333 days kept a null Effort with the client insisting it was in sync.
      *
      * Bumping this forces one full re-send, then records the new epoch. */
+    // v5: sleep timestamps now sent as LOCAL-shifted epoch ms, matching the
+    //     column's documented contract; stored nights need re-sending.
     // v4: adds the strap `battery` object to the payload.
     // v3: the dashboard's skin-temp bound was (-15, 15), written for a field
     // NAMED skinTempDevC but holding ABSOLUTE degrees C. It rejected every
     // reading ever sent -- 0 of 1,221. With the bound corrected the server
     // reads the same payload differently, so the history has to go up again;
     // a routine 21-day window would never reach it.
-    private const val SYNC_EPOCH = 4
+    private const val SYNC_EPOCH = 5
 
     /** Room requires an explicit LIMIT on the sleep read. Sized for a full
      *  backfill (a multi-year imported history), not just three weeks — a
