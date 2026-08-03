@@ -9,8 +9,10 @@ import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.noop.analytics.StrainScorer
 import com.noop.data.DailyMetric
 import com.noop.data.WhoopDatabase
+import com.noop.ui.ProfileStore
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -85,6 +87,8 @@ object DashboardUploader {
      * 1,333 days kept a null Effort with the client insisting it was in sync.
      *
      * Bumping this forces one full re-send, then records the new epoch. */
+    // v6: Effort is COMPUTED for strap-captured days (NOOP only stores it
+    //     for imported rows), so every live day so far went up as 0.
     // v5: sleep timestamps now sent as LOCAL-shifted epoch ms, matching the
     //     column's documented contract; stored nights need re-sending.
     // v4: adds the strap `battery` object to the payload.
@@ -93,12 +97,16 @@ object DashboardUploader {
     // reading ever sent -- 0 of 1,221. With the bound corrected the server
     // reads the same payload differently, so the history has to go up again;
     // a routine 21-day window would never reach it.
-    private const val SYNC_EPOCH = 5
+    private const val SYNC_EPOCH = 6
 
     /** Room requires an explicit LIMIT on the sleep read. Sized for a full
      *  backfill (a multi-year imported history), not just three weeks — a
      *  silent truncation here would lose the oldest nights without a word. */
     private const val SLEEP_ROW_LIMIT = 5000
+
+    /** A day of HR at the strap's cadence is a few thousand rows; this is
+     *  headroom, not a target. */
+    private const val HR_SAMPLE_LIMIT = 200_000
 
     /** What the device registry falls back to before anything is paired — the
      *  same default NoopApplication documents. */
@@ -299,6 +307,57 @@ object DashboardUploader {
         m.respRateBpm, m.spo2Pct, m.skinTempDevC, m.steps, m.activeKcalEst,
     ).count { it != null }
 
+
+    /** A day's Effort, computed the way NOOP's own screen computes it.
+     *
+     * `dailyMetric.strain` is populated only for IMPORTED rows. For a day the
+     * strap actually captured it stays 0.0, because NOOP scores Effort at
+     * render time (AppViewModel: StrainScorer.strain(samples, hrMax, sex)) from
+     * raw HR plus the wearer's profile, and never writes it back. So the
+     * dashboard faithfully received 0 for every live day while the phone showed
+     * a real number.
+     *
+     * This is a deliberate exception to this file's "no arithmetic" rule, and
+     * the rule's reasoning is why it is safe: the danger was a SECOND mapper
+     * drifting from the tested one. Here there is no second implementation —
+     * it calls NOOP's own scorer with NOOP's own profile, so the number is the
+     * one on the strap's screen by construction.
+     *
+     * Whole-day samples, not workout windows: Effort is cumulative
+     * cardiovascular load across every waking hour, so a rest day is a real
+     * number in the 8-12 range, never 0.
+     */
+    private suspend fun computedEffort(
+        context: Context,
+        deviceIds: List<String>,
+        day: String,
+        restingHr: Double?,
+    ): Double? {
+        val dao = WhoopDatabase.get(context).whoopDao()
+        val profile = ProfileStore.from(context)
+        val maxHr = profile.hrMax.toDouble()
+        if (maxHr <= 0.0) return null
+
+        // Local midnight to midnight — the day boundary the wearer lives in,
+        // not UTC's, or an evening session lands on tomorrow.
+        val zone = java.time.ZoneId.systemDefault()
+        val from = java.time.LocalDate.parse(day).atStartOfDay(zone).toEpochSecond()
+        val to = from + 24 * 3600
+
+        val samples = deviceIds
+            .flatMap { dao.hrSamples(it, from, to, HR_SAMPLE_LIMIT) }
+            .distinctBy { it.ts }
+            .sortedBy { it.ts }
+        if (samples.isEmpty()) return null
+
+        return StrainScorer.strain(
+            samples,
+            maxHR = maxHr,
+            restingHR = restingHr ?: StrainScorer.defaultRestingHR,
+            sex = profile.sex,
+        )
+    }
+
     private suspend fun buildPayload(context: Context, lookbackDays: Long): String? {
         val dao = WhoopDatabase.get(context).whoopDao()
         val active = dao.activeDeviceId() ?: DEFAULT_DEVICE_ID
@@ -345,7 +404,12 @@ object DashboardUploader {
                 putOrNull("restingHr", m.restingHr)
                 putOrNull("avgHrv", m.avgHrv)
                 putOrNull("recovery", m.recovery)
-                putOrNull("strain", m.strain)
+                // A stored Effort of null OR 0.0 on a strap-captured day means
+                // "never scored", not "you did nothing" — NOOP only writes this
+                // column for imported rows. Compute it rather than sending a
+                // zero the dashboard would render as a flat day.
+                putOrNull("strain", m.strain.takeIf { (it ?: 0.0) > 0.0 }
+                    ?: computedEffort(context, deviceIds, m.day, m.restingHr?.toDouble()))
                 putOrNull("respRateBpm", m.respRateBpm)
                 putOrNull("spo2Pct", m.spo2Pct)
                 putOrNull("skinTempDevC", m.skinTempDevC)
