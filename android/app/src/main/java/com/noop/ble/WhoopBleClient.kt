@@ -214,6 +214,11 @@ data class LiveState(
      *  once empty offloads are SUSTAINED; cleared on connect or once the strap banks real records. Twin of
      *  macOS LiveState.historySyncExperimental. */
     val historySyncExperimental: Boolean = false,
+    /** #612: TRUE when the WHOOP-4/generic empty-offload streak ([emptySyncTracker]) is currently
+     *  SUSTAINED (3+ consecutive completed-but-empty offloads). Not 5/MG-specific and not coupled to HR:
+     *  a connected strap that keeps handing over nothing has this true regardless of live-HR status.
+     *  Cleared on disconnect; re-derived from the next offload. Twin of macOS LiveState.sustainedEmptyOffload. */
+    val sustainedEmptyOffload: Boolean = false,
 ) {
     /** Set the fresh-packet [rr] AND append the valid intervals onto the bounded [rrRecent] rolling
      *  buffer (oldest fall off first). Non-positive sentinels are dropped from the rolling buffer.
@@ -539,6 +544,25 @@ class WhoopBleClient(
         }
 
         /**
+         * The throughput summary for one offload burst (#1007), pure so it is testable without a BLE stack.
+         *
+         * #477 and #533 ship two levers that should shorten the offload — CONNECTION_PRIORITY_HIGH for the
+         * burst, and LE 2M around it — and both default OFF, gated on validation against a real strap. That
+         * validation never happened, and this is why: nothing measured the thing they change. The figures in
+         * #1007 had to be counted by hand out of a raw capture ("3193 frames / 90 s"), which is not something
+         * a reporter can be asked to do twice.
+         *
+         * Frames rather than records: [offloadFramesThisSession] counts genuine offload frames (47/48/49/50),
+         * which is what the levers actually move, and is the same numerator #1007 measured. A non-positive
+         * elapsed yields the count WITHOUT a rate rather than a fabricated one. Locale-fixed so a decimal
+         * comma cannot follow the phone language into a log someone pastes into an issue.
+         */
+        fun offloadThroughputLine(frames: Int, elapsedMs: Long): String =
+            if (elapsedMs <= 0L) "$frames frame(s)"
+            else "%d frame(s) in %.1fs (%.1f frame/s)".format(
+                java.util.Locale.US, frames, elapsedMs / 1000.0, frames * 1000.0 / elapsedMs)
+
+        /**
          * The `reason=` token for a connection-down trace line (#1020), pure so the composition is
          * unit-testable without a BLE stack.
          *
@@ -554,8 +578,8 @@ class WhoopBleClient(
         }
 
         /** Pure battery-adaptive gate (#477), unit-testable without a BLE stack. Keyed on the STRAP's
-         *  battery (WHOOP/Oura/Fitbit): the lever is ARMED by [thresholdPct] > 0 (the Settings slider is
-         *  10–30; 0 disables it) and engages while the strap is DISCHARGING at/below [thresholdPct]. The
+         *  battery (WHOOP/Oura/Fitbit): the lever is ARMED by [thresholdPct] > 0 and engages while the
+         *  strap is DISCHARGING at/below [thresholdPct]. The
          *  phone's own Battery Saver deliberately does NOT trigger it — power saving is about the strap's
          *  charge, not the phone's. A charging strap never throttles. The threshold is its own hysteresis
          *  (battery % moves slowly, so a boundary crossing flips at most once per point). */
@@ -1004,6 +1028,9 @@ class WhoopBleClient(
                 // #580: the 5/MG "history experimental" note is per-link — a fresh connect re-derives it
                 // from the next offload, so it must not outlive the dropped link.
                 historySyncExperimental = false,
+                // #612: the display flag only, not the underlying emptySyncTracker streak (that counter
+                // deliberately survives a reconnect, unchanged existing behaviour).
+                sustainedEmptyOffload = false,
             )
 
         /**
@@ -1650,7 +1677,21 @@ class WhoopBleClient(
      *  [setConnectionPriorityManagement]. */
     @Volatile private var connectionPriorityEnabled: Boolean = false
     /** Battery-% at/below which the LOW_POWER idle throttle engages while discharging; 0 = never (safe
-     *  half only). The Settings picker offers 10/15/20/25/30. */
+     *  half only).
+     *
+     *  NOT REACHABLE TODAY, and this doc used to claim a Settings picker that was never built. The only
+     *  caller passes a hard-coded 0 (`AppViewModel.applyPowerSaving`), so the idle throttle is dormant
+     *  for everyone regardless of any setting. #477's validation plan needs it enabled on a real strap,
+     *  which nobody can currently do — see #1005, where the idle link is the addressable share and there
+     *  is no lever to reach it. Wiring a control is a separate change; do not describe one until it
+     *  exists.
+     *
+     *  Note it would ALSO need [connectionPriorityEnabled], i.e. the Fast history sync toggle, since
+     *  [refreshConnectionPriority] early-returns without it. A control for this alone would do nothing.
+     *
+     *  Contrast [lowBatteryOffloadPct] below, which IS wired: the Power saving master drives it. Both key
+     *  on the STRAP's battery — see [batteryPctAndCharging] — so neither is a lever a user can pull
+     *  because their PHONE is draining. That is the gap #1005 runs into. */
     @Volatile private var idleThrottleBatteryPct: Int = 0
 
     /** #533: also escalate to HIGH for the LIVE-HR stream, not just the offload burst. DEFAULT OFF, and
@@ -2212,6 +2253,12 @@ class WhoopBleClient(
     /** Genuine offload frames seen this session — zero at timeout means the strap never answered
      *  the history request at all (5/MG retry trigger, #78 fork). Main-looper only. */
     private var offloadFramesThisSession = 0
+    /** Wall time (ms) this offload burst began, for the #1007 throughput line. Stamped by
+     *  [enterBackfilling] and NEVER cleared, so it holds the PREVIOUS burst's start between bursts - both
+     *  readers pair it with `backfilling`, which is only true when [enterBackfilling] has re-stamped it.
+     *  Read in [exitBackfilling] for a classified exit, and in [reset] for a burst a disconnect cut short -
+     *  the same two paths that already own [offloadFramesThisSession], so this adds no new thread. */
+    private var backfillStartedAtMs = 0L
     /** #174 deep-packet cooldown: wall time (ms) of the most recent offload frame OR HISTORY_COMPLETE.
      *  A type-0x2F arriving just after a backfill ends (backfilling already flipped false) is a TRAILING
      *  historical frame, not the live R22 stream, so it must not be counted as a "live deep packet".
@@ -2272,11 +2319,8 @@ class WhoopBleClient(
 
     // --- Offload frame drain (preserves START/data/END arrival order; port of routeBackfillFrame) ---
 
-    /** Ordered queue of offload frames awaiting the serial Backfiller drain. */
-    private val backfillFrameQueue = ConcurrentLinkedQueue<ByteArray>()
-
-    @Volatile
-    private var backfillDraining = false
+    /** Ordered queue + generation-safe owner for the serial Backfiller drain. */
+    private val backfillDrain = BackfillDrainGate<ByteArray>()
 
     /** Periodic re-offload + idle-watchdog tokens (handler-posted; cancelled on disconnect). */
     private val periodicBackfillRunnable = Runnable { triggerPeriodicBackfill() }
@@ -2397,9 +2441,6 @@ class WhoopBleClient(
     @SuppressLint("MissingPermission")
     fun connect(model: WhoopModel = WhoopModel.WHOOP4) {
         intentionalDisconnect = false
-        // Connection test mode: stamp when this connect attempt began so onConnectionStateChange can report
-        // the connect latency. A plain timestamp, no behaviour change; only read behind the CONNECTION gate.
-        connectAttemptStartedAtMs = System.currentTimeMillis()
         // PR #588: an explicit user-driven Connect is never an out-of-range retry — clear the involuntary-
         // reconnect streak so this scan (and any reconnects it spawns) starts back at the snappy
         // LOW_LATENCY scan mode + the 3s backoff base, never inheriting a backed-off lower-power scan.
@@ -4260,6 +4301,11 @@ class WhoopBleClient(
         // connect — onScanResult (pin now null) connects to the working strap when it advertises.
         resetReconnectBackoff()   // a deliberate re-adopt, not an out-of-range retry — start fresh
         intentionalDisconnect = false
+        // #1040: the FIFTH local-teardown route, and the only one that was never stamped — so the status-22
+        // drop it causes printed `via=unknown`, which the reason doc calls out as meaning exactly this: a
+        // teardown path that exists and is not tagged. A multi-WHOOP re-adopt looks identical in the trace
+        // to a bond-watchdog bounce without it.
+        noteLocalTeardown("readopt")   // #1020
         try {
             gatt?.disconnect()   // drop the dead-pin link → handleDisconnect → rescan (pin cleared)
         } catch (t: Throwable) {
@@ -4375,6 +4421,15 @@ class WhoopBleClient(
         // Close any prior/pending GATT so a direct-reconnect attempt doesn't leak the old client.
         // close() can throw on a dead binder (#314); swallow it — we're replacing the handle anyway.
         try { gatt?.close() } catch (t: Throwable) { log("prior gatt.close() threw ${t.javaClass.simpleName} (ignored)") }
+        // Connection test mode: stamp when THIS GATT attempt began, so onConnectionStateChange reports the
+        // latency of the attempt that just succeeded. Stamped here rather than in connect() (#1040): the
+        // auto-reconnect path never calls connect(), so the mark went stale and `latencyMs` was measured
+        // from the original user-initiated connect — #1040 reported latencyMs=7847081 (2.18 h) for a link
+        // that came up 6 seconds after the previous drop, and it grows without bound the longer a reconnect
+        // loop runs. connectToDevice is the single funnel every connect passes through, so every attempt
+        // now gets a fresh mark. Latency is therefore GATT-attempt time, no longer including scan time on
+        // the first connect. A plain timestamp; only read behind the CONNECTION gate.
+        connectAttemptStartedAtMs = System.currentTimeMillis()
         // autoConnect=false → a fast, direct connect (CoreBluetooth central.connect default), used for
         // the scan-discovered first connect. autoConnect=true → the OS reconnects whenever the bonded
         // strap is reachable WITHOUT needing an advertisement (used by the dropout auto-reconnect, #61).
@@ -6335,6 +6390,9 @@ class WhoopBleClient(
         decodedChunksThisSession = 0
         consoleChunksThisSession = 0
         offloadFramesThisSession = 0
+        // #1007: wall time the burst began, for the throughput line at exit. Its own field rather than
+        // reusing lastBackfillAtMs, which is the BackfillPolicy floor and measures from the last KICK.
+        backfillStartedAtMs = System.currentTimeMillis()
         historicalKickSent = false
         _state.update { it.copy(backfilling = true, syncChunksThisSession = 0) }
         refreshConnectionPriority()   // #477: escalate to HIGH for the offload burst (faster sync). No-op unless enabled.
@@ -6454,16 +6512,19 @@ class WhoopBleClient(
      * END chunk assembly is never reordered. Port of `routeBackfillFrame` + the serial drain task.
      */
     private fun routeBackfillFrame(frame: ByteArray) {
-        backfillFrameQueue.add(frame)
-        if (backfillDraining) return
-        backfillDraining = true
+        val lease = backfillDrain.enqueue(frame) ?: return
         ioScope.launch {
-            // A throw from ingest() must NEVER leave backfillDraining stuck true (that would wedge the
+            var ownsDrain = true
+            // A throw from ingest() must NEVER leave the drain stuck owned (that would wedge the
             // offload — every later frame returns early and the queue never drains). finally guarantees
-            // the flag is cleared even if a chunk handler throws. (#77/#91 hardening.)
+            // the lease is released even if a chunk handler throws. (#77/#91 hardening.)
             try {
                 while (true) {
-                    val f = backfillFrameQueue.poll() ?: break
+                    val f = backfillDrain.pollOrRelease(lease)
+                    if (f == null) {
+                        ownsDrain = false
+                        break
+                    }
                     try {
                         backfiller.ingest(f)
                     } catch (t: Throwable) {
@@ -6475,7 +6536,7 @@ class WhoopBleClient(
                     }
                 }
             } finally {
-                backfillDraining = false
+                if (ownsDrain) backfillDrain.release(lease)
             }
         }
     }
@@ -6501,7 +6562,7 @@ class WhoopBleClient(
             backfilling = false
             _state.update { it.copy(backfilling = false, syncChunksThisSession = 0) }
             handler.removeCallbacks(backfillTimeoutRunnable)
-            backfillFrameQueue.clear()
+            backfillDrain.clear()
             log("Backfill: no history frames arrived — retrying request (attempt ${whoop5HistoryAttempts + 1})")
             // Bounded mid-attempt retry (whoop5HistoryAttempts < 2): AUTO_CONTINUE so the 90s event floor
             // can't suppress it — it's continuing THIS connect's offload, not a fresh periodic kick.
@@ -6562,6 +6623,12 @@ class WhoopBleClient(
         // setFastLinkPhy's on→off edge calls it AFTER the flag is already false. So the default path still
         // issues ZERO BLE ops.
         if (fastLinkPhyEnabled) releasePreferredPhy()
+        // #1007: what the burst actually achieved. Emitted unconditionally (one line per offload, not per
+        // frame) so an ordinary exported strap log carries it — behind the test-mode gate it would need a
+        // reporter to find Test Centre first, which is the friction that left #477/#533 unvalidated.
+        val offloadElapsedMs =
+            if (backfillStartedAtMs > 0L) System.currentTimeMillis() - backfillStartedAtMs else -1L
+        log("Backfill: ${offloadThroughputLine(offloadFramesThisSession, offloadElapsedMs)} ($reason)")
         // #174: a backfill just ended. Start (or extend) the deep-packet cooldown from this instant so
         // any type-0x2F records the strap flushes in the seconds after the session aren't miscounted as
         // the live R22 stream — they're the offload's tail.
@@ -6669,6 +6736,9 @@ class WhoopBleClient(
                     else -> futureClockBanner
                 },
                 historySyncExperimental = whoop5HistoryExperimental,
+                // #612: set on EVERY HISTORY_COMPLETE (not just the empty branch) so a productive sync
+                // clears it immediately, exposing the streak previously reachable only via lastSyncError text.
+                sustainedEmptyOffload = sustainedEmpty,
             )
             "timeout" -> it.copy(
                 backfilling = false,
@@ -6688,7 +6758,7 @@ class WhoopBleClient(
             )
         } }
         handler.removeCallbacks(backfillTimeoutRunnable)
-        backfillFrameQueue.clear()
+        backfillDrain.clear()
         closeWhoop5BackfillCapture(flushSummary = true)
         log("Backfill: session ended — reason=$reason")
         // Inactivity reminder (#419): read-only hook on the natural offload completion (no cadence
@@ -7225,9 +7295,18 @@ class WhoopBleClient(
         disRead = false
         disSerial = null
         disHwRev = null
+        // #1007: a burst cut short by a disconnect never reaches exitBackfilling — that path is only
+        // HISTORY_COMPLETE / timeout / user-abort — so without this the throughput line simply would not
+        // appear, and its ABSENCE is ambiguous: no offload at all, or one that was interrupted? For a
+        // battery question those are opposite answers (the interrupted one spent radio for nothing).
+        // Logged here rather than by calling exitBackfilling, which would also release the connection
+        // priority and PHY and record a sync outcome — behaviour, on a path that does none of it today.
+        if (backfilling && backfillStartedAtMs > 0L) {
+            log("Backfill: ${offloadThroughputLine(offloadFramesThisSession,
+                System.currentTimeMillis() - backfillStartedAtMs)} (interrupted)")
+        }
         backfilling = false
-        backfillDraining = false
-        backfillFrameQueue.clear()
+        backfillDrain.reset()
         strapNewestTs = null
         offloadFramesThisSession = 0
         lastOffloadFrameAtMs = 0L   // #174: don't carry a stale cooldown reference into the next session
