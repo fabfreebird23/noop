@@ -212,6 +212,29 @@
             </intent-filter>
         </activity-alias>
 
+        <!-- FORK-ONLY (com.noop.dashboard). The whoop-garmin dashboard on this
+             same phone navigates to noopwg://sync to ask for an immediate
+             upload, because its "I just worked out" button otherwise had to
+             wait out the uploader's 3-hour period and show a pre-workout
+             Effort. No UI; finishes instantly. See DashboardSyncActivity for
+             why an Activity rather than a receiver, and why this is safe to
+             export. This is the ONE line our fork adds to a file upstream
+             touches — everything else lives in files upstream has never had. -->
+        <activity
+            android:name="com.noop.dashboard.DashboardSyncActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="noopwg" android:host="sync" />
+            </intent-filter>
+        </activity>
+
         <!-- Health Connect permissions-rationale route (Android 14+, platform Health Connect). -->
         <activity-alias
             android:name="ViewPermissionUsageActivity"
