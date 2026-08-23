@@ -303,7 +303,10 @@ final class SourceCoordinator: ObservableObject {
             log: straplog,   // generic-HR lifecycle → the SAME exported strap log (issue #421)
             // Surface the generic strap's standard Battery Service (0x180F) charge the SAME place the
             // WHOOP strap battery shows (the Live/device status), via the shared LiveState funnel.
-            onBattery: { [live] pct in live.setBattery(Double(pct)) })
+            onBattery: { [live] pct in live.setBattery(Double(pct)) },
+            // #polar-debug: read the toggle live at connect so a Polar strap logs its identified model
+            // (default off; the Test Centre only exposes the toggle when a Polar strap is paired).
+            polarDebug: { UserDefaults.standard.bool(forKey: AppModel.polarDebugLoggingKey) })
     }
 
     /// Build the isolated `FTMSSource` for a gym machine `id`. HR (when the machine reports it) rides the
@@ -328,6 +331,23 @@ final class SourceCoordinator: ObservableObject {
             },
             log: straplog,
             onBattery: { [live] pct in live.setBattery(Double(pct)) })
+    }
+
+    /// One duplicate-candidate's shape for the `dup-gen(#1284)` line: the window, its duration, and the two
+    /// measures that actually decide WHICH row is fuller — the stage-segment count and the decoded JSON
+    /// length. Duration cannot decide it on its own: the mode-1 re-anchor mints rows of IDENTICAL length at
+    /// two `0x49` onsets (measured 2026-08-14/15: three 390 min / 1333 B rows, and four 26 min / 266 B
+    /// fragments), so a duration-derived "code count" prints the same value for both members of the pair and
+    /// the corpus cannot adjudicate. Segments + JSON length are also the fields the issue's own analysis is
+    /// written in, so the log lines drop straight into it.
+    ///
+    /// Both terms are plain substring/length counts over the ASCII segments JSON — no parser, no locale, and
+    /// identical arithmetic in the Kotlin twin (`SourceCoordinator.dupGenShape`), so the two platforms' lines
+    /// compare directly.
+    private static func dupGenShape(_ s: CachedSleepSession) -> String {
+        let json = s.stagesJSON ?? ""
+        let segments = json.components(separatedBy: "\"stage\"").count - 1
+        return "[\(s.startTs) -> \(s.endTs)] min=\((s.endTs - s.startTs) / 60) segs=\(segments) json=\(json.utf8.count)"
     }
 
     /// Build the EXPERIMENTAL Oura source (Oura Ring gen 3/4/5) for `id`, driven by the clean-room
@@ -356,16 +376,64 @@ final class SourceCoordinator: ObservableObject {
             persist: { [storeHandle] streams in
                 Task { if let store = await storeHandle() { _ = try? await store.insert(streams, deviceId: id) } }
             },
-            persistSleepSession: { [storeHandle] session in
+            persistSleepSession: { [storeHandle, straplog] session in
                 // The ring-PROVIDED hypnogram night, upserted under the ring's OWN id (the imported/measured
                 // side, NOT the "-noop" computed sibling) so SleepMerge's imported-over-computed rule makes
                 // Oura's SleepNet staging win over NOOP's sparse-motion computed night (#325).
-                Task { if let store = await storeHandle() { _ = try? await store.upsertSleepSessions([session], deviceId: id) } }
+                Task {
+                    guard let store = await storeHandle() else { return }
+                    // #1284 duplicate-generation diagnostic (LOG-ONLY, no behaviour change). The in-source
+                    // `duplicate-gen(#1284)` line compares against a PER-CONNECTION memory list, so it is
+                    // blind to the common case: an overnight with link drops mints the duplicate across
+                    // DIFFERENT connections. Read the day's stored sessions here instead (cross-connection,
+                    // survives an app restart) and log — using the SAME `SleepSessionDedup.isDuplicate` rule
+                    // the heal uses — when this persist duplicates one. `startDelta` is END-ANCHOR DRIFT, NOT
+                    // 0x49 onset jitter: startTs is `end − laidCodes·30 s`, and the 0x49 onset is applied only
+                    // as a one-way PRE-onset clip (OuraLiveSource `sleepStart`), which does not bind when the
+                    // backward lay never reaches it — so every row can be tagged `[0x49-onset]` yet none start
+                    // AT the onset (08-16: 4,206 s startDelta over 21 s of real onset jitter). The two shapes
+                    // say WHICH row is fuller. One compact line per duplicate, to survive the log head-clip;
+                    // this is the corpus the generation-side 0x49-onset keying will be designed against.
+                    let from = session.startTs - 16 * 3600 - 3600
+                    let to = session.endTs + 3600
+                    // UNFILTERED window read: the keying guard MUST see a row already at the candidate's keyed
+                    // startTs (the common same-bucket collision). The dup-gen diagnostic excludes it inline.
+                    let stored = (try? await store.sleepSessions(deviceId: id, from: from, to: to, limit: 64)) ?? []
+                    for e in stored where e.startTs != session.startTs && SleepSessionDedup.isDuplicate(session, e) {
+                        straplog("Oura: dup-gen(#1284) persist \(SourceCoordinator.dupGenShape(session)) duplicates stored \(SourceCoordinator.dupGenShape(e)) startDelta=\(session.startTs - e.startTs)s (end-anchor drift) - cross-connection DB read")
+                    }
+                    if UserDefaults.standard.bool(forKey: AppModel.ouraOnsetKeyingKey) {
+                        // #1284 residual 3 (EXPERIMENTAL): completeness-guarded onset keying — suppress or
+                        // replace a duplicate re-serve BEFORE banking, so the wrong night never shows between
+                        // wake and the next analyze pass. Same collapse rule as the heal (`planBank`); `stored`
+                        // is UNFILTERED so a fuller row at the same keyed PK suppresses this candidate.
+                        let plan = SleepSessionDedup.planBank(candidate: session, existing: stored)
+                        if plan.bank {
+                            // Bank the survivor FIRST, retire the rows it supersedes only after it lands — so a
+                            // failed upsert never leaves the night with NEITHER the candidate nor its (deleted)
+                            // duplicates. On failure the stored rows are kept and the heal reconciles next pass.
+                            do {
+                                try await store.upsertSleepSessions([session], deviceId: id)
+                                for s in plan.supersededStarts {
+                                    _ = try? await store.deleteSleepSession(deviceId: id, startTs: s)
+                                }
+                                straplog("Oura: onset-key(#1284) banked \(SourceCoordinator.dupGenShape(session)) superseded \(plan.supersededStarts.count) stored row(s) - generation keying")
+                            } catch {
+                                straplog("Oura: onset-key(#1284) bank FAILED (\(error.localizedDescription)) - kept \(stored.count) stored row(s); heal will reconcile")
+                            }
+                        } else {
+                            straplog("Oura: onset-key(#1284) suppressed \(SourceCoordinator.dupGenShape(session)) - a stored same-night row is at least as complete")
+                        }
+                    } else {
+                        _ = try? await store.upsertSleepSessions([session], deviceId: id)
+                    }
+                }
             },
             log: straplog,
             onBattery: { [live] pct in live.setBattery(Double(pct)) },
             onModel: { [registry] model in registry.setModel(id, model: model) },   // #772: correct a name-guessed gen
             onSerial: { [weak self] serial in self?.adoptOuraSerial(currentId: id, serial: serial) },  // #771
+            onsetKeying: { UserDefaults.standard.bool(forKey: AppModel.ouraOnsetKeyingKey) },  // #1284 residual 3
             adoptIntent: adoptIntent)
         if adoptIntent { straplog("Oura: adopt consent granted - this session may install NOOP's key") }
         ouraSource = source   // the published typed handle for the adopt mirror (same object as activeSource)
@@ -421,6 +489,16 @@ final class SourceCoordinator: ObservableObject {
 
     // MARK: - Identity adoption
 
+    /// Stamp the row belonging to the strap that just DISCONNECTED, resolved by the identity it adopted
+    /// rather than by whatever is active now. On a multi-WHOOP install those are not the same row: make
+    /// another strap active while this one is live, and stamping "the active row" would record a sighting
+    /// of a strap that was never connected — the same mis-mapping the peripheralId guard above exists to
+    /// prevent. A uuid no row has adopted stamps nothing. (#1527)
+    private func touchLastSeen(forStrap uuid: String) {
+        guard let device = registry.device(forPeripheralId: uuid) else { return }
+        registry.touchLastSeen(device.id)
+    }
+
     /// The BLE engine connected to a WHOOP peripheral (`uuid`). Persist that stable identity onto the
     /// CURRENTLY ACTIVE device when it's a WHOOP and hasn't adopted one yet — so the legacy "my-whoop"
     /// learns its strap's id on first connect, and a freshly-paired WHOOP confirms its identity.
@@ -440,8 +518,16 @@ final class SourceCoordinator: ObservableObject {
         // Track the live strap's uuid for the WHOOP->WHOOP adopt-in-place skip (#74). nil is a
         // disconnect/never-connected republish: clear it so a later make-active can't wrongly match a stale
         // link, then fall through to the existing ignore.
+        let previouslyConnectedTo = connectedWhoopUuid
         connectedWhoopUuid = uuid
-        guard let uuid else { return }
+        guard let uuid else {
+            // Disconnect edge. The strap was in hand right up to this instant, so stamp it NOW rather than
+            // leaving the connect-time value: after a ten-hour overnight session that would have the card
+            // reading "Last seen 10 h ago" the moment the link dropped. Only when we were actually
+            // connected — a nil republish with no prior link is not a sighting. (#1527)
+            if let previouslyConnectedTo { touchLastSeen(forStrap: previouslyConnectedTo) }
+            return
+        }
 
         let activeId = registry.activeDeviceId
         guard isWhoop(activeId),
@@ -451,8 +537,9 @@ final class SourceCoordinator: ObservableObject {
         case .none:
             // First connect for this WHOOP row → adopt the strap's stable identity.
             registry.setPeripheralId(activeId, peripheralId: uuid)
+            registry.touchLastSeen(activeId)
         case .some(uuid):
-            break                               // already adopted this exact strap → nothing to do
+            registry.touchLastSeen(activeId)    // already adopted this exact strap → only the sighting is new
         case .some(let existing):
             // A DIFFERENT strap connected under this WHOOP row. Re-adopt ONLY when this is the #52 stale-pin
             // handoff — i.e. the engine is genuinely encrypted-bonded to the strap whose id just arrived.
@@ -463,6 +550,7 @@ final class SourceCoordinator: ObservableObject {
             if live.encryptedBond {
                 live.append(log: "Multi-WHOOP (#52): active device \(activeId) was pinned to strap \(existing) which refused to bond — re-adopting the working strap \(uuid).")
                 registry.setPeripheralId(activeId, peripheralId: uuid)
+                registry.touchLastSeen(activeId)
             } else {
                 live.append(log: "Multi-WHOOP: active device \(activeId) is registered to strap \(existing) but \(uuid) connected — not overwriting.")
             }

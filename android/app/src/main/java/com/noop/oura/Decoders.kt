@@ -19,6 +19,11 @@ package com.noop.oura
 
 object OuraDecoders {
 
+    /** #1284: minimum TRAILING run of 0xFF code bytes (1 byte = 4 epochs = 16 min) for [decodeSleepPhase]
+     *  to treat it as unwritten flash pad rather than continuous awake. Byte-identical to the Swift
+     *  `OuraDecoders.minTrailingUnwritten`. Conservative + tunable; measured pads ran 9-10 bytes. */
+    const val MIN_TRAILING_UNWRITTEN = 6
+
     /**
      * Decode a GetProductInfo reply body (serial page `18 03 08 00 10` or hardware page `18 03 18 00 10`,
      * both under outer op 0x19). On-device capture 2026-07-24 (Gen3): the body is `byte0 = 0x00 status, then
@@ -87,8 +92,16 @@ object OuraDecoders {
      * decoded to an 82% beat-to-beat >200ms "jump" rate (not a heartbeat train). This byte-scatter
      * layout yields a coherent ~60 bpm train (10% jump rate). Validated against open_oura. Byte-identical
      * twin of Swift's decodeIBIAmplitude.
+     *
+     * @param channel which tag's record this is. 0x60 and 0x44 share this layout byte for byte, so they
+     *   share the decoder — but they are different tags on the wire, and the caller states which one it
+     *   routed here so the beat carries its true origin (#1071 follow-up). Defaults to 0x60's channel,
+     *   which is what every existing call site means.
      */
-    fun decodeIBIAmplitude(rec: OuraRecord): List<OuraIBI>? {
+    fun decodeIBIAmplitude(
+        rec: OuraRecord,
+        channel: OuraIbiChannel = OuraIbiChannel.IBI_AMPLITUDE,
+    ): List<OuraIBI>? {
         val b = rec.payload
         if (b.size < 14) return null   // fixed 14-byte packet (body bytes 6..19)
         val b12 = b[12] and 0xFF
@@ -107,7 +120,12 @@ object OuraDecoders {
         for (k in 0 until 6) {
             if (ibi[k] <= 0) continue                      // drop a zero IBI, never invent one
             val amp = ((b[6 + k] and 0xFF) shr 1) shl shift   // 7-bit mantissa << exponent
-            out.add(OuraIBI(ringTimestamp = rec.ringTimestamp, ibiMs = ibi[k], amplitude = amp))
+            out.add(
+                OuraIBI(
+                    ringTimestamp = rec.ringTimestamp, ibiMs = ibi[k], amplitude = amp,
+                    channel = channel,
+                ),
+            )
         }
         return if (out.isEmpty()) null else out
     }
@@ -181,7 +199,12 @@ object OuraDecoders {
             val ibi = (b[i + 1] and 0x07) or ((b[i] and 0xFF) shl 3)   // high byte first
             val quality = (b[i + 1] shr 3) and 0x03
             if (quality == 1 && ibi in 300..2000) {
-                out.add(OuraIBI(ringTimestamp = rec.ringTimestamp, ibiMs = ibi))
+                out.add(
+                    OuraIBI(
+                        ringTimestamp = rec.ringTimestamp, ibiMs = ibi,
+                        channel = OuraIbiChannel.GREEN_QUALITY,
+                    ),
+                )
             }
             i += 2
             sampleCount += 1
@@ -210,7 +233,12 @@ object OuraDecoders {
         while (idx >= 1) {
             val ibi = b[idx] * 8                          // 8-bit count x8 -> ms
             if (ibi > 0) {
-                out.add(OuraIBI(ringTimestamp = rec.ringTimestamp, ibiMs = ibi))
+                out.add(
+                    OuraIBI(
+                        ringTimestamp = rec.ringTimestamp, ibiMs = ibi,
+                        channel = OuraIbiChannel.SPO2_IBI,
+                    ),
+                )
             }
             idx -= 1
         }
@@ -220,21 +248,53 @@ object OuraDecoders {
     // MARK: - HRV / RMSSD (0x5D; s6.9)
 
     /**
-     * Decode the 0x5D hrv_event: samples each carrying a time_ms field + two int8 fields (b1, b2).
-     * Per OURA_PROTOCOL.md s6.9 the per-sample stride is time(2 LE) + b1(1) + b2(1) = 4 bytes.
-     * Returns null on a short body. NOOP consumes this as the ring's OWN RMSSD-derived HRV tag.
+     * Decode the 0x5D hrv_event: a run of (u8 avg HR bpm, u8 avg RMSSD ms) pairs, ONE per 5-min bucket
+     * (per open_oura decode_hrv / OURA_PROTOCOL.md s6.9). The previous layout read a 4-byte
+     * (u16 time, int8, int8) stride — a mis-framing that garbled the first (hr,rmssd) byte-pair into a
+     * bogus time_ms, sign-flipped the RMSSD byte, and only its b1 accidentally landed on a real HR byte.
+     * Both bytes are UNSIGNED (no scaling). Returns null on an empty or ODD-length body (no partial pair).
+     * Validated overnight: the hr byte tracks sleeping HR (~52 bpm, matching the #511 IBI-derived median).
+     * Twin of Swift decodeHRV.
+     *
+     * PADDING (#1128): a record that closes early pads its tail with a `00 00` pair, and that is NOT a
+     * reading — a stored `hr_bpm: 0` is a value the ring never asserted, indistinguishable downstream from
+     * a measurement. Observed on a real overnight: 2 of 22 records were partial, both padded, and both
+     * zero pairs persisted into the 5-min series beside 110 genuine buckets running 45-64 bpm. They are
+     * skipped here, at decode, so an absent bucket stays absent instead of becoming a zero one.
+     *
+     * The test is BOTH bytes zero — the exact padding signature — not `hrBpm == 0` alone. A lone zero HR
+     * beside a non-zero RMSSD has never been observed, and if it ever occurs it is a DIFFERENT fault (a
+     * real record with a bad byte) that should stay visible rather than be silently swallowed by a padding
+     * rule. Narrower is the honest choice while one night is all the evidence there is.
+     *
+     * `index` advances for EVERY pair, including a skipped one, because it is not a label: the consumer
+     * derives the bucket's wall-clock from it (`OuraStreamMapping`, `bucketTs = ts - index * 300`).
+     * Renumbering the survivors would slide every later bucket 5 minutes. That is invisible for TAIL
+     * padding — the only shape observed — which is exactly why it is pinned by test instead of by luck.
      */
     fun decodeHRV(rec: OuraRecord): List<OuraHRV>? {
         val b = rec.payload
-        if (b.size < 4) return null
+        if (b.size < 2 || b.size % 2 != 0) return null   // N complete (hr, rmssd) pairs
+        val pairCount = b.size / 2       // BEFORE any padding pair is dropped — see OuraHRV.count
         val out = ArrayList<OuraHRV>()
         var i = 0
-        while (i + 4 <= b.size) {
-            val timeMs = u16le(b, i)
-            val v1 = i8(b[i + 2])
-            val v2 = i8(b[i + 3])
-            out.add(OuraHRV(ringTimestamp = rec.ringTimestamp, timeMs = timeMs, b1 = v1, b2 = v2))
-            i += 4
+        var index = 0
+        while (i + 2 <= b.size) {
+            val hr = b[i]
+            val rmssd = b[i + 1]
+            if (!(hr == 0 && rmssd == 0)) {
+                out.add(
+                    OuraHRV(
+                        ringTimestamp = rec.ringTimestamp,
+                        index = index,
+                        hrBpm = hr,
+                        rmssdMs = rmssd,
+                        count = pairCount,
+                    ),
+                )
+            }
+            i += 2
+            index += 1
         }
         return if (out.isEmpty()) null else out
     }
@@ -269,10 +329,24 @@ object OuraDecoders {
         while (i < b.size) {
             val raw = b[i]
             if (raw == 0xFF) break                       // terminator
-            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = raw))
+            // The samples are one PER SECOND, so each carries its position in the record: ringTimestamp
+            // stays the record's anchor and the consumer spreads them over their own seconds. Without the
+            // position the offset is unrecoverable downstream and 12 of every 13 samples collide away on
+            // the (deviceId, ts) primary key (#1070). Swift twin matches exactly.
+            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = raw, index = out.size))
             i += 1
         }
-        return if (out.isEmpty()) null else out
+        return if (out.isEmpty()) null else stampSampleCount(out)
+    }
+
+    /**
+     * Fill in `count` (the number of samples the record yielded) on every sample of one record. The
+     * total is only known once the body has been walked, so the decoders stamp `index` inline and the
+     * count in one pass at the end. Twin of Swift `stampSampleCount`.
+     */
+    private fun stampSampleCount(samples: List<OuraSpO2>): List<OuraSpO2> {
+        val n = samples.size
+        return samples.map { it.copy(count = n) }
     }
 
     // MARK: - SpO2 stable, BIG-endian (0x7B; s6.6)
@@ -310,16 +384,18 @@ object OuraDecoders {
         }
         val out = ArrayList<OuraSpO2>()
         if (hasBase) {
-            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = acc, unit = "dc_raw"))
+            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = acc, unit = "dc_raw", index = 0))
         }
         while (i < b.size) {
             val v = i8(b[i])
             val mag = Math.abs(v) shl scale
             acc += if (v < 0) -mag else mag
-            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = acc, unit = "dc_raw"))
+            // Same per-sample position as 0x6F (see #1070): this record is multi-sample too, and its
+            // samples reach the same (deviceId, ts)-keyed table, so they collide the same way.
+            out.add(OuraSpO2(ringTimestamp = rec.ringTimestamp, value = acc, unit = "dc_raw", index = out.size))
             i += 1
         }
-        return if (out.isEmpty()) null else out
+        return if (out.isEmpty()) null else stampSampleCount(out)
     }
 
     // MARK: - Temperature (0x46 / 0x69 / 0x75; s6.8)
@@ -431,7 +507,7 @@ object OuraDecoders {
         if (b.size > 5) {
             val tailBytes = ByteArray(b.size - 1) { b[it + 1].toByte() }
             // Swift trims the NUL character set; match that exactly (trim only U+0000, not whitespace).
-            text = String(tailBytes, Charsets.UTF_8).trim('\u0000')
+            text = strictUtf8(tailBytes)?.trim('\u0000')
         }
         return OuraState(ringTimestamp = rec.ringTimestamp, stateCode = code, text = text)
     }
@@ -458,8 +534,16 @@ object OuraDecoders {
     fun decodeDebugText(rec: OuraRecord): String? {
         if (rec.payload.isEmpty()) return null
         val raw = ByteArray(rec.payload.size) { rec.payload[it].toByte() }
-        return String(raw, Charsets.UTF_8)
+        return strictUtf8(raw)
     }
+
+    private fun strictUtf8(bytes: ByteArray): String? = runCatching {
+        Charsets.UTF_8.newDecoder()
+            .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+            .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+            .decode(java.nio.ByteBuffer.wrap(bytes))
+            .toString()
+    }.getOrNull()
 
     // MARK: - Sleep phase, 2-bit codes (0x4E / 0x5A; s6.12)
 
@@ -472,17 +556,48 @@ object OuraDecoders {
         val b = rec.payload
         // body[0] is the header (spec offset 6); phase codes begin at body[1].
         if (b.size < 2) return null
+        // #1246: a whole record of 0xFF is an UNWRITTEN (erased-flash) hypnogram page, not sleep — the ring
+        // serves pages of it for a stretch it never classified (confirmed on-device: SpO2/R-R go dark in the
+        // SAME window). The 2-bit unpack would read each 0xFF as `11 11 11 11` = four AWAKE, manufacturing
+        // hours of fake wake (one night: 320 of 334 "awake" min were padding → 36 % efficiency). Detect it
+        // at the RECORD level (unambiguous; a byte-level filter would eat the four genuine AWAKE epochs that
+        // also encode as 0xFF) and flag the epochs unwritten so the assembler drops them as a GAP while they
+        // still hold their place in the time axis. Byte-parity twin of the Swift decodeSleepPhase.
+        // Require >=2 code bytes so a LONE 0xFF byte — four genuine AWAKE epochs, which also encode as 0xFF
+        // (the reporter's explicit caution) — is never mistaken for an erased page. Observed erased pages
+        // are whole ~13-byte records; a single byte is real wake.
+        val codeCount = b.size - 1
+        val allUnwritten = codeCount >= 2 && (1 until b.size).all { (b[it].toInt() and 0xFF) == 0xFF }
+        // #1284: a PARTLY-written page fills front-to-back and leaves the TAIL as 0xFF pad, which the
+        // whole-record rule misses. Flag a TRAILING run of >= MIN_TRAILING_UNWRITTEN consecutive 0xFF code
+        // bytes (to the record's end) as unwritten too. Trailing-only + a run floor, on purpose: a
+        // leading/interior 0xFF run stays real wake (a pre-onset run is dropped by the assembler's onset
+        // clip), and a short trailing run is spared. Byte-parity twin of the Swift decodeSleepPhase.
+        // Floor clamped to >= 2 (see Swift): a LONE trailing 0xFF is four genuine awake epochs (the #1246
+        // case), and the whole-record rule only fires at codeCount >= 2 — the trailing rule must never undercut
+        // that even if MIN_TRAILING_UNWRITTEN is lowered by someone who hasn't read #1284.
+        val effectiveFloor = maxOf(2, MIN_TRAILING_UNWRITTEN)
+        var trailingFF = 0
+        var t = b.size - 1
+        while (t >= 1 && (b[t].toInt() and 0xFF) == 0xFF) { trailingFF++; t-- }
+        val trailingStart = if (trailingFF >= effectiveFloor) codeCount - trailingFF else codeCount
         val out = ArrayList<OuraSleepPhase>()
         var index = 0
         for (k in 1 until b.size) {
             val byte = b[k]
+            val byteUnwritten = allUnwritten || (k - 1) >= trailingStart
             // MSB-first within the byte: [7:6] is the first code.
             var shift = 6
             while (shift >= 0) {
                 val code = (byte shr shift) and 0x03
                 val stage = OuraSleepStage.fromRaw(code)
                 if (stage != null) {
-                    out.add(OuraSleepPhase(ringTimestamp = rec.ringTimestamp, index = index, stage = stage))
+                    out.add(
+                        OuraSleepPhase(
+                            ringTimestamp = rec.ringTimestamp, index = index,
+                            stage = stage, unwritten = byteUnwritten,
+                        ),
+                    )
                     index += 1
                 }
                 shift -= 2
@@ -491,30 +606,88 @@ object OuraDecoders {
         return if (out.isEmpty()) null else out
     }
 
+    // MARK: - Sleep period info (0x6A; s6.12) - Tier B, third-party field names
+
+    /**
+     * Decode the 0x6A sleep_period_info: a fixed 10-byte body carrying the ring's OWN per-window sleep
+     * summary - an average heart rate and a CANDIDATE breath rate. Field names and multipliers are a
+     * clean-room fact citation of [open_ring]'s `decode_sleep_period_info_2`
+     * (`parse_api_sleep_period_info`, multipliers from its `.rodata` block); no code is copied. See
+     * [OuraSleepPeriodInfo] for what our own captures do and do not establish, and OURA_PROTOCOL.md
+     * s6.12.
+     *   byte0 = average_hr, u8 * 0.5      (so wire 130 = 65 bpm - NOT a bare bpm byte)
+     *   byte1 = hr_trend,   s8 * 0.0625   (the only SIGNED field in the body)
+     *   byte2 = mzci,       u8 * 0.0625
+     *   byte3 = dzci,       u8 * 0.0625
+     *   byte4 = breath,     u8 / 8.0      (breaths per minute - the reason this tag matters)
+     *   byte5 = breath_v,   u8 / 8.0
+     *   byte6 = motion_count, u8          (source DECLARES < 121)
+     *   byte7 = sleep_state,  u8          (source DECLARES in {0,1,2})
+     *   byte8-9 = cv, u16 LE / 65536      (so [0,1))
+     *
+     * Returns null on a short body OR when either declared invariant is violated. Rejecting on the
+     * invariants is deliberate and is what makes this decode falsifiable rather than credulous: the
+     * source's own parser throws there, so a body that breaks them is not this layout, and the honest
+     * answer is "not decoded" rather than a number built from bytes that mean something else. It costs
+     * nothing on real data - all 3,493 records across four consecutive Gen 3 overnights pass both.
+     * Byte-identical twin of Swift's `decodeSleepPeriodInfo`.
+     */
+    fun decodeSleepPeriodInfo(rec: OuraRecord): OuraSleepPeriodInfo? {
+        val b = rec.payload
+        if (b.size < 10) return null
+        val motionCount = b[6]
+        val sleepState = b[7]
+        if (motionCount >= 121 || sleepState > 2) return null   // the source's own invariants
+        return OuraSleepPeriodInfo(
+            ringTimestamp = rec.ringTimestamp,
+            averageHrBpm = b[0] * 0.5,
+            hrTrend = i8(b[1]) * 0.0625,
+            mzci = b[2] * 0.0625,
+            dzci = b[3] * 0.0625,
+            breathsPerMin = b[4] / 8.0,
+            breathVariability = b[5] / 8.0,
+            motionCount = motionCount,
+            sleepState = sleepState,
+            cv = u16le(b, 8).toDouble() / 65536.0,
+        )
+    }
+
     // MARK: - Motion period, 2-bit MOTION_STATE codes (0x6B; s6.13)
 
     /**
-     * Decode the 0x6B motion_period: 12-bit period header, byte6 bits[5:4]=leading-symbol count, then
-     * 2-bit MOTION_STATE codes, 4 per byte (MSB-first). 0=NO_MOTION,1=RESTLESS,2=TOSSING,3=ACTIVE.
-     * Per OURA_PROTOCOL.md s6.13. Returns null on a short body. The first two bytes carry the period
-     * header; codes follow from byte index 2.
+     * Decode the 0x6B motion_period: a compact run of 2-bit MOTION_STATE codes. Layout cross-checked
+     * against the native parse_api_motion_period (attribution, not a port — re-derived from a real capture;
+     * OURA_PROTOCOL.md s6.13), the SAME shape as the validated decodeSleepPhase (one header byte, then 2-bit
+     * codes from byte 1):
+     *   byte0 = header — bits[7:6] period_type; bits[5:4] = `count` of valid codes in the FINAL byte;
+     *           bits[3:0] = a rolling mod-16 sequence counter (record ordering / dedup, not a state).
+     *   byte1… = 2-bit codes, 4 per byte, MSB-first; every byte carries 4 codes EXCEPT the last, which
+     *           carries `count` — where `count == 0` means 4 (a full final byte): the field is 2 bits but the
+     *           byte holds up to 4 codes, so 4 wraps to 0. In a real capture all 81 `count == 0` records have
+     *           a NON-ZERO final byte (0xc0/0x80/0x40), never 0x00, confirming 0 ⇒ 4 not 0 ⇒ empty.
+     * 0=NO_MOTION, 1=RESTLESS, 2=TOSSING, 3=ACTIVE. Returns null on a body too short to hold the header
+     * plus one code byte (< 2), or when no codes result. The header's low-nibble sequence counter is what
+     * pins this layout: in a real capture it increments and wraps mod-16 across consecutive records,
+     * proving byte0 is a header and codes begin at byte1 — NOT the earlier reading (byte0/1 a 12-bit
+     * period, codes from byte2). Byte-identical twin of Swift.
      */
     fun decodeMotionPeriod(rec: OuraRecord): List<OuraMotion>? {
         val b = rec.payload
-        if (b.size < 3) return null
+        if (b.size < 2) return null
+        val countField = (b[0] shr 4) and 0x03      // bits[5:4] of the header: codes in the FINAL byte
+        val lastCount = if (countField == 0) 4 else countField   // 0 encodes a full (4-code) final byte
         val out = ArrayList<OuraMotion>()
         var index = 0
-        for (k in 2 until b.size) {
+        for (k in 1 until b.size) {
+            val n = if (k == b.size - 1) lastCount else 4   // last byte carries `lastCount` codes; others 4
             val byte = b[k]
-            var shift = 6
-            while (shift >= 0) {
-                val code = (byte shr shift) and 0x03
+            for (j in 0 until n) {
+                val code = (byte shr (6 - 2 * j)) and 0x03
                 val state = OuraMotionState.fromRaw(code)
                 if (state != null) {
                     out.add(OuraMotion(ringTimestamp = rec.ringTimestamp, index = index, state = state))
                     index += 1
                 }
-                shift -= 2
             }
         }
         return if (out.isEmpty()) null else out
@@ -583,5 +756,77 @@ object OuraDecoders {
             met.add(Math.round(raw * 100.0) / 100.0)
         }
         return OuraActivityInfo(ringTimestamp = rec.ringTimestamp, state = b[0], met = met)
+    }
+
+    // MARK: - Real steps features (0x7E/0x7F; s6.13) - Tier B, third-party formula
+
+    /**
+     * The byte offset at which a real_steps record's packed field block starts, per tag.
+     *
+     * `0x7E` starts at byte 0. **`0x7F` starts at byte 2** - its block is shifted by two bytes, so
+     * applying `0x7E`'s layout to it (what this decoder did until 2026-08-01) mis-assembles every
+     * field. Established from a real 5,122-record capture:
+     * - Aligning `0x7F`'s per-byte statistics onto `0x7E`'s scores a **+2** shift at total error 19.0
+     *   vs 58.6 for the next-best offset (a 3x separation); at +2 the per-byte mean, standard
+     *   deviation AND MSB-set rate all match.
+     * - The carry-bit test is decisive: fields 0/8 take their 9th bit from a neighbouring byte's MSB,
+     *   which for a real carry bit sits near 50% set. `0x7E` reads 49.7% and 49.0%; `0x7F` at the OLD
+     *   (unshifted) offsets read 41.6% and **17.5%** - byte 11 at 17.5% is plainly a data byte, not a
+     *   carry bit - and at +2 reads 51.6% and 45.3%.
+     * - Behaviourally, `0x7F`'s field 0 decoded to an INVERTED movement signal (Cohen's d = -1.72
+     *   against a sleep-vs-activity contrast, i.e. higher at rest); at +2 it reads +2.36, matching
+     *   `0x7E`'s own +2.35, and paired-window agreement goes r = -0.557 -> **+0.790**.
+     *
+     * See OURA_PROTOCOL.md s6.13. NOOP's own finding - not in the [oura-rs] source, which applies one
+     * layout to both tags. Byte-identical twin of Swift's `realStepsFieldOffset`.
+     */
+    internal fun realStepsFieldOffset(tag: Int): Int = if (tag == OuraEventTag.REAL_STEPS_2.raw) 2 else 0
+
+    /**
+     * Decode a `0x7E`/`0x7F` real_steps_features record's bit-packed field block.
+     * Formula ([oura-rs] - Th0rgal/open_oura `crates/oura-protocol/src/events.rs`, clean-room fact
+     * citation, no code copied): fields 0 and 8 are 9-bit values built as `byte*2 + carry_bit`, where
+     * the carry bit is the MSB of a neighboring byte (block byte 3's MSB for field 0, block byte 11's
+     * MSB for field 8) - the same byte then also supplies field 3 / field 11 from its own low 7 bits.
+     * Fields 1, 2, 9, 10 are a bare `byte<<1` (no carry completion). Fields 4-7 and 12-13 are plain
+     * bytes. Returns null unless the body is exactly 14 bytes (the source's own length gate).
+     *
+     * TAG-DEPENDENT OFFSET (NOOP, 2026-08-01): the block starts at byte 0 for `0x7E` but at **byte 2**
+     * for `0x7F` - see [realStepsFieldOffset] for the evidence. Consequences for `0x7F`:
+     * - It yields **12 fields, not 14**: fields 12/13 would need block bytes 12/13 = record bytes
+     *   14/15, which do not exist in a 14-byte body. They are OMITTED rather than zero-filled - a
+     *   fabricated zero would be indistinguishable from a real one (honest-data invariant).
+     * - CONFIDENCE TIERS on the 12 it does yield, from the same capture: **fields 0-7 are validated**
+     *   (mean and standard deviation match `0x7E`'s to ~1%, and the sleep-vs-activity effect size
+     *   matches within 0.13 on two independent contrasts); **field 8 is likely right** (effect +2.82 vs
+     *   `0x7E`'s +2.33, r = +0.854, but its mean is offset); **fields 9-11 remain uncertain** (they
+     *   improve but do not converge, consistent with the block being truncated by the record boundary).
+     *   All 12 are emitted because the only consumer is the Tier-B research sidecar; nothing is scored.
+     *
+     * Byte-identical twin of Swift's `decodeRealStepsFields`.
+     */
+    fun decodeRealStepsFields(rec: OuraRecord): OuraRealStepsFields? {
+        val p = rec.payload
+        if (p.size != 14) return null
+        val off = realStepsFieldOffset(rec.type)
+        fun b(i: Int): Int = p[off + i]
+        val fields = mutableListOf(
+            (b(3) shr 7) or (b(0) shl 1),
+            b(1) shl 1,
+            b(2) shl 1,
+            b(3) and 0x7f,
+            b(4), b(5), b(6), b(7),
+            (b(11) shr 7) or (b(8) shl 1),
+            b(9) shl 1,
+            b(10) shl 1,
+            b(11) and 0x7f,
+        )
+        // Fields 12/13 exist only when the block starts at byte 0 (0x7E); for 0x7F they would read past
+        // the 14-byte body, so they are omitted rather than invented.
+        if (off == 0) {
+            fields.add(b(12))
+            fields.add(b(13))
+        }
+        return OuraRealStepsFields(tag = rec.type, ringTimestamp = rec.ringTimestamp, fields = fields)
     }
 }

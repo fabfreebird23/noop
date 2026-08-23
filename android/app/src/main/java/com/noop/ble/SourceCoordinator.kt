@@ -9,6 +9,7 @@ import com.noop.data.StreamBatch
 import com.noop.data.WhoopRepository
 import com.noop.oura.OuraRingGen
 import com.noop.oura.OuraWearState
+import com.noop.ui.NoopPrefs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -102,7 +103,24 @@ class SourceCoordinator(
      *  generic-HR strap path (a footpod / bike sensor / power meter rides StandardHrSource). Default no-op
      *  keeps existing call sites + JVM tests compiling unchanged. */
     private val sensorSink: (StandardHrSource.SensorMetrics) -> Unit = {},
+    /** Initial registry id for process composition. Nullable keeps plain JVM harnesses honest until their
+     * first successful reconcile; production injects its already-resolved startup id. */
+    initialActiveDeviceId: String? = null,
+    /** Move Oura's install key alongside serial-identity adoption. Plain JVM tests inject a no-op;
+     * production retains the encrypted-store behavior through this default. */
+    private val migrateOuraInstallKey: (fromId: String, toId: String) -> Unit = { fromId, toId ->
+        context?.let { ctx ->
+            OuraInstallKeyStore.load(ctx, fromId)?.let { key ->
+                OuraInstallKeyStore.save(ctx, toId, key)
+                OuraInstallKeyStore.clear(ctx, fromId)
+            }
+        }
+    },
 ) {
+
+    /** The single success-only active-id publication for UI and internal identity-adoption consumers. */
+    private val _activeDeviceId = MutableStateFlow(initialActiveDeviceId)
+    val activeDeviceId: StateFlow<String?> = _activeDeviceId.asStateFlow()
 
     /** Latest instantaneous speed/cadence/power from the active standard fitness sensor (RSC/CSC/CPS),
      *  read ADDITIVELY alongside HR by [StandardHrSource]. The in-workout UI observes this to surface the
@@ -169,7 +187,7 @@ class SourceCoordinator(
     fun start() {
         scope.launch {
             val id = registry.activeDeviceId() ?: WhoopBleClient.DEFAULT_DEVICE_ID
-            reconcileLock.withLock { reconcile(id) }
+            reconcileActiveDevice(id)
         }
     }
 
@@ -179,7 +197,36 @@ class SourceCoordinator(
      * repeated call for the same id is dropped (the `removeDuplicates()` equivalent).
      */
     fun onActiveDeviceChanged(id: String) {
-        scope.launch { reconcileLock.withLock { reconcile(id) } }
+        scope.launch { reconcileActiveDevice(id) }
+    }
+
+    /**
+     * Await the serialized source switch and report its completed outcome. Callers which publish active
+     * source state must use this API so they never advertise an id whose activation later failed.
+     * Re-selecting the already reconciled id is a successful, idempotent completion.
+     */
+    suspend fun reconcileActiveDevice(id: String): Boolean =
+        reconcileLock.withLock {
+            reconcile(id).also { success ->
+                if (success) _activeDeviceId.value = id
+            }
+        }
+
+    /** Stamp the row belonging to the strap that just DISCONNECTED, resolved by the identity it adopted
+     *  rather than by whatever is active now. On a multi-WHOOP install those are not the same row: make
+     *  another strap active while this one is live, and stamping "the active row" would record a sighting of
+     *  a strap that was never connected — the same mis-mapping the peripheralId guard below exists to
+     *  prevent. An address no row has adopted stamps nothing.
+     *
+     *  Matched the way the connect path below matches — `ignoreCase` — and NOT through
+     *  [DeviceRegistry.deviceForPeripheralId], whose `WHERE peripheralId = ?` is case-SENSITIVE in SQLite.
+     *  A stored address differing only in case is the same strap to the guard below, so resolving it more
+     *  strictly here would adopt on connect and then silently stamp nothing on disconnect — the same
+     *  quiet staleness this whole change exists to remove. The Swift twin keeps its exact lookup because
+     *  its connect path compares exactly too; each side matches ITS OWN adopt rule. (#1527) */
+    private suspend fun touchLastSeenForStrap(address: String) {
+        val row = registry.all().firstOrNull { it.peripheralId.equals(address, ignoreCase = true) } ?: return
+        registry.touchLastSeen(row.id)
     }
 
     /**
@@ -200,8 +247,18 @@ class SourceCoordinator(
         // Track the live strap's address for the WHOOP->WHOOP adopt-in-place skip (#74). A null address is a
         // disconnect/never-connected republish: clear it so a later make-active can't wrongly match a stale
         // link, then fall through to the existing ignore.
+        val previouslyConnectedTo = connectedWhoopAddress
         connectedWhoopAddress = address
-        if (address == null) return
+        if (address == null) {
+            // Disconnect edge. The strap was in hand right up to this instant, so stamp it NOW rather than
+            // leaving the connect-time value: after a ten-hour overnight session that would have the card
+            // reading "Last seen 10 h ago" the moment the link dropped. Only when we were actually
+            // connected — a null republish with no prior link is not a sighting. (#1527)
+            if (previouslyConnectedTo != null) {
+                scope.launch { runCatching { touchLastSeenForStrap(previouslyConnectedTo) } }
+            }
+            return
+        }
         scope.launch {
             val activeId = registry.activeDeviceId() ?: return@launch
             val devices = registry.all()
@@ -210,11 +267,14 @@ class SourceCoordinator(
 
             val existing = row.peripheralId
             when {
-                existing == null ->
+                existing == null -> {
                     // First connect for this WHOOP row → adopt the strap's stable identity (its address).
                     registry.setPeripheralId(activeId, address)
+                    registry.touchLastSeen(activeId)
+                }
                 existing.equals(address, ignoreCase = true) -> {
-                    // Already adopted this exact strap → nothing to do.
+                    // Already adopted this exact strap → only the sighting is new. (#1527)
+                    registry.touchLastSeen(activeId)
                 }
                 else ->
                     // A DIFFERENT strap connected under this WHOOP row. Never silently overwrite — that would
@@ -227,10 +287,9 @@ class SourceCoordinator(
         }
     }
 
-    private suspend fun reconcile(id: String) {
-        if (id == lastSeenId) return
+    private suspend fun reconcile(id: String): Boolean {
+        if (id == lastSeenId) return true
         lastSeenId = id
-        val devices = registry.all()
         // CONTAIN every device-switch failure here. reconcile is the single entry point for both
         // start() (launch, against the PERSISTED active id) and onActiveDeviceChanged(), and it runs
         // inside a bare `scope.launch {}` — a SupervisorJob does NOT stop an uncaught throw from
@@ -239,13 +298,16 @@ class SourceCoordinator(
         // regression: making a Polar H10 active bricked the app). A strap switch must never crash the
         // app. We log the exception into the EXPORTABLE strap log too, so the next shared log reveals
         // the exact underlying throw, and reset lastSeenId so the user can retry after switching away.
-        try {
+        return try {
+            val devices = registry.all()
             if (isWhoop(id, devices)) switchToWhoop(id, devices) else switchToStrap(id, devices)
+            true
         } catch (t: Throwable) {
             lastSeenId = null
             log("SourceCoordinator: device switch to '$id' failed: ${t.javaClass.simpleName}: ${t.message}")
             straplog("HR-strap: activating this device failed (${t.javaClass.simpleName}: ${t.message}) - " +
                 "staying on the previous source. Please share this log so we can fix it.")
+            false
         }
     }
 
@@ -387,9 +449,31 @@ class SourceCoordinator(
                         _sensorMetrics.value = metrics
                         sensorSink(metrics)
                     },
+                    // #polar-debug: read the toggle live at connect so a Polar strap logs its identified
+                    // model (default off; the Test Centre only exposes the toggle when a Polar strap is paired).
+                    polarDebug = { NoopPrefs.polarDebugLogging(ctx) },
                 )
             }
         }
+    }
+
+    /**
+     * One duplicate-candidate's shape for the `dup-gen(#1284)` line: the window, its duration, and the two
+     * measures that actually decide WHICH row is fuller — the stage-segment count and the decoded JSON
+     * length. Duration cannot decide it on its own: the mode-1 re-anchor mints rows of IDENTICAL length at
+     * two `0x49` onsets (measured 2026-08-14/15: three 390 min / 1333 B rows, and four 26 min / 266 B
+     * fragments), so a duration-derived "code count" prints the same value for both members of the pair and
+     * the corpus cannot adjudicate. Segments + JSON length are also the fields the issue's own analysis is
+     * written in, so the log lines drop straight into it.
+     *
+     * Both terms are plain substring/length counts over the ASCII segments JSON — no parser, no locale, and
+     * identical arithmetic in the Swift twin (`SourceCoordinator.dupGenShape`), so the two platforms' lines
+     * compare directly.
+     */
+    private fun dupGenShape(startTs: Long, endTs: Long, stagesJSON: String?): String {
+        val json = stagesJSON ?: ""
+        val segments = json.split("\"stage\"").size - 1
+        return "[$startTs -> $endTs] min=${(endTs - startTs) / 60} segs=$segments json=${json.length}"
     }
 
     /**
@@ -423,12 +507,64 @@ class SourceCoordinator(
                 // staging over NOOP's sparse-motion computed night (#325).
                 scope.launch {
                     runCatching {
-                        repo.upsertSleepSessions(listOf(com.noop.data.SleepSession(
+                        val session = com.noop.data.SleepSession(
                             deviceId = deviceId, startTs = s.startTs, endTs = s.endTs,
-                            efficiency = s.efficiency, stagesJSON = s.stagesJson)))
+                            efficiency = s.efficiency, stagesJSON = s.stagesJson)
+                        // #1284 duplicate-generation diagnostic (LOG-ONLY). The in-source
+                        // duplicate-gen(#1284) line compares a PER-CONNECTION memory list, so it is blind to
+                        // the common case: an overnight with link drops mints the duplicate across DIFFERENT
+                        // connections. Read the day's stored sessions here (cross-connection, survives an app
+                        // restart) and log — using the SAME SleepSessionDedup.isDuplicate rule the heal uses —
+                        // when this persist duplicates one. startDelta is END-ANCHOR DRIFT, NOT 0x49 onset
+                        // jitter: startTs is `end - laidCodes*30 s`, and the 0x49 onset is applied only as a
+                        // one-way PRE-onset clip (OuraLiveSource sleepStart), which does not bind when the
+                        // backward lay never reaches it — so every row can be tagged [0x49-onset] yet none
+                        // start AT the onset (08-16: 4,206 s startDelta over 21 s of real onset jitter). The
+                        // two shapes say WHICH row is fuller. One compact line per duplicate, to survive the
+                        // log head-clip; this is the corpus the generation-side 0x49-onset keying targets.
+                        //
+                        // ISOLATED in its own runCatching: log-only means log-only. The read below is a DB
+                        // round-trip on the BLE persist path and CAN throw (locked DB, disk I/O, a store
+                        // closed under a background teardown); sharing the outer runCatching would let a
+                        // failed DIAGNOSTIC skip the upsert underneath it and silently lose the night. The
+                        // Swift twin contains its read the same way (`(try? ...) ?? []`).
+                        runCatching {
+                            val from = s.startTs - 16 * 3600 - 3600
+                            val to = s.endTs + 3600
+                            repo.sleepSessions(deviceId, from, to, 64)
+                                .filter { it.startTs != s.startTs && com.noop.analytics.SleepSessionDedup.isDuplicate(session, it) }
+                                .forEach { e ->
+                                    straplog("Oura: dup-gen(#1284) persist ${dupGenShape(s.startTs, s.endTs, s.stagesJson)} duplicates stored ${dupGenShape(e.startTs, e.endTs, e.stagesJSON)} startDelta=${s.startTs - e.startTs}s (end-anchor drift) - cross-connection DB read")
+                                }
+                        }
+                        if (NoopPrefs.ouraOnsetKeying(ctx)) {
+                            // #1284 residual 3 (EXPERIMENTAL): completeness-guarded onset keying — suppress or
+                            // replace a duplicate re-serve BEFORE banking. UNFILTERED read so a fuller row at the
+                            // candidate's keyed PK suppresses it; a read failure falls back to empty → bank the
+                            // candidate (safe default). Mirrors the Swift twin's structure + FAILED log.
+                            val from = s.startTs - 16 * 3600 - 3600
+                            val to = s.endTs + 3600
+                            val nearby = runCatching { repo.sleepSessions(deviceId, from, to, 64) }.getOrDefault(emptyList())
+                            val plan = com.noop.analytics.SleepSessionDedup.planBank(session, nearby)
+                            if (plan.bank) {
+                                // Bank the survivor FIRST, retire what it supersedes only after it lands — so a
+                                // failed upsert never leaves the night with neither the candidate nor its deleted
+                                // duplicates; on failure the stored rows are kept and the heal reconciles next pass.
+                                runCatching {
+                                    repo.upsertSleepSessions(listOf(session))
+                                    nearby.filter { it.startTs in plan.supersededStarts }.forEach { row -> runCatching { repo.deleteSleepSessionRowOnly(row) } }
+                                    straplog("Oura: onset-key(#1284) banked ${dupGenShape(s.startTs, s.endTs, s.stagesJson)} superseded ${plan.supersededStarts.size} stored row(s) - generation keying")
+                                }.onFailure { straplog("Oura: onset-key(#1284) bank FAILED (${it.message}) - kept ${nearby.size} stored row(s); heal will reconcile") }
+                            } else {
+                                straplog("Oura: onset-key(#1284) suppressed ${dupGenShape(s.startTs, s.endTs, s.stagesJson)} - a stored same-night row is at least as complete")
+                            }
+                        } else {
+                            repo.upsertSleepSessions(listOf(session))
+                        }
                     }
                 }
             },
+            onsetKeying = { NoopPrefs.ouraOnsetKeying(ctx) },  // #1284 residual 3
             log = straplog,           // Oura connect/auth/stream lifecycle → the SAME exported strap log (#421)
             onBattery = batterySink,  // ring battery → the same live state the WHOOP strap battery uses
             onModel = { model -> scope.launch { runCatching { registry.setModel(id, model) } } },  // #772: correct a name-guessed gen
@@ -465,16 +601,12 @@ class SourceCoordinator(
      * off the BLE callback thread; re-checks it is still the active device before acting.
      */
     private fun adoptOuraSerial(currentId: String, serial: String) {
-        val ctx = context ?: return
         val serialId = "${ExperimentalBrand.OURA.idPrefix}-$serial"
         if (currentId == serialId) return
         scope.launch {
             if (registry.activeDeviceId() != currentId) return@launch
             if (registry.adoptSerialIdentity(currentId, serialId)) {
-                OuraInstallKeyStore.load(ctx, currentId)?.let { key ->
-                    OuraInstallKeyStore.save(ctx, serialId, key)
-                    OuraInstallKeyStore.clear(ctx, currentId)
-                }
+                migrateOuraInstallKey(currentId, serialId)
                 straplog("Oura: adopted stable serial id $serialId (was $currentId) - re-pointing onto the ring's serial (#771)")
                 registry.setActive(serialId)
                 onActiveDeviceChanged(serialId)

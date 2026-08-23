@@ -169,6 +169,10 @@
       "Max 4"
     ],
     [
+      "android/app/src/main/java/com/noop/ui/CompareScreen.kt",
+      "\\u2014"
+    ],
+    [
       "android/app/src/main/java/com/noop/ui/CoupledScreen.kt",
       "A classic one-glance read of NOOP's own scores. Same data, different lens."
     ],
@@ -473,40 +477,24 @@
       "r = %+.2f"
     ],
     [
+      "android/app/src/main/java/com/noop/ui/NoopLimitationsScreen.kt",
+      "${row.feature}: WHOOP 4.0 ${row.whoop4.spoken}, 5.0/MG ${row.whoop5.spoken}"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/NoopLimitationsScreen.kt",
+      "5.0/MG"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/NoopLimitationsScreen.kt",
+      "Feature"
+    ],
+    [
       "android/app/src/main/java/com/noop/ui/NotificationsSettingsScreen.kt",
       "Buzzes your wrist"
     ],
     [
       "android/app/src/main/java/com/noop/ui/NotificationsSettingsScreen.kt",
       "Off"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/OnboardingScreen.kt",
-      "Deep blue accent on a dark blue-grey canvas."
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/OnboardingScreen.kt",
-      "Deep blue accent on warm paper."
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/OnboardingScreen.kt",
-      "Following your phone's light/dark setting."
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/OnboardingScreen.kt",
-      "Re-scan"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/OnboardingScreen.kt",
-      "Scan again"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/OnboardingScreen.kt",
-      "Your strap is bonded and ready to stream."
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/OnboardingScreen.kt",
-      "Your strap is bonded · ${it.toInt()}% battery."
     ],
     [
       "android/app/src/main/java/com/noop/ui/PipBar.kt",
@@ -522,11 +510,19 @@
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
-      "Adds your VO₂max estimate"
+      "Auto · ${profile.hrMaxAuto} bpm (Tanaka)"
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
-      "Auto · ${profile.hrMaxAuto} bpm (Tanaka)"
+      "Background image"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Blood Oxygen: strap estimate"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Browse files"
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
@@ -534,15 +530,23 @@
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Choose from Photos"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
       "Choose photo"
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
-      "Collapsed"
+      "Fill"
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
-      "Expanded"
+      "Fit"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Let the background show through every card. Tune how much just below."
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
@@ -554,10 +558,6 @@
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
-      "Optional · adds your VO₂max estimate"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
       "Put the strap on first. The deep stream is on-wrist only."
     ],
     [
@@ -566,19 +566,59 @@
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Recent"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Remove image"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Replace from Photos"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Scaling"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Scores today's hour-by-hour stress timeline against YOUR own cross-day baseline "
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
       "Searching…"
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
-      "Strap accepted ${live.r22FlagsAccepted}/15 R22 flags…"
+      "Show custom background"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Sleep chart"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Stress: personal daytime baseline"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Stretch"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Surfaces the WHOOP 5/MG strap's nightly SpO₂ estimate (spo2_candidate_82) in the "
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Tile"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
+      "Transparent cards"
     ],
     [
       "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
       "Wear the strap, tap once, then let it sync and share your strap log."
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/SettingsScreen.kt",
-      "✓ Strap accepted all 15 R22 flags"
     ],
     [
       "android/app/src/main/java/com/noop/ui/SkinTempCardsScreen.kt",
@@ -599,14 +639,6 @@
     [
       "android/app/src/main/java/com/noop/ui/SleepScreen.kt",
       "Raw on-device stages"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/SleepScreen.kt",
-      "Removes this recorded sleep and recomputes the day without it. NOOP won't re-detect sleep in this window. You can undo for a few seconds after."
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/SleepScreen.kt",
-      "Removes this sleep and recomputes the day without it. You can undo for a few seconds after."
     ],
     [
       "android/app/src/main/java/com/noop/ui/SleepScreen.kt",
@@ -657,60 +689,28 @@
       "Today's value is your recorded daily stress score (0-3)."
     ],
     [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "CALIBRATING"
+      "android/app/src/main/java/com/noop/ui/TestCentreScreen.kt",
+      "Capturing… reproduce the issue, then share the log below."
     ],
     [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "Calibrating , no heart rate banked yet today. Your curve fills in as the strap offloads."
+      "android/app/src/main/java/com/noop/ui/TestCentreScreen.kt",
+      "Detailed capture to file"
     ],
     [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "How ${it.label} is calculated"
+      "android/app/src/main/java/com/noop/ui/TestCentreScreen.kt",
+      "Oura onset keying (experimental)"
     ],
     [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "How this score is calculated"
+      "android/app/src/main/java/com/noop/ui/TestCentreScreen.kt",
+      "Polar debug logging"
     ],
     [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "No heart rate for this day. Step back to a day the strap was worn."
+      "android/app/src/main/java/com/noop/ui/TestCentreScreen.kt",
+      "Share captured log"
     ],
     [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "No heart rate in the last ${hrWindow.label}. Try a wider window or Today."
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "Not connected"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "Pinch to zoom · drag to pan"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "SOLID"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "Show all metrics ($hidden)"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "Show fewer"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "Strap battery"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "Strap battery ${it.roundToInt()} percent"
-    ],
-    [
-      "android/app/src/main/java/com/noop/ui/TodayScreen.kt",
-      "Zoomed in · drag to pan"
+      "android/app/src/main/java/com/noop/ui/TrendsScreen.kt",
+      "Share recap"
     ],
     [
       "android/app/src/main/java/com/noop/ui/UpdateStore.kt",
@@ -754,6 +754,14 @@
     ],
     [
       "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
+      "Active calories"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
+      "Active-calorie heatmap, last 13 weeks"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
       "Add"
     ],
     [
@@ -782,6 +790,14 @@
     ],
     [
       "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
+      "Export route"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
+      "FIT"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
       "Finish selecting"
     ],
     [
@@ -790,7 +806,23 @@
     ],
     [
       "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
+      "GPX"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
+      "Last 13 weeks · daily burn"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
+      "Less"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
       "Logged sessions across ${effectiveRange.caption}."
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
+      "More"
     ],
     [
       "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
@@ -799,6 +831,10 @@
     [
       "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
       "Save"
+    ],
+    [
+      "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
+      "Save this GPS route as a file to import into Strava, Garmin Connect, or another app. "
     ],
     [
       "android/app/src/main/java/com/noop/ui/WorkoutsScreen.kt",
@@ -867,36 +903,12 @@
       "\\(value), \\(label!)"
     ],
     [
-      "Packages/StrandDesign/Sources/StrandDesign/DayNavBar.swift",
-      "Next day"
-    ],
-    [
-      "Packages/StrandDesign/Sources/StrandDesign/DayNavBar.swift",
-      "Pick a date"
-    ],
-    [
-      "Packages/StrandDesign/Sources/StrandDesign/DayNavBar.swift",
-      "Previous day"
-    ],
-    [
-      "Packages/StrandDesign/Sources/StrandDesign/TrendChart.swift",
-      "Trend"
-    ],
-    [
       "Packages/StrandDesign/Sources/StrandDesign/YearHeatStrip.swift",
       "\\(DateFormatterCache.day.string(from: day.date)) · recovery \\(Int(score.rounded()))"
     ],
     [
       "Strand/Liquid/LiquidPrimitives.swift",
       "%.\\(decimals)f"
-    ],
-    [
-      "Strand/Liquid/LiquidTodayView.swift",
-      " \\(unit)"
-    ],
-    [
-      "Strand/Liquid/LiquidTodayView.swift",
-      "Arrange Today sections"
     ],
     [
       "Strand/Screens/AddDeviceWizard.swift",
@@ -960,10 +972,6 @@
     ],
     [
       "Strand/Screens/JournalLogCard.swift",
-      "Edit \\(item.display)"
-    ],
-    [
-      "Strand/Screens/JournalLogCard.swift",
       "Hide this item"
     ],
     [
@@ -1008,6 +1016,10 @@
     ],
     [
       "Strand/Screens/SettingsView.swift",
+      "Blood Oxygen: strap estimate (WHOOP 5/MG)"
+    ],
+    [
+      "Strand/Screens/SettingsView.swift",
       "Date of birth, age \\(profile.age) years"
     ],
     [
@@ -1016,11 +1028,23 @@
     ],
     [
       "Strand/Screens/SettingsView.swift",
+      "Scores your hour-by-hour stress timeline against YOUR own cross-day baseline (how your days usually run, Oura-style) instead of the day's own calm hours. Needs a few worn days; until then it stays on the default. The high-stress cutoff is tuned from a single-subject reference so far, so it's an alternative lens rather than the default. HR-only, and it never feeds recovery or illness scoring. Off by default."
+    ],
+    [
+      "Strand/Screens/SettingsView.swift",
+      "Stress: personal daytime baseline"
+    ],
+    [
+      "Strand/Screens/SettingsView.swift",
       "Trend chart style"
     ],
     [
       "Strand/Screens/SettingsView.swift",
       "WHOOP 5.0 / MG · motion → steps"
+    ],
+    [
+      "Strand/Screens/SettingsView.swift",
+      "Your WHOOP 5.0/MG sends a strap-computed SpO₂ percentage (the @82 candidate byte) every second. An 8-night independent validation tracked it at corr +0.99 against the WHOOP app, but two nights on the original test device moved the OPPOSITE direction — device/firmware variance is unresolved. Turning this on surfaces the nightly mean in the Blood Oxygen tile as \\\"strap estimate (unverified)\\\" when no calibrated import exists. It never feeds recovery or illness scoring. WHOOP 4.0 has no @82 stream, so this does nothing there."
     ],
     [
       "Strand/Screens/SleepView.swift",
@@ -1051,8 +1075,20 @@
       "Today's value is your recorded daily stress score (0-3)."
     ],
     [
-      "Strand/Screens/TodayView.swift",
-      "Acute (7-day) vs chronic (28-day) training load. 0.8-1.3 is the sweet spot."
+      "Strand/Screens/TestCentreView.swift",
+      "Keys each Oura sleep night on its stable 0x49 onset and suppresses duplicate re-serves at the source, instead of the shipped end-anchored persist (#1284). Off by default — a hardware-validation toggle. Watch the strap log for \\u{201C}onset-key(#1284)\\u{201D} lines."
+    ],
+    [
+      "Strand/Screens/TestCentreView.swift",
+      "Oura onset keying (experimental)"
+    ],
+    [
+      "Strand/Screens/TestCentreView.swift",
+      "Polar debug logging"
+    ],
+    [
+      "Strand/Screens/TestCentreView.swift",
+      "\\(identity). Logs this to the strap log on each connect, so a Polar bug report shows the model NOOP resolved your strap to."
     ],
     [
       "Strand/Screens/TrendsView.swift",
@@ -1081,10 +1117,6 @@
     [
       "Strand/Screens/WorkoutsView.swift",
       "Clear filters"
-    ],
-    [
-      "Strand/Screens/WorkoutsView.swift",
-      "Clear search"
     ],
     [
       "Strand/Screens/WorkoutsView.swift",

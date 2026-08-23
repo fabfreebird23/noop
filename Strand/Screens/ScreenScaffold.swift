@@ -46,9 +46,9 @@ struct ScreenScaffold<Content: View, Trailing: View>: View {
             Color.clear.frame(height: 0).id(screenScaffoldTopAnchorID)
             column
             #if os(iOS)
-            // Unified side margins matching the liquid home (16pt) so every page's cards + header line up
+            // Unified side margins matching the floating navigation bar so every page's cards + header line up
             // to the same edges (2026-07-02); macOS keeps the classic 28 in the #else branch.
-            .padding(.horizontal, 16)
+            .padding(.horizontal, NoopMetrics.screenHPadding)
             .padding(.top, 24)
             // The tab bar floats over the scroll content, so the last card sat hidden behind it.
             // Reserve extra bottom scroll room so every screen's final card clears the floating bar.
@@ -115,23 +115,15 @@ struct ScreenScaffold<Content: View, Trailing: View>: View {
     }
 
     private var header: some View {
-        // When a `topBackground` (the day-cycle liquid sky) sits behind the header, that band is dark in
-        // BOTH themes — so the title/subtitle must use the scheme-invariant on-dark tokens. The regular
-        // text tokens flip to dark ink in Light mode and went dark-on-dark over the sky, exactly the #1013
-        // pattern the Liquid Today hero hit (osifaind's Trends-tab sibling report). Flat-canvas screens
-        // (no topBackground) keep the theme tokens so the header reads on the light/dark surfaceBase.
-        let overSky = topBackground != nil
-        let titleColor = overSky ? StrandPalette.onDarkPrimary : StrandPalette.textPrimary
-        let subtitleColor = overSky ? StrandPalette.onDarkSecondary : StrandPalette.textSecondary
-        return HStack(alignment: .center, spacing: 12) {
+        HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 if let title {
                     // Match the liquid home's title face (SF Rounded 28) so every page's header reads
                     // identically (2026-07-02 cohesion pass).
-                    Text(title).font(StrandFont.rounded(28)).foregroundStyle(titleColor)
+                    Text(title).font(StrandFont.rounded(28)).foregroundStyle(StrandPalette.textPrimary)
                 }
                 if let subtitle {
-                    Text(subtitle).font(StrandFont.subhead).foregroundStyle(subtitleColor)
+                    Text(subtitle).font(StrandFont.subhead).foregroundStyle(StrandPalette.textSecondary)
                 }
             }
             Spacer(minLength: 0)

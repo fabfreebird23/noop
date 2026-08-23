@@ -46,21 +46,65 @@ class OuraStreamMappingTest {
     }
 
     @Test
-    fun hrvBecomesOuraHrvEventWithRawFieldsNotRmssd() {
+    fun hrvBecomesOuraHrvEventWithHrAndRmssd() {
         val s = OuraStreamMapping.streams(
-            listOf(OuraEvent.Hrv(OuraHRV(ringTimestamp = 5, timeMs = 1000, b1 = 7, b2 = -3))),
+            listOf(OuraEvent.Hrv(OuraHRV(ringTimestamp = 5, index = 0, hrBpm = 52, rmssdMs = 47))),
             anchor,
         )
         assertEquals(1, s.events.size)
         val ev = s.events.first()
         assertEquals(OuraStreamMapping.EVENT_HRV, ev.kind)
         assertEquals("OURA_HRV", ev.kind)
-        assertEquals(base + 5, ev.ts)
-        // HONEST: the ring's OWN raw tag fields only; NEVER a fabricated rmssd_ms.
-        assertEquals(1000, ev.payload["time_ms"])
-        assertEquals(7, ev.payload["b1"])
-        assertEquals(-3, ev.payload["b2"])
-        assertTrue("must not fabricate rmssd_ms", !ev.payload.containsKey("rmssd_ms"))
+        // #1167: a 1-pair record's single bucket is the span [ts-300, ts) — its five minutes END at the
+        // record time, so it is stamped 300 s before it.
+        assertEquals(base + 5 - 300, ev.ts)
+        // Layout pinned (u8 bpm, u8 ms) → honestly labelled fields; keys/values match the Swift twin.
+        assertEquals(0, ev.payload["pair_index"])
+        assertEquals(52, ev.payload["hr_bpm"])
+        assertEquals(47, ev.payload["rmssd_ms"])
+    }
+
+    // Each 5-min bucket must land on its OWN timestamp: the event key is (deviceId, ts, kind), so pairs
+    // sharing the record ts would collide on insert and only one survive. #1167: the record's FIRST pair
+    // is its OLDEST bucket and the record ts marks the END of the covered span, so pair `index` sits
+    // (count - index) * 300 s before it and the LAST pair's five minutes end exactly at the record time.
+    // Twin of the Swift OuraStreamMapping test.
+    @Test
+    fun hrvMultiBucketGetsDistinctFiveMinTimestamps() {
+        val s = OuraStreamMapping.streams(
+            listOf(
+                OuraEvent.Hrv(OuraHRV(ringTimestamp = 5, index = 0, hrBpm = 52, rmssdMs = 47, count = 3)),
+                OuraEvent.Hrv(OuraHRV(ringTimestamp = 5, index = 1, hrBpm = 54, rmssdMs = 44, count = 3)),
+                OuraEvent.Hrv(OuraHRV(ringTimestamp = 5, index = 2, hrBpm = 55, rmssdMs = 41, count = 3)),
+            ),
+            anchor,
+        )
+        assertEquals(3, s.events.size)
+        // Distinct, 300 s apart, ascending in time, ending at the record time.
+        assertEquals(listOf(base + 5 - 900, base + 5 - 600, base + 5 - 300), s.events.map { it.ts })
+        assertEquals(3, s.events.map { it.ts }.toSet().size)
+        assertEquals(listOf(0, 1, 2), s.events.map { it.payload["pair_index"] })
+        assertEquals(listOf(52, 54, 55), s.events.map { it.payload["hr_bpm"] })
+        assertEquals(listOf(47, 44, 41), s.events.map { it.payload["rmssd_ms"] })
+    }
+
+    // #1167 + #1131 together: a dropped `00 00` pad must still be COUNTED, or every surviving bucket in
+    // that record slides. The record had 4 pairs and the decoder dropped index 1, so the survivors keep
+    // the exact slots they would have had with the pad present — a 300 s hole at ts-600, NOT three buckets
+    // closing up. This is the mid-record shape observed in the field on 2026-08-08. Twin of Swift.
+    @Test
+    fun hrvDroppedPaddingPairStillConsumesItsSlot() {
+        val s = OuraStreamMapping.streams(
+            listOf(
+                OuraEvent.Hrv(OuraHRV(ringTimestamp = 5, index = 0, hrBpm = 52, rmssdMs = 47, count = 4)),
+                // index 1 was the `00 00` pad — never emitted by the decoder.
+                OuraEvent.Hrv(OuraHRV(ringTimestamp = 5, index = 2, hrBpm = 55, rmssdMs = 41, count = 4)),
+                OuraEvent.Hrv(OuraHRV(ringTimestamp = 5, index = 3, hrBpm = 56, rmssdMs = 39, count = 4)),
+            ),
+            anchor,
+        )
+        assertEquals(listOf(base + 5 - 1200, base + 5 - 600, base + 5 - 300), s.events.map { it.ts })
+        assertEquals(listOf(0, 2, 3), s.events.map { it.payload["pair_index"] })
     }
 
     @Test
@@ -130,7 +174,73 @@ class OuraStreamMappingTest {
         assertEquals(1, s.spo2.size)
         assertEquals(97, s.spo2.first().red)
         assertEquals(0, s.spo2.first().ir) // unread channel, never a fabricated second reading
+        // Single-sample records (count == 1) keep the record's own second, exactly as before #1070.
         assertEquals(base + 1, s.spo2.first().ts)
+    }
+
+    // #1070: `spo2Sample` is keyed (deviceId, ts). A 0x6F record's 13 per-second samples used to be
+    // written at the record's single `ts`, so twelve collided away on insert and the night was stored at
+    // 1/13 resolution — permanently, since the ring trims its banked history once the offload is acked.
+    // Swift twin: OuraStreamMappingTests.testSpO2PerSampleRecordGetsThirteenDistinctSeconds. The seconds
+    // asserted here are IDENTICAL to the ones the Swift test asserts (parity contract).
+    @Test
+    fun spo2PerSampleRecordGetsThirteenDistinctSeconds() {
+        val n = 13
+        val events = (0 until n).map {
+            OuraEvent.Spo2(OuraSpO2(ringTimestamp = 100, value = 950 + it, unit = "raw", index = it, count = n))
+        }
+        val s = OuraStreamMapping.streams(events, anchor)
+
+        assertEquals(n, s.spo2.size)
+        // Thirteen DISTINCT seconds: nothing can collide on the primary key.
+        assertEquals(n, s.spo2.map { it.ts }.toSet().size)
+        // Laid BACKWARD at 1 s from the record anchor, so the LAST sample keeps the record's own ts.
+        val recordTs = base + 100
+        assertEquals(((recordTs - n + 1)..recordTs).toList(), s.spo2.map { it.ts })
+        assertEquals(recordTs, s.spo2.last().ts)
+        // Order is preserved, so sample i still carries sample i's value.
+        assertEquals((0 until n).map { 950 + it }, s.spo2.map { it.red })
+    }
+
+    @Test
+    fun spo2AdjacentRecordsTileAtTheNominalCadence() {
+        // Packets arrive ~13 s apart carrying 13 values, so back-laying tiles the interval exactly:
+        // at the NOMINAL cadence consecutive records produce a gapless, non-overlapping series.
+        // The tight tail is covered separately below.
+        val n = 13
+        fun secondsFor(ringTs: Long): List<Int> = OuraStreamMapping.streams(
+            (0 until n).map {
+                OuraEvent.Spo2(OuraSpO2(ringTimestamp = ringTs, value = 950, unit = "raw", index = it, count = n))
+            },
+            anchor,
+        ).spo2.map { it.ts }
+
+        val a = secondsFor(100)
+        val b = secondsFor(113)
+        assertTrue(a.toSet().intersect(b.toSet()).isEmpty())
+        assertEquals(((base + 100 - n + 1)..(base + 113)).toList(), a + b)
+    }
+
+    @Test
+    fun spo2TightCadenceOverlapsByExactlyOneSecond() {
+        // The cadence has a tight tail (p10 12 s). Back-laying 13 samples from a record only 12 s after
+        // the previous one makes the newer record's FIRST second equal the older record's LAST — one
+        // sample lost at that boundary on the (deviceId, ts) key. That is bounded and expected, not a
+        // regression: measured over a real overnight it costs 0.84 % of samples, against 92.3 % before.
+        // Pins the bound at ONE second so a future change to the lay cannot widen it silently.
+        // PARITY: the Swift twin asserts the IDENTICAL overlap.
+        val n = 13
+        fun secondsFor(ringTs: Long): List<Int> = OuraStreamMapping.streams(
+            (0 until n).map {
+                OuraEvent.Spo2(OuraSpO2(ringTimestamp = ringTs, value = 950, unit = "raw", index = it, count = n))
+            },
+            anchor,
+        ).spo2.map { it.ts }
+
+        val a = secondsFor(100)
+        val b = secondsFor(112)
+        assertEquals(setOf(base + 100), a.toSet().intersect(b.toSet()))
+        assertEquals(2 * n - 1, a.toSet().union(b.toSet()).size)
     }
 
     @Test
@@ -169,6 +279,77 @@ class OuraStreamMappingTest {
         assertTrue(s.hr.isEmpty())
     }
 
+    // --- Batching a record's events into one persist (#1072, root cause for #823) ---
+
+    /**
+     * The defect's shape: [assignRrSeq]'s `ord` counter is batch-local, so a record's beats only get a
+     * real emission order if they reach the store TOGETHER. Grouping is by the resolved second, and the
+     * `ord` values it produces are asserted end-to-end here. Twin of the Swift
+     * `testBatchedGroupsOneRecordsBeatsIntoASingleBatch`.
+     */
+    @Test
+    fun batchedGroupsOneRecordsBeatsIntoASinglePersist() {
+        val beats = listOf(812, 795, 840, 801, 833)
+        val stamped = beats.map { ms ->
+            OuraEvent.Ibi(OuraIBI(ringTimestamp = 10, ibiMs = ms)) as OuraEvent to base + 10
+        }
+        val batches = OuraStreamMapping.batched(stamped)
+        assertEquals("one record's beats must be ONE batch, not five", 1, batches.size)
+        assertEquals(base + 10, batches[0].first)
+
+        // Through the production widening (StreamPersistence.toBatch) so the ord assertion is on the
+        // rows the DAO actually inserts.
+        val rr = StreamPersistence.toBatch(OuraStreamMapping.streams(batches[0].second) { base + 10 }).rr
+        assertEquals(beats, rr.map { it.rrMs })
+        // ord is what the whole change exists for: emission order, not 0 on every row.
+        assertEquals(listOf(0, 1, 2, 3, 4), assignRrSeq("ring", rr).map { it.ord })
+    }
+
+    /** The pre-fix shape, pinned so it cannot come back: one beat per persist can only ever write 0. */
+    @Test
+    fun onePersistPerBeatRecordsNoOrder() {
+        val ords = listOf(812, 795, 840).map { ms ->
+            assignRrSeq("ring", listOf(RrRow(base.toLong(), ms))).single().ord
+        }
+        assertEquals(listOf(0, 0, 0), ords)
+    }
+
+    /** Distinct seconds stay distinct batches, in arrival order — `ord` numbers within a second. */
+    @Test
+    fun batchedKeepsDistinctTimestampsSeparateAndInArrivalOrder() {
+        val batches = OuraStreamMapping.batched(
+            listOf(
+                OuraEvent.Ibi(OuraIBI(ringTimestamp = 13, ibiMs = 800)) as OuraEvent to base + 13,
+                OuraEvent.Ibi(OuraIBI(ringTimestamp = 13, ibiMs = 810)) as OuraEvent to base + 13,
+                OuraEvent.Ibi(OuraIBI(ringTimestamp = 10, ibiMs = 900)) as OuraEvent to base + 10,
+            ),
+        )
+        assertEquals(listOf(base + 13, base + 10), batches.map { it.first })
+        assertEquals(listOf(2, 1), batches.map { it.second.size })
+    }
+
+    /** Interleaved same-second events fold into one batch, relative order preserved. */
+    @Test
+    fun batchedFoldsInterleavedSameSecondEventsIntoOneBatch() {
+        val batches = OuraStreamMapping.batched(
+            listOf(
+                OuraEvent.Ibi(OuraIBI(ringTimestamp = 10, ibiMs = 800)) as OuraEvent to base + 10,
+                OuraEvent.Ibi(OuraIBI(ringTimestamp = 11, ibiMs = 900)) as OuraEvent to base + 11,
+                OuraEvent.Ibi(OuraIBI(ringTimestamp = 10, ibiMs = 810)) as OuraEvent to base + 10,
+            ),
+        )
+        assertEquals(2, batches.size)
+        assertEquals(
+            listOf(800, 810),
+            OuraStreamMapping.streams(batches[0].second) { base + 10 }.rr.map { it.rrMs },
+        )
+    }
+
+    @Test
+    fun batchedOnEmptyInputYieldsNoBatches() {
+        assertTrue(OuraStreamMapping.batched(emptyList()).isEmpty())
+    }
+
     @Test
     fun tierBAndActivityInfoNeverMapToAStream() {
         // HONEST-DATA INVARIANT (PR #960): Tier-B raw summaries AND the decoded-but-unvalidated 0x50
@@ -185,6 +366,11 @@ class OuraStreamMappingTest {
                 OuraEvent.ActivityInfo(
                     com.noop.oura.OuraActivityInfo(ringTimestamp = 100, state = 0x41, met = listOf(1.8, 1.9)),
                 ),
+                // 0x7E/0x7F real_steps_features: decoded but Tier-B - must never mint a `steps` row
+                // either. Ground truth showed no field is a count; they are model inputs (s6.13).
+                OuraEvent.RealStepsFields(
+                    com.noop.oura.OuraRealStepsFields(tag = 0x7E, ringTimestamp = 100, fields = (0..13).toList()),
+                ),
             ),
             anchor,
         )
@@ -194,5 +380,67 @@ class OuraStreamMappingTest {
         assertTrue(s.battery.isEmpty())
         assertTrue(s.spo2.isEmpty())
         assertTrue(s.skinTemp.isEmpty())
+        assertTrue(s.resp.isEmpty())
+    }
+
+    // MARK: - 0x6A sleep_period_info -> respiration instrumentation
+
+    private fun sleepPeriod(bpm: Double, ringTimestamp: Long = 100) = OuraEvent.SleepPeriodInfo(
+        com.noop.oura.OuraSleepPeriodInfo(
+            ringTimestamp = ringTimestamp, averageHrBpm = 53.0, hrTrend = -0.625, mzci = 3.75,
+            dzci = 1.75, breathsPerMin = bpm, breathVariability = 4.625,
+            motionCount = 0, sleepState = 1, cv = 0.25,
+        ),
+    )
+
+    /**
+     * `breath` becomes ONE resp row, in milli-bpm, at the record's own ts - and nothing else about the
+     * record reaches a durable stream. The other fields are the whole reason the record was dropped
+     * wholesale before: `averageHrBpm` at a ~5-min cadence would sit in the same series as the
+     * beat-derived HR channel with no way to tell them apart afterwards. Swift twin:
+     * `testSleepPeriodInfoMapsBreathToRespirationAndNothingElse`.
+     */
+    @Test
+    fun sleepPeriodInfoMapsBreathToRespirationAndNothingElse() {
+        val s = OuraStreamMapping.streams(listOf(sleepPeriod(14.375)), anchor)
+        assertEquals(1, s.resp.size)
+        assertEquals(base + 100, s.resp[0].ts)
+        assertEquals(14_375, s.resp[0].raw)
+        assertTrue(s.hr.isEmpty())
+        assertTrue(s.rr.isEmpty())
+        assertTrue(s.events.isEmpty())
+        assertTrue(s.skinTemp.isEmpty())
+        assertTrue(s.spo2.isEmpty())
+    }
+
+    /**
+     * Every value the wire can express survives the round trip exactly - the point of the milli scale,
+     * and the property that makes the two platforms agree without a rounding rule. The field is a
+     * `u8 / 8`, so the whole alphabet is 0..31.875 bpm in 0.125 steps. Swift twin:
+     * `testEveryWireBreathValueRoundTripsExactly`.
+     */
+    @Test
+    fun everyWireBreathValueRoundTripsExactly() {
+        for (byte in 0..255) {
+            val bpm = byte / 8.0
+            val s = OuraStreamMapping.streams(listOf(sleepPeriod(bpm)), anchor)
+            assertEquals(byte * 125, s.resp[0].raw)
+            assertEquals(bpm, OuraRespScale.breathsPerMin(s.resp[0].raw), 1e-12)
+        }
+    }
+
+    /**
+     * Each record keeps its OWN anchored second, so a night's ~5-min windows land where they were
+     * measured. The rows are keyed (deviceId, ts), so two records sharing a second would collapse to
+     * one - the failure mode that cost 92% of an overnight's SpO2 before #1070.
+     */
+    @Test
+    fun sleepPeriodInfoRecordsKeepTheirOwnTimestamps() {
+        val s = OuraStreamMapping.streams(
+            listOf(sleepPeriod(14.375, 100), sleepPeriod(14.5, 396), sleepPeriod(15.0, 692)),
+            anchor,
+        )
+        assertEquals(listOf(base + 100, base + 396, base + 692), s.resp.map { it.ts })
+        assertEquals(listOf(14_375, 14_500, 15_000), s.resp.map { it.raw })
     }
 }

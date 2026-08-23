@@ -399,8 +399,7 @@ private struct ExpectationsStep: View {
                     }
                     .padding(14)
                     .frame(maxWidth: 520, alignment: .leading)
-                    .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 14))
-                    .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(StrandPalette.hairline))
+                    .background(NoopPanelSurface(cornerRadius: 14))
                     .opacity(shown ? 1 : 0)
                     .offset(y: shown ? 0 : 8)
                     .animation(StrandMotion.gentle.delay(Double(index) * 0.08), value: shown)
@@ -443,8 +442,7 @@ private struct ExpectationsStep: View {
         }
         .padding(14)
         .frame(maxWidth: 520, alignment: .leading)
-        .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(StrandPalette.hairline))
+        .background(NoopPanelSurface(cornerRadius: 14))
     }
 }
 
@@ -1116,6 +1114,11 @@ private struct StepShell<Content: View>: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 24)
         }
+        #if os(iOS)
+        // #697/#horizontal-swipe parity, see ScreenScaffold. First-run wizard, every step routes
+        // through this one shell, so a single fix here covers the whole onboarding flow.
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        #endif
     }
 }
 
@@ -1390,10 +1393,7 @@ private struct SecondaryButtonStyle: ButtonStyle {
             .foregroundStyle(StrandPalette.textPrimary)
             .padding(.vertical, 11)
             .padding(.horizontal, 18)
-            .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(StrandPalette.surfaceOverlay)
-            )
+            .background(NoopPanelSurface(cornerRadius: 12))
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .stroke(configuration.isPressed ? StrandPalette.hairlineStrong : StrandPalette.hairline, lineWidth: 1)

@@ -36,15 +36,24 @@ public enum ReadinessEngine {
         case good, neutral, watch, bad
     }
 
+    /// Locale-free numeric evidence. Clients format and localize it at the display boundary.
+    public enum Evidence: Sendable, Equatable {
+        case metric(value: Double, baseline: Double, unit: String, decimals: Int)
+        case trainingLoad(acute: Double, chronic: Double)
+        case monotony(Double)
+    }
+
     public struct Signal: Sendable, Equatable {
         public let key: String      // "hrv" | "rhr" | "respRate" | "acwr" | "monotony"
         public let label: String    // short human label
         public let evidence: String?
+        public let evidenceData: Evidence?
         public let detail: String   // one-line plain-English read
         public let flag: Flag
-        public init(key: String, label: String, evidence: String? = nil, detail: String, flag: Flag) {
+        public init(key: String, label: String, evidence: String? = nil,
+                    evidenceData: Evidence? = nil, detail: String, flag: Flag) {
             self.key = key; self.label = label; self.evidence = evidence
-            self.detail = detail; self.flag = flag
+            self.evidenceData = evidenceData; self.detail = detail; self.flag = flag
         }
     }
 
@@ -57,10 +66,15 @@ public enum ReadinessEngine {
         public let acwr: Double?
         /// Foster training monotony over the last week (nil if not enough strain history).
         public let monotony: Double?
+        /// How much history backs this read (HRV/RHR baseline density) — so the card can show
+        /// calibrating / building / solid instead of a confident number off a 7-night baseline.
+        public let confidence: ScoreConfidence
         public init(level: Level, headline: String, summary: String,
-                    signals: [Signal], acwr: Double?, monotony: Double?) {
+                    signals: [Signal], acwr: Double?, monotony: Double?,
+                    confidence: ScoreConfidence = .calibrating) {
             self.level = level; self.headline = headline; self.summary = summary
             self.signals = signals; self.acwr = acwr; self.monotony = monotony
+            self.confidence = confidence
         }
     }
 
@@ -139,6 +153,8 @@ public enum ReadinessEngine {
             unit: "ms",
             decimals: 0,
             higherIsBetter: true,
+            logDomain: true,   // RD1: lnRMSSD — HRV is right-skewed
+            cfg: Baselines.readinessHRVLnCfg,   // RD2: ln-space spine, reject off
             goodText: "above your baseline - well recovered",
             neutralText: "in your normal range",
             watchText: "a touch below baseline",
@@ -153,6 +169,7 @@ public enum ReadinessEngine {
             unit: "bpm",
             decimals: 0,
             higherIsBetter: false,
+            cfg: Baselines.restingHRCfg,   // RD2: raw-bpm spine, reject off
             goodText: "at or below baseline",
             neutralText: "in your normal range",
             watchText: "running a little high",
@@ -172,10 +189,12 @@ public enum ReadinessEngine {
                 if z >= 2.0 {
                     signals.append(Signal(key: "respRate", label: "Respiratory rate",
                         evidence: evidence(value: rr, baseline: m, unit: "rpm", decimals: 1),
+                        evidenceData: .metric(value: rr, baseline: m, unit: "rpm", decimals: 1),
                         detail: "up vs baseline - sometimes an early sign of getting sick", flag: .bad))
                 } else if z >= 1.5 {
                     signals.append(Signal(key: "respRate", label: "Respiratory rate",
                         evidence: evidence(value: rr, baseline: m, unit: "rpm", decimals: 1),
+                        evidenceData: .metric(value: rr, baseline: m, unit: "rpm", decimals: 1),
                         detail: "slightly raised vs baseline", flag: .watch))
                 }
             }
@@ -201,6 +220,7 @@ public enum ReadinessEngine {
                 if mono >= 2.0 {
                     signals.append(Signal(key: "monotony", label: "Training variety",
                         evidence: "monotony \(String(format: "%.1f", mono))",
+                        evidenceData: .monotony(mono),
                         detail: "low - similar strain every day raises strain/illness risk", flag: .watch))
                 }
             }
@@ -208,8 +228,16 @@ public enum ReadinessEngine {
 
         let (level, headline, summary) = synthesize(signals: signals,
                                                     hasHistory: !history.isEmpty || acwr != nil)
+        // RD-confidence: surface how much history backs the read (HRV baseline density, the primary
+        // readiness driver). A read off a 7-night baseline must not look as certain as one off the full
+        // 30-night window. Insufficient reads carry .calibrating.
+        let hrvBaselineNights = history.suffix(baselineWindow).compactMap { $0.avgHrv }.count
+        let confidence = ScoreConfidence.readiness(hasRead: level != .insufficient,
+                                                   baselineNights: hrvBaselineNights,
+                                                   fullWindow: baselineWindow)
         return Readiness(level: level, headline: headline, summary: summary,
-                         signals: signals, acwr: acwr, monotony: monotony)
+                         signals: signals, acwr: acwr, monotony: monotony,
+                         confidence: confidence)
     }
 
     // MARK: Signal builders
@@ -217,13 +245,33 @@ public enum ReadinessEngine {
     /// Build a z-score signal for a metric where the baseline is the trailing window.
     private static func zSignal(value: Double?, baseline: [Double],
                                 key: String, label: String, unit: String, decimals: Int,
-                                higherIsBetter: Bool,
+                                higherIsBetter: Bool, logDomain: Bool = false,
+                                cfg: MetricCfg,
                                 goodText: String, neutralText: String,
                                 watchText: String, badText: String) -> Signal? {
-        guard let v = value, baseline.count >= minBaseline,
-              let m = mean(baseline), let sd = sampleSD(baseline), sd > 0 else { return nil }
+        guard let v = value, baseline.count >= minBaseline else { return nil }
+        // RD1: right-skewed metrics (HRV/RMSSD) are z-scored in the LOG domain — lnRMSSD is closer to
+        // normal, so a symmetric z is statistically valid, whereas a raw-ms z over-weights the long
+        // upper tail and misstates tail rarity (Plews/Altini; the app's own HRVReadiness works this
+        // way). RHR/resp are ~normal and stay linear. Evidence stays in the metric's own units, but the
+        // baseline shown is then the GEOMETRIC mean (exp of the log-mean) — a typical night, not an
+        // outlier-inflated arithmetic mean.
+        let tv = logDomain ? log(max(v, 1.0)) : v
+        let tb = logDomain ? baseline.map { log(max($0, 1.0)) } : baseline
+        // RD2: fold the trailing baseline through the shared Winsorized-EWMA spine — recency-weighted,
+        // σ-floored (a tight baseline can't saturate the z), and Winsor-clamped so a single freak night
+        // is DAMPED not folded raw — instead of a flat mean + sample SD. Hard-outlier REJECTION is off
+        // (`rejectHardOutliers: false`): a re-folded trailing window must ADAPT to a recent sustained
+        // shift (fitness change / device swap) rather than reject the new normal as a run of outliers —
+        // the window-fold vs incremental-fold distinction, validated on real HRV history. `cfg` is in
+        // the SAME space as `tb` (ln for HRV, linear for RHR); center + spread come back σ-floored.
+        let state = Baselines.foldHistory(tb.map { Optional($0) }, cfg: cfg, rejectHardOutliers: false)
+        guard state.usable else { return nil }
+        let sigma = max(1.253 * state.spread, 1e-9)   // robust σ from the EWMA-abs-dev spread
+        guard sigma > 0 else { return nil }
+        let m = state.baseline
         // Orient z so positive always means "better".
-        let z = (higherIsBetter ? (v - m) : (m - v)) / sd
+        let z = (higherIsBetter ? (tv - m) : (m - tv)) / sigma
         let flag: Flag
         let text: String
         switch z {
@@ -233,7 +281,10 @@ public enum ReadinessEngine {
         default:            flag = .bad;     text = badText
         }
         return Signal(key: key, label: label,
-                      evidence: evidence(value: v, baseline: m, unit: unit, decimals: decimals),
+                      evidence: evidence(value: v, baseline: logDomain ? exp(m) : m,
+                                         unit: unit, decimals: decimals),
+                      evidenceData: .metric(value: v, baseline: logDomain ? exp(m) : m,
+                                            unit: unit, decimals: decimals),
                       detail: text, flag: flag)
     }
 
@@ -244,18 +295,22 @@ public enum ReadinessEngine {
         case ..<0.8:
             return Signal(key: "acwr", label: "Training load",
                 evidence: evidence,
+                evidenceData: .trainingLoad(acute: acute, chronic: chronic),
                 detail: "ramping down (acute:chronic \(pct)) - room to build", flag: .watch)
         case 0.8..<1.3:
             return Signal(key: "acwr", label: "Training load",
                 evidence: evidence,
+                evidenceData: .trainingLoad(acute: acute, chronic: chronic),
                 detail: "in the sweet spot (acute:chronic \(pct))", flag: .good)
         case 1.3..<1.5:
             return Signal(key: "acwr", label: "Training load",
                 evidence: evidence,
+                evidenceData: .trainingLoad(acute: acute, chronic: chronic),
                 detail: "building fast (acute:chronic \(pct)) - watch fatigue", flag: .watch)
         default:
             return Signal(key: "acwr", label: "Training load",
                 evidence: evidence,
+                evidenceData: .trainingLoad(acute: acute, chronic: chronic),
                 detail: "spiking (acute:chronic \(pct)) - higher injury risk", flag: .bad)
         }
     }

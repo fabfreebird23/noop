@@ -40,13 +40,23 @@ public struct WorkoutRow: Equatable, Codable {
     public let distanceM: Double?
     public let zonesJSON: String?
     public let notes: String?
+    public let steps: Int?               // #1058: per-session steps (activity-file foot sports); nil otherwise
+    /// NO DEFAULTS HERE, deliberately (#1444). Swift rebuilds a row field by field, so a defaulted
+    /// parameter lets an existing call site keep compiling while it silently starts writing nothing.
+    /// That is exactly how `steps` was dropped at six sites — two of which persisted the loss — with
+    /// nothing in the read path able to tell "never had steps" from "had steps, then lost them".
+    /// Requiring every field makes each call site state its intent and turns the next added column into
+    /// a compile error instead of silent data loss. Keep it that way: add a field WITHOUT a default and
+    /// fix the call sites the compiler points at. (Kotlin needs no equivalent rule because `copy()`
+    /// carries unmentioned fields — but note that only protects a rebuild whose receiver IS the stored
+    /// row, which is why the Android edit sheet lost `steps` anyway.)
     public init(startTs: Int, endTs: Int, sport: String, source: String, durationS: Double?,
                 energyKcal: Double?, avgHr: Int?, maxHr: Int?, strain: Double?, distanceM: Double?,
-                zonesJSON: String?, notes: String?) {
+                zonesJSON: String?, notes: String?, steps: Int?) {
         self.startTs = startTs; self.endTs = endTs; self.sport = sport; self.source = source
         self.durationS = durationS; self.energyKcal = energyKcal; self.avgHr = avgHr
         self.maxHr = maxHr; self.strain = strain; self.distanceM = distanceM
-        self.zonesJSON = zonesJSON; self.notes = notes
+        self.zonesJSON = zonesJSON; self.notes = notes; self.steps = steps
     }
 }
 
@@ -146,8 +156,8 @@ extension WhoopStore {
                 try db.execute(sql: """
                     INSERT INTO workout
                         (deviceId, startTs, endTs, sport, source, durationS, energyKcal,
-                         avgHr, maxHr, strain, distanceM, zonesJSON, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         avgHr, maxHr, strain, distanceM, zonesJSON, notes, steps)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(deviceId, startTs, sport) DO UPDATE SET
                         endTs = excluded.endTs,
                         source = excluded.source,
@@ -158,10 +168,11 @@ extension WhoopStore {
                         strain = excluded.strain,
                         distanceM = excluded.distanceM,
                         zonesJSON = excluded.zonesJSON,
-                        notes = excluded.notes
+                        notes = excluded.notes,
+                        steps = excluded.steps
                     """, arguments: [deviceId, r.startTs, r.endTs, r.sport, r.source, r.durationS,
                                      r.energyKcal, r.avgHr, r.maxHr, r.strain, r.distanceM,
-                                     r.zonesJSON, r.notes])
+                                     r.zonesJSON, r.notes, r.steps])
                 n += db.changesCount
             }
             return n
@@ -235,7 +246,7 @@ extension WhoopStore {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
                 SELECT startTs, endTs, sport, source, durationS, energyKcal, avgHr, maxHr,
-                       strain, distanceM, zonesJSON, notes FROM workout
+                       strain, distanceM, zonesJSON, notes, steps FROM workout
                 WHERE deviceId = ? AND startTs >= ? AND startTs <= ?
                 ORDER BY startTs ASC LIMIT ?
                 """, arguments: [deviceId, from, to, limit])
@@ -244,8 +255,21 @@ extension WhoopStore {
                                source: $0["source"], durationS: $0["durationS"],
                                energyKcal: $0["energyKcal"], avgHr: $0["avgHr"], maxHr: $0["maxHr"],
                                strain: $0["strain"], distanceM: $0["distanceM"],
-                               zonesJSON: $0["zonesJSON"], notes: $0["notes"])
+                               zonesJSON: $0["zonesJSON"], notes: $0["notes"], steps: $0["steps"])
                 }
+        }
+    }
+
+    /// #1058: sum per-session `steps` over one source's workouts whose startTs is in [from, to). Used to
+    /// recompute an activity-file day's step total from ALL its sessions, so a second file on the same day
+    /// adds rather than clobbers — and re-importing a file is idempotent (its row's steps are replaced,
+    /// not re-added, by `upsertWorkouts`). Returns 0 when no session in the range carried steps.
+    public func sumWorkoutSteps(deviceId: String, from: Int, to: Int) async throws -> Int {
+        try syncRead { db in
+            try Int.fetchOne(db, sql: """
+                SELECT COALESCE(SUM(steps), 0) FROM workout
+                WHERE deviceId = ? AND steps IS NOT NULL AND startTs >= ? AND startTs < ?
+                """, arguments: [deviceId, from, to]) ?? 0
         }
     }
 

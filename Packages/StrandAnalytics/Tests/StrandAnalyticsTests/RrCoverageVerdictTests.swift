@@ -103,4 +103,146 @@ final class RrCoverageVerdictTests: XCTestCase {
     func testCollapsedAboveCoverageStillClassifiesOnCoverageFirst() {
         XCTAssertEqual(HRVAnalyzer.classifyCoverage(coverage: 0.5, collapsed: 9.9), .underCovered)
     }
+
+    // MARK: - Acting on the verdict: beat-spread statistics (SDNN)
+
+    /// The whole point of the gate: an over-counted capture inflates SDNN directly, because SDNN is a
+    /// spread over EVERY interval and some of those intervals are the same beat twice.
+    func testOverCountedWindowsRefuseBeatSpreadStatistics() {
+        XCTAssertFalse(HRVAnalyzer.beatSpreadIsTrustworthy(.sameSecondOverCount))
+        XCTAssertFalse(HRVAnalyzer.beatSpreadIsTrustworthy(.crossSecondOverCount))
+    }
+
+    /// Nothing else gates. `underCovered` is a capture with holes and `unmeasurable` is what a LIVE spot
+    /// reading looks like (real-time beats, no timestamps to measure coverage with) — neither duplicates
+    /// a beat, and refusing them would suppress honest readings, which is the opposite of the point.
+    func testGapsAndUnmeasurableWindowsStayTrusted() {
+        XCTAssertTrue(HRVAnalyzer.beatSpreadIsTrustworthy(.plausible))
+        XCTAssertTrue(HRVAnalyzer.beatSpreadIsTrustworthy(.underCovered))
+        XCTAssertTrue(HRVAnalyzer.beatSpreadIsTrustworthy(.unmeasurable))
+    }
+
+    /// End to end on the shape that motivated this: beats banked in bursts at their record's second
+    /// (an Oura night — 6 beats per record, records ~5 s apart) cover more beat-time than wall-clock and
+    /// therefore refuse SDNN, while the SAME beats stamped at the times they really occurred stay
+    /// trusted. The verdict is measured from the data, never assumed from the device.
+    func testBankedBeatsRefuseSpreadWhileTheSameBeatsHonestlySpacedDoNot() {
+        let beat = 1000.0                       // 60 bpm
+        let rr = [Double](repeating: beat, count: 60)
+
+        // Honest: one beat per second, so beat-time ~= wall-clock (the whole-second stamps cost the
+        // final interval, which is what the ceiling's rounding allowance exists for).
+        let honestTs = (0..<60).map { $0 }
+        let honest = HRVAnalyzer.classifyCoverage(
+            coverage: HRVAnalyzer.rrCoverage(tsSec: honestTs, rrMs: rr),
+            collapsed: HRVAnalyzer.collapsedCoverage(tsSec: honestTs, rrMs: rr))
+        XCTAssertEqual(honest, .plausible)
+        XCTAssertTrue(HRVAnalyzer.beatSpreadIsTrustworthy(honest))
+
+        // Banked: the same 60 beats delivered as 10 records of 6, each record stamping all six of its
+        // beats at its own second, records 5 s apart. 60 s of beat-time inside a 45 s span.
+        let bankedTs = (0..<60).map { ($0 / 6) * 5 }
+        let banked = HRVAnalyzer.classifyCoverage(
+            coverage: HRVAnalyzer.rrCoverage(tsSec: bankedTs, rrMs: rr),
+            collapsed: HRVAnalyzer.collapsedCoverage(tsSec: bankedTs, rrMs: rr))
+        XCTAssertFalse(HRVAnalyzer.beatSpreadIsTrustworthy(banked), "verdict was \(banked)")
+    }
+
+    // MARK: - The second, independent fault: beat-VALUE accuracy (P7')
+
+    /// A beat-accurate stream steps one interval per beat, so each wall-clock gap equals its own R-R
+    /// value and the fraction is 1.0. This is what WHOOP R-R and the synthetic fixtures look like.
+    func testBeatAccurateStreamMeasuresFully() {
+        let rr = [Double](repeating: 1000.0, count: 60)     // 60 bpm, one beat per second
+        let ts = (0..<60).map { $0 }
+        XCTAssertEqual(HRVAnalyzer.beatAccurateFraction(tsSec: ts, rrMs: rr), 1.0, accuracy: 1e-9)
+        XCTAssertTrue(HRVAnalyzer.beatValuesAreTrustworthy(
+            beatAccurateFraction: HRVAnalyzer.beatAccurateFraction(tsSec: ts, rrMs: rr)))
+    }
+
+    /// A BANKED stream stamps a whole record of intervals on one timestamp, so nearly every gap is 0 s
+    /// against a ~1 s value. Six beats per record: five of every six gaps are 0, so the fraction lands
+    /// far below the boundary — the shape every measured Oura night has (2.6-6.6%).
+    func testBankedStreamIsNotBeatAccurateAndRefusesBeatValues() {
+        let rr = [Double](repeating: 1000.0, count: 60)
+        let ts = (0..<60).map { ($0 / 6) * 7 }              // 10 records of 6, 7 s apart
+        let frac = HRVAnalyzer.beatAccurateFraction(tsSec: ts, rrMs: rr)
+        XCTAssertLessThan(frac, HRVAnalyzer.beatAccuracyMinFraction)
+        XCTAssertFalse(HRVAnalyzer.beatValuesAreTrustworthy(beatAccurateFraction: frac))
+    }
+
+    /// **The case that motivated P7'.** The two faults are INDEPENDENT: this stream is perfectly
+    /// covered — one interval of beat-time per second of wall clock, so `classifyCoverage` says
+    /// `plausible` and the over-count gate passes it — yet the beats are banked six to a record, so
+    /// their individual values are a decomposition of a record period rather than beat-to-beat
+    /// measurements. The 2026-08-06 Oura night is exactly this shape (coverage 1.03, `plausible`,
+    /// SDNN 174 ms) and the over-count gate alone let it through.
+    func testAPerfectlyCoveredBankedNightStillRefusesBeatValues() {
+        // 10 records of 6 beats, records 7 s apart, so the span is 9 * 7 = 63 s. Sixty intervals of
+        // 1050 ms are exactly 63 s of beat-time: coverage lands on 1.0 while five of every six gaps
+        // are still 0 s. (Coverage is measured across the first-to-last STAMP, so the beat-time has to
+        // match that span, not the record count times the record period.)
+        let rr = [Double](repeating: 63_000.0 / 60.0, count: 60)
+        let ts = (0..<60).map { ($0 / 6) * 7 }
+        let verdict = HRVAnalyzer.classifyCoverage(
+            coverage: HRVAnalyzer.rrCoverage(tsSec: ts, rrMs: rr),
+            collapsed: HRVAnalyzer.collapsedCoverage(tsSec: ts, rrMs: rr))
+        XCTAssertTrue(HRVAnalyzer.beatSpreadIsTrustworthy(verdict),
+                      "the over-count gate must PASS this — that is the point (verdict \(verdict))")
+        let frac = HRVAnalyzer.beatAccurateFraction(tsSec: ts, rrMs: rr)
+        XCTAssertFalse(HRVAnalyzer.beatValuesAreTrustworthy(beatAccurateFraction: frac),
+                       "the beat-value gate must REFUSE it (fraction \(frac))")
+    }
+
+    /// A live spot reading carries no timestamps, so there is nothing to measure and nothing to refuse:
+    /// too-short input returns 1.0 and stays trusted. Suppressing honest live readings is the exact
+    /// failure this gate must not introduce.
+    func testTooShortOrMismatchedInputStaysTrusted() {
+        XCTAssertEqual(HRVAnalyzer.beatAccurateFraction(tsSec: [], rrMs: []), 1.0)
+        XCTAssertEqual(HRVAnalyzer.beatAccurateFraction(tsSec: [5], rrMs: [1000]), 1.0)
+        // Mismatched lengths cannot be paired up; refusing on that would be guessing.
+        XCTAssertEqual(HRVAnalyzer.beatAccurateFraction(tsSec: [0, 1, 2], rrMs: [1000]), 1.0)
+        XCTAssertTrue(HRVAnalyzer.beatValuesAreTrustworthy(beatAccurateFraction: 1.0))
+    }
+
+    /// NaN means "not measured", and an unmeasured window must not be silently refused — the same
+    /// negated-comparison convention `classifyCoverage` uses so both platforms fold NaN identically.
+    func testNaNAccuracyStaysTrusted() {
+        XCTAssertTrue(HRVAnalyzer.beatValuesAreTrustworthy(beatAccurateFraction: .nan))
+    }
+
+    /// The boundary itself: exactly at the minimum is trusted, just below is not.
+    func testBoundaryIsInclusive() {
+        XCTAssertTrue(HRVAnalyzer.beatValuesAreTrustworthy(
+            beatAccurateFraction: HRVAnalyzer.beatAccuracyMinFraction))
+        XCTAssertFalse(HRVAnalyzer.beatValuesAreTrustworthy(
+            beatAccurateFraction: HRVAnalyzer.beatAccuracyMinFraction - 0.01))
+    }
+
+    // MARK: - Spot-capture beat time vs. wall clock
+
+    /// ~700 beats of ~850 ms ≈ 595 s of beat time — impossible in a 60-second window. Twin of
+    /// Kotlin `spotCaptureRejectsMoreBeatTimeThanElapsedTime`.
+    func testSpotCaptureRejectsMoreBeatTimeThanElapsedTime() {
+        let beatTimeMs = (0..<700).reduce(0.0) { sum, i in sum + 830.0 + Double(i % 5) * 10.0 }
+        XCTAssertTrue(HRVAnalyzer.spotCaptureOverCounted(beatTimeMs: beatTimeMs, captureMs: 60_000))
+    }
+
+    /// ~70 beats of 850 ms ≈ 59.5 s of beat time in 60 s — a normal seated reading stays trusted.
+    func testSpotCaptureAcceptsAPlausibleWindow() {
+        XCTAssertFalse(HRVAnalyzer.spotCaptureOverCounted(beatTimeMs: 70 * 850.0, captureMs: 60_000))
+    }
+
+    /// Exactly at the shared `coveragePlausibleCeiling` stays trusted — the ceiling is a rounding
+    /// allowance and the gate uses strict `>` like `classifyCoverage`.
+    func testSpotCaptureToleratesTheRoundingAllowance() {
+        let atCeiling = 60_000 * HRVAnalyzer.coveragePlausibleCeiling
+        XCTAssertFalse(HRVAnalyzer.spotCaptureOverCounted(beatTimeMs: atCeiling, captureMs: 60_000))
+        XCTAssertTrue(HRVAnalyzer.spotCaptureOverCounted(beatTimeMs: atCeiling + 1, captureMs: 60_000))
+    }
+
+    /// No wall clock to hold the beats against — never reject on a degenerate duration.
+    func testSpotCaptureWithZeroElapsedTimeIsNotJudged() {
+        XCTAssertFalse(HRVAnalyzer.spotCaptureOverCounted(beatTimeMs: 1_000, captureMs: 0))
+    }
 }

@@ -9,6 +9,28 @@ final class DeviceRegistryStoreTests: XCTestCase {
         return dbq
     }
 
+    /// #1518: a stored row carrying whitespace still names real capabilities, and every one of them must
+    /// survive the decode.
+    ///
+    /// Written with raw SQL on purpose: `add` always joins canonical rawValues, so it cannot reproduce the
+    /// state this guards. A spaced token reaches the column from history — the v36 migration rewrote rows
+    /// in place before #1495 taught it to trim, so an upgraded install can be holding exactly this — or
+    /// from a restored backup.
+    ///
+    /// Before the fix `Metric(rawValue:)` matched exactly, so every spaced token failed to parse and
+    /// `compactMap` dropped it: this row decoded to `{hr}` alone, silently losing three capabilities.
+    func testDecodeTrimsWhitespaceBearingCapabilityTokens() throws {
+        let dbq = try makeDB()
+        try dbq.write { db in
+            try db.execute(sql: "UPDATE pairedDevice SET capabilities = ? WHERE id = 'my-whoop'",
+                           arguments: ["hr, hrv,\tskinTemp , spo2 , sleep"])
+        }
+        let store = DeviceRegistryStore(dbQueue: dbq)
+        let device = try XCTUnwrap(store.all().first(where: { $0.id == "my-whoop" }))
+        // spo2 is absent because a WHOOP row drops calibrated SpO₂ (#548) — not because it failed to parse.
+        XCTAssertEqual(device.capabilities, [.hr, .hrv, .skinTemp, .sleep])
+    }
+
     func testSeededWhoopIsActive() throws {
         let store = DeviceRegistryStore(dbQueue: try makeDB())
         let devices = try store.all()
@@ -34,6 +56,23 @@ final class DeviceRegistryStoreTests: XCTestCase {
         try store.archive("my-whoop")
         XCTAssertEqual(try store.all().first?.status, .archived)   // I4: row kept
         XCTAssertNil(try store.activeDeviceId())
+    }
+
+    // #1193: unlike `archive` (which keeps the row so it lingers in "Removed"), `remove` hard-deletes the
+    // registry entry so a duplicate/stale strap can be purged entirely — and touches only the given id.
+    func testRemoveDeletesOnlyTheGivenRegistryRow() throws {
+        let store = DeviceRegistryStore(dbQueue: try makeDB())
+        try store.add(PairedDevice(id: "whoop-DEAD", brand: "WHOOP", model: "4.0", sourceKind: .liveBLE,
+                                   capabilities: [.hr], status: .archived, addedAt: 2, lastSeenAt: 2))
+        XCTAssertEqual(Set(try store.all().map(\.id)), ["my-whoop", "whoop-DEAD"])
+        try store.remove("whoop-DEAD")
+        XCTAssertEqual(try store.all().map(\.id), ["my-whoop"])     // duplicate purged, seed untouched
+    }
+
+    func testRemoveIsANoOpForAnAbsentId() throws {
+        let store = DeviceRegistryStore(dbQueue: try makeDB())
+        try store.remove("whoop-never-existed")                    // must not throw
+        XCTAssertEqual(try store.all().map(\.id), ["my-whoop"])
     }
 
     func testSeededWhoopHasNilPeripheralId() throws {

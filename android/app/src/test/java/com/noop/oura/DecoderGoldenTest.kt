@@ -66,11 +66,11 @@ class DecoderGoldenTest {
         val ibis = OuraDecoders.decodeSpO2IBI(rec)
         assertEquals(
             listOf(
-                OuraIBI(ringTimestamp = rt, ibiMs = 400),
-                OuraIBI(ringTimestamp = rt, ibiMs = 320),
-                OuraIBI(ringTimestamp = rt, ibiMs = 240),
-                OuraIBI(ringTimestamp = rt, ibiMs = 160),
-                OuraIBI(ringTimestamp = rt, ibiMs = 80),
+                OuraIBI(ringTimestamp = rt, ibiMs = 400, channel = OuraIbiChannel.SPO2_IBI),
+                OuraIBI(ringTimestamp = rt, ibiMs = 320, channel = OuraIbiChannel.SPO2_IBI),
+                OuraIBI(ringTimestamp = rt, ibiMs = 240, channel = OuraIbiChannel.SPO2_IBI),
+                OuraIBI(ringTimestamp = rt, ibiMs = 160, channel = OuraIbiChannel.SPO2_IBI),
+                OuraIBI(ringTimestamp = rt, ibiMs = 80, channel = OuraIbiChannel.SPO2_IBI),
             ),
             ibis,
         )
@@ -80,10 +80,81 @@ class DecoderGoldenTest {
 
     @Test
     fun testHRV0x5D() {
-        // time 5000, b1=10, b2=-5
-        val rec = record("5d080200010088130afb")
+        // (u8 hr, u8 rmssd) pairs — real overnight bytes: 32 84 32 83 -> (50,132),(50,131).
+        // hr=50 bpm is sleeping HR (validates the layout; matches the #511 IBI-derived median).
+        val rec = record("5d080200010032843283")
         val hrv = OuraDecoders.decodeHRV(rec)
-        assertEquals(listOf(OuraHRV(ringTimestamp = rt, timeMs = 5000, b1 = 10, b2 = -5)), hrv)
+        assertEquals(
+            listOf(
+                OuraHRV(ringTimestamp = rt, index = 0, hrBpm = 50, rmssdMs = 132, count = 2),
+                OuraHRV(ringTimestamp = rt, index = 1, hrBpm = 50, rmssdMs = 131, count = 2),
+            ),
+            hrv,
+        )
+    }
+
+    @Test
+    fun testHRV0x5DOddLengthIsNull() {
+        // A partial trailing pair (odd body length) must decode to null, never a half-sample.
+        assertNull(OuraDecoders.decodeHRV(record("5d0702000100328432")))
+    }
+
+    // MARK: - 0x5D `00 00` tail padding (#1128)
+
+    @Test
+    fun testHRV0x5DDropsTailPadding() {
+        // A record that closes early pads its tail with `00 00`. That pair is not a reading, and a
+        // stored hr_bpm: 0 is a fabricated value nothing downstream can tell from a measurement. Real
+        // shape, from the 2026-08-07 overnight: ... 48/128 47/137 ... 0/0.
+        val hrv = OuraDecoders.decodeHRV(record("5d0a02000100328432830000"))
+        assertEquals(
+            listOf(
+                // count is 3, not 2: the dropped pad still counts, or the survivors slide (#1167).
+                OuraHRV(ringTimestamp = rt, index = 0, hrBpm = 50, rmssdMs = 132, count = 3),
+                OuraHRV(ringTimestamp = rt, index = 1, hrBpm = 50, rmssdMs = 131, count = 3),
+            ),
+            hrv,
+        )
+    }
+
+    @Test
+    fun testHRV0x5DAllPaddingIsNull() {
+        // A body that is ENTIRELY padding carries no bucket at all, so it decodes to null (honest
+        // no-data) rather than to an empty list a caller might read as "decoded fine, zero readings".
+        assertNull(OuraDecoders.decodeHRV(record("5d06020001000000")))
+    }
+
+    @Test
+    fun testHRV0x5DZeroPairConsumesItsIndex() {
+        // THE ONE THAT MATTERS: a skipped pair must still CONSUME its index. `index` is not a label —
+        // OuraStreamMapping derives the bucket's wall-clock from it (bucketTs = ts - index * 300), so
+        // renumbering the survivors would slide every later bucket 5 minutes into the past.
+        //
+        // Tail padding cannot detect that mistake (nothing follows the pad), which is why this plants
+        // the zero pair in the MIDDLE: the bucket after it must keep index 2, not collapse to index 1.
+        // Only tail padding has been observed in the wild; this guards the shape we have not seen yet.
+        val hrv = OuraDecoders.decodeHRV(record("5d0a02000100328400003182"))
+        assertEquals(
+            listOf(
+                OuraHRV(ringTimestamp = rt, index = 0, hrBpm = 50, rmssdMs = 132, count = 3),
+                OuraHRV(ringTimestamp = rt, index = 2, hrBpm = 49, rmssdMs = 130, count = 3),
+            ),
+            hrv,
+        )
+    }
+
+    @Test
+    fun testHRV0x5DLoneZeroByteIsNotTreatedAsPadding() {
+        // A genuine bucket with ONE zero byte is not padding and must survive: the rule keys on both
+        // bytes being zero, so a real reading with a zero byte stays visible as the anomaly it would be.
+        val hrv = OuraDecoders.decodeHRV(record("5d080200010032000083"))
+        assertEquals(
+            listOf(
+                OuraHRV(ringTimestamp = rt, index = 0, hrBpm = 50, rmssdMs = 0, count = 2),
+                OuraHRV(ringTimestamp = rt, index = 1, hrBpm = 0, rmssdMs = 131, count = 2),
+            ),
+            hrv,
+        )
     }
 
     // MARK: - 0x6F SpO2 per-sample (base from high nibble << 7, then u8, 0xFF terminator)
@@ -93,13 +164,39 @@ class DecoderGoldenTest {
         // byte6 high nibble 1 (base/status, discarded) ; samples 95,96 ; FF terminator (#968).
         val rec = record("6f0802000100105f60ff")
         val s = OuraDecoders.decodeSpO2PerSample(rec)
+        // Every sample keeps the RECORD's ringTimestamp and carries its own position, so the consumer can
+        // give each one its own second instead of collapsing the record onto one (#1070). Swift twin.
         assertEquals(
             listOf(
-                OuraSpO2(ringTimestamp = rt, value = 95),
-                OuraSpO2(ringTimestamp = rt, value = 96),
+                OuraSpO2(ringTimestamp = rt, value = 95, index = 0, count = 2),
+                OuraSpO2(ringTimestamp = rt, value = 96, index = 1, count = 2),
             ),
             s,
         )
+    }
+
+    @Test
+    fun testSpO2PerSample0x6FStampsPositionForEverySample() {
+        // A full 13-value record, the real Gen 3 shape: indices 0..12, count 13 on every sample, and the
+        // record's own ringTimestamp untouched. Terminator absent.
+        // len 0x12 = 4 rt + 1 status + 13 values.
+        val body = (0 until 13).joinToString("") { String.format("%02x", 90 + it) }
+        val rec = record("6f120200010000" + body)
+        val s = OuraDecoders.decodeSpO2PerSample(rec)!!
+        assertEquals(13, s.size)
+        assertEquals((0 until 13).toList(), s.map { it.index })
+        assertEquals(List(13) { 13 }, s.map { it.count })
+        assertTrue(s.all { it.ringTimestamp == rt })
+    }
+
+    @Test
+    fun testSpO2DC0x77StampsPositionForEverySample() {
+        // 0x77 shares the multi-sample shape, so it stamps the same way.
+        // len 0x0b = 4 rt + 1 header + 3 base + 3 deltas ; hasBase -> base is sample 0, then 3 deltas.
+        val rec = record("770b02000100400a0000" + "01ff02")
+        val s = OuraDecoders.decodeSpO2DC(rec)!!
+        assertEquals(listOf(0, 1, 2, 3), s.map { it.index })
+        assertEquals(listOf(4, 4, 4, 4), s.map { it.count })
     }
 
     // MARK: - 0x7B SpO2 stable (BIG-endian footgun)
@@ -156,6 +253,79 @@ class DecoderGoldenTest {
     }
 
     @Test
+    fun testSleepPhase0x4EWholeFFRecordIsUnwritten() {
+        // #1246: two 0xFF code bytes (an erased/unwritten flash page). Flagged unwritten so the assembler
+        // drops them as a GAP instead of 8 awake epochs. PARITY twin of the Swift test.
+        val rec = record("4e070200010000ffff")
+        val phases = OuraDecoders.decodeSleepPhase(rec)
+        assertEquals(8, phases?.size)
+        assertTrue(phases!!.all { it.unwritten && it.stage == OuraSleepStage.AWAKE })
+    }
+
+    @Test
+    fun testSleepPhase0x4ELoneFFByteIsGenuineAwake() {
+        // #1246 caution: a SINGLE 0xFF code byte is four genuine AWAKE epochs, NOT an erased page — it must
+        // stay written (only a run of >=2 all-0xFF code bytes reads as unwritten). PARITY twin of Swift.
+        val rec = record("4e060200010000ff")
+        val phases = OuraDecoders.decodeSleepPhase(rec)
+        assertEquals(4, phases?.size)
+        assertTrue(phases!!.none { it.unwritten })
+        assertTrue(phases.all { it.stage == OuraSleepStage.AWAKE })
+    }
+
+    @Test
+    fun testSleepPhase0x4EMixedFFIsWritten() {
+        // A record that is NOT entirely 0xFF is genuine data — its 0xFF byte is four REAL awake epochs, so
+        // none of the record is flagged unwritten. Guards against a byte-level filter eating genuine wake.
+        val rec = record("4e0702000100006cff")
+        val phases = OuraDecoders.decodeSleepPhase(rec)
+        assertEquals(8, phases?.size)
+        assertTrue(phases!!.none { it.unwritten })
+        assertTrue(phases.takeLast(4).all { it.stage == OuraSleepStage.AWAKE })
+    }
+
+    @Test
+    fun testSleepPhase0x4ETrailingFFRunIsUnwritten() {
+        // #1284: the reporter's `hdr=01` record — `ff ff f3 c0` then nine straight 0xFF (13 code bytes). The
+        // 9-byte trailing pad is flagged unwritten; the leading `ff ff` stays real wake. PARITY twin of Swift.
+        val phases = OuraDecoders.decodeSleepPhase(record("4e120200010000fffff3c0ffffffffffffffffff"))
+        assertEquals(52, phases?.size)
+        assertEquals(36, phases!!.count { it.unwritten })
+        assertTrue(phases.take(16).none { it.unwritten })
+        assertTrue(phases.takeLast(36).all { it.unwritten })
+    }
+
+    @Test
+    fun testSleepPhase0x4ETrailingRunFloorIsExclusive() {
+        // Exactly MIN_TRAILING_UNWRITTEN trailing 0xFF flags; one fewer is spared. PARITY twin of Swift.
+        val atFloor = OuraDecoders.decodeSleepPhase(record("4e12020001000055555555555555ffffffffffff"))
+        assertEquals(OuraDecoders.MIN_TRAILING_UNWRITTEN * 4, atFloor!!.count { it.unwritten })
+        val belowFloor = OuraDecoders.decodeSleepPhase(record("4e1202000100005555555555555555ffffffffff"))
+        assertTrue(belowFloor!!.none { it.unwritten })
+    }
+
+    @Test
+    fun testSleepPhase0x4ETrailingSingleFFIsGenuineAwake() {
+        // #1284/#1246 boundary: a written record ending in a SINGLE trailing 0xFF is four genuine awake epochs,
+        // never pad. The trailing floor is clamped to >= 2, so this holds even if MIN_TRAILING_UNWRITTEN is
+        // lowered — a lone trailing byte can never be eaten (the case #1246 protects). PARITY twin of Swift.
+        assertTrue("floor < 2 would eat a lone trailing 0xFF (#1246); the decode clamps to 2 as a backstop",
+            OuraDecoders.MIN_TRAILING_UNWRITTEN >= 2)
+        val phases = OuraDecoders.decodeSleepPhase(record("4e120200010000555555555555555555555555ff"))
+        assertEquals(52, phases?.size)                                 // 13 code bytes * 4
+        assertTrue(phases!!.none { it.unwritten })                     // nothing flagged unwritten
+        assertTrue(phases.takeLast(4).all { it.stage == OuraSleepStage.AWAKE })   // the lone 0xFF stays real wake
+    }
+
+    @Test
+    fun testSleepPhase0x4ELeadingFFRunIsRealWake() {
+        // Trailing-only: a long leading 0xFF run that does NOT reach the record's end stays real wake.
+        val phases = OuraDecoders.decodeSleepPhase(record("4e120200010000ffffffffffffffffff55555555"))
+        assertEquals(52, phases?.size)
+        assertTrue(phases!!.none { it.unwritten })
+    }
+
+    @Test
     fun testSleepStageRawValuesMatchOpenOura() {
         // Pin the validated open_oura order (0=deep, 1=light, 2=rem, 3=awake) so a regression to the
         // old unverified mapping (0=awake/2=deep/3=REM) breaks loudly. Twin of the Swift enum.
@@ -165,12 +335,14 @@ class DecoderGoldenTest {
         assertEquals(3, OuraSleepStage.AWAKE.raw)
     }
 
-    // MARK: - 0x6B motion period (2-bit MOTION_STATE codes; 2 header bytes skipped)
+    // MARK: - 0x6B motion period (2-bit MOTION_STATE codes; 1 header byte, codes from byte1)
 
     @Test
     fun testMotionPeriod0x6B() {
-        // 2 header bytes 0x00 0x00, code byte 0x1B = 00 01 10 11 -> noMotion, restless, tossing, active.
-        val rec = record("6b070200010000001b")
+        // header 0x13: period_type 0, count(bits[5:4]) = 1 code in the FINAL byte, seq 0x3.
+        // byte1 0x1B = 00 01 10 11 -> noMotion, restless, tossing, active (a full middle byte, 4 codes).
+        // byte2 0xC0 = 11 00 00 00 -> LAST byte, truncated to count=1 -> just active (padding not read).
+        val rec = record("6b0702000100131bc0")
         val m = OuraDecoders.decodeMotionPeriod(rec)
         assertEquals(
             listOf(
@@ -178,8 +350,37 @@ class DecoderGoldenTest {
                 OuraMotion(ringTimestamp = rt, index = 1, state = OuraMotionState.RESTLESS),
                 OuraMotion(ringTimestamp = rt, index = 2, state = OuraMotionState.TOSSING),
                 OuraMotion(ringTimestamp = rt, index = 3, state = OuraMotionState.ACTIVE),
+                OuraMotion(ringTimestamp = rt, index = 4, state = OuraMotionState.ACTIVE),
             ),
             m,
+        )
+    }
+
+    @Test
+    fun testMotionPeriod0x6BShortSingleCodeRecord() {
+        // Real short capture `1ea0`: header 0x1E -> count = 1; byte1 0xA0 = 10 00 00 00 truncated to
+        // count=1 -> a single TOSSING code. The earlier decoder (codes from byte2) produced NOTHING here.
+        val rec = record("6b06020001001ea0")
+        assertEquals(
+            listOf(OuraMotion(ringTimestamp = rt, index = 0, state = OuraMotionState.TOSSING)),
+            OuraDecoders.decodeMotionPeriod(rec),
+        )
+    }
+
+    @Test
+    fun testMotionPeriod0x6BCountZeroMeansFullFinalByte() {
+        // Header 0x0D: count FIELD 0 encodes a FULL final byte (4 codes), not 0 — the 2-bit field can't hold
+        // 4, so 4 wraps to 0 (all 81 count==0 records in the capture have a non-zero final byte). byte1 0xC0
+        // = 11 00 00 00 -> active, noMotion, noMotion, noMotion. `count==0 ? 0` returned null; `? 4` recovers.
+        val rec = record("6b06020001000dc0")
+        assertEquals(
+            listOf(
+                OuraMotion(ringTimestamp = rt, index = 0, state = OuraMotionState.ACTIVE),
+                OuraMotion(ringTimestamp = rt, index = 1, state = OuraMotionState.NO_MOTION),
+                OuraMotion(ringTimestamp = rt, index = 2, state = OuraMotionState.NO_MOTION),
+                OuraMotion(ringTimestamp = rt, index = 3, state = OuraMotionState.NO_MOTION),
+            ),
+            OuraDecoders.decodeMotionPeriod(rec),
         )
     }
 
@@ -253,12 +454,52 @@ class DecoderGoldenTest {
         assertNull(s?.text)               // body too short for a trailing string
     }
 
+    @Test
+    fun testStateMalformedUTF8IsNotReplacementDecoded() {
+        val malformed = OuraRecord(
+            type = OuraEventTag.STATE_CHANGE.raw,
+            ringTimestamp = rt,
+            payload = intArrayOf(
+                0x08, 0x63, 0x68, 0x67, 0x2e, 0x20, 0x64, 0x65,
+                0x74, 0x65, 0x63, 0x74, 0x65, 0x64, 0xff,
+            ),
+        )
+        // Valid UTF-8 remains decoded and only surrounding NULs are trimmed.
+        val valid = OuraRecord(
+            type = OuraEventTag.STATE_CHANGE.raw,
+            ringTimestamp = rt,
+            payload = intArrayOf(0x04, 0x00, 0x63, 0x61, 0x66, 0xc3, 0xa9, 0x00),
+        )
+        assertEquals("café", OuraDecoders.decodeState(valid)?.text)
+
+        val decoded = OuraDecoders.decodeState(malformed)
+        assertEquals(8, decoded?.stateCode)
+        assertNull(decoded?.text)
+    }
+
     // MARK: - 0x43 debug text
 
     @Test
     fun testDebugText0x43() {
         val rec = record("4306020001004142")
         assertEquals("AB", OuraDecoders.decodeDebugText(rec))
+    }
+
+    @Test
+    fun testDebugTextMalformedUTF8IsRejected() {
+        val malformed = OuraRecord(
+            type = OuraEventTag.DEBUG_TEXT.raw,
+            ringTimestamp = rt,
+            payload = intArrayOf(0x41, 0xff, 0x42),
+        )
+        // The valid ASCII control remains unchanged.
+        val ascii = OuraRecord(
+            type = OuraEventTag.DEBUG_TEXT.raw,
+            ringTimestamp = rt,
+            payload = intArrayOf(0x41, 0x42),
+        )
+        assertEquals("AB", OuraDecoders.decodeDebugText(ascii))
+        assertNull(OuraDecoders.decodeDebugText(malformed))
     }
 
     // MARK: - 0x0D battery (outer response body; percent at [0], voltage at [4..6] LE)

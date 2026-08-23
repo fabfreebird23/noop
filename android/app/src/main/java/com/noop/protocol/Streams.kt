@@ -11,8 +11,62 @@ package com.noop.protocol
 /** A heart-rate sample at wall-clock unix seconds [ts]. */
 data class HrSample(val ts: Int, val bpm: Int)
 
-/** A single beat-to-beat R-R interval (ms) at wall-clock unix seconds [ts]. */
-data class RrInterval(val ts: Int, val rrMs: Int)
+/**
+ * WHICH sensor channel produced an R-R interval (#1071).
+ *
+ * A WHOOP strap has ONE beat source, so its rows carry no channel (null) and nothing here changes for
+ * them. An Oura ring has more than one: the green-quality tag (0x80) and the SpO2 tag (0x6E) both
+ * decode to R-R and both were stored, so the table held roughly TWO complete copies of every night —
+ * not duplicate rows to de-duplicate, but the SAME heartbeats measured twice. Labelling the channel is
+ * what lets scoring read one copy while both stay on disk as each other's cross-check.
+ *
+ * [code] is the DURABLE, cross-platform storage value for `rrInterval.srcChannel` and must stay in
+ * lockstep with Swift `RRSourceChannel` — it is written to SQLite and crosses the `.noopbak` boundary,
+ * so it is a wire format, not an implementation detail. Never renumber a case; only append.
+ */
+enum class RrSourceChannel(val code: Int) {
+    /**
+     * Oura 0x80 `green_ibi_quality_event` — the green-LED beat train, gated on the ring's own
+     * `quality == 1` flag and a 300-2000 ms physiological window, running the whole night.
+     */
+    GREEN_QUALITY(1),
+
+    /**
+     * Oura 0x6E `spo2_ibi_and_amplitude_event` — the SpO2/red-channel beat train, on an 8 ms
+     * quantisation grid with no quality gate, and present ONLY while SpO2 measurement is running.
+     */
+    SPO2_IBI(2),
+
+    /** Oura 0x60 `ibi_and_amplitude_event` — the bit-packed IBI+amplitude family. */
+    IBI_AMPLITUDE(3),
+
+    /**
+     * Oura 0x44 `ibi_event` — the SAME bit-packed layout family as 0x60, decoded by the same routine,
+     * but a DIFFERENT tag on the wire.
+     *
+     * Split out (#1071 follow-up) because both tags used to stamp [IBI_AMPLITUDE], which made them
+     * indistinguishable once stored: a capture showing that channel over-covering its own wall-clock
+     * could not say whether one tag repeats beats or two tags report the same beats to each other. That
+     * is the question the channel choice for scoring rests on, and no stored night could answer it.
+     * Labelling only — both are read exactly as before.
+     */
+    IBI_BARE(4),
+    ;
+
+    companion object {
+        /** The channel with this durable storage [code], or null for an unknown/absent one. */
+        fun fromCode(code: Int?): RrSourceChannel? = entries.firstOrNull { it.code == code }
+    }
+}
+
+/**
+ * A single beat-to-beat R-R interval (ms) at wall-clock unix seconds [ts].
+ *
+ * [srcChannel] is the sensor channel that measured this beat, or null when the source does not
+ * distinguish one (every WHOOP row, and every row written before the column existed). See
+ * [RrSourceChannel].
+ */
+data class RrInterval(val ts: Int, val rrMs: Int, val srcChannel: RrSourceChannel? = null)
 
 /**
  * A raw-ADC SpO2 sample at wall-clock unix seconds [ts]. Mirrors the Room `Spo2Sample` (red/ir)
@@ -44,6 +98,20 @@ data class Spo2Sample(val ts: Int, val red: Int, val ir: Int, val unit: String =
  * this carrier-level tag plus this comment document the convention until a migration adds one.)
  */
 data class SkinTempSample(val ts: Int, val raw: Int, val unit: String = "raw_adc")
+
+/**
+ * A respiration sample at wall-clock unix seconds [ts]. Mirrors the Room `RespSample` and the Swift
+ * `RespSample(ts:raw:unit:)` shape.
+ *
+ * UNIT CONVENTION, and it is not one convention: [raw] is a WHOOP 4.0's raw respiration ADC WAVEFORM
+ * sample (`resp_rate_raw@47`, ~1 Hz, `raw_adc`) — the signal the stager runs a peak detector over — OR,
+ * for an Oura ring, that ring's own already-computed per-window RATE in MILLI-breaths-per-minute
+ * (`0x6A breath`, one value per ~296 s, `milli_bpm`). Two physical quantities in one table, told apart
+ * by the row's OWNER: `com.noop.data.OuraRespScale` is the single place that conversion and the
+ * accompanying scoring refusal live. [unit] carries the scale tag for fidelity; as with SkinTempSample
+ * the Room entity has no unit column, so the deviceId is the durable discriminator.
+ */
+data class RespSample(val ts: Int, val raw: Int, val unit: String = "raw_adc")
 
 /**
  * WHOOP 4.0 (v24) skin-temp mapping constants (#938). The single provisional slope + anchor live in ONE
@@ -192,6 +260,11 @@ data class Streams(
     // unchanged; only a source that decodes these biometric signals live (the Oura ring) populates them.
     val spo2: MutableList<Spo2Sample> = mutableListOf(),
     val skinTemp: MutableList<SkinTempSample> = mutableListOf(),
+    // Same reasoning as spo2/skinTemp above: empty for every WHOOP live batch (a WHOOP's respiration
+    // rows arrive on the historical-offload path, which builds a StreamBatch directly), populated only
+    // by a live source that decodes a respiration value itself — today the Oura ring's 0x6A `breath`
+    // (see `OuraStreamMapping`, and `OuraRespScale` for the scale it is stored at).
+    val resp: MutableList<RespSample> = mutableListOf(),
 ) {
     companion object {
         val EMPTY: Streams get() = Streams()
@@ -272,6 +345,19 @@ internal fun appendBattery(out: Streams, ts: Int, p: Map<String, Any?>) {
 internal fun Map<String, Any?>.intOrNull(key: String): Int? = when (val v = this[key]) {
     is Int -> v
     is Long -> v.toInt()
+    else -> null
+}
+
+/**
+ * Read a parsed-map value in the LONG (unsigned-u32-safe) domain. Use this, never [intOrNull], for a
+ * field the decoder read with an unsigned u32 reader: [intOrNull]'s `is Long -> v.toInt()` branch
+ * narrows to Kotlin's 32-bit Int, which sends any value with bit 31 set negative and re-opens the
+ * cross-platform split against Swift's 64-bit Int. Swift needs no analogue — its `intValue` is
+ * already 64-bit, which is exactly why the divergence is Android-only.
+ */
+internal fun Map<String, Any?>.longOrNull(key: String): Long? = when (val v = this[key]) {
+    is Long -> v
+    is Int -> v.toLong()
     else -> null
 }
 

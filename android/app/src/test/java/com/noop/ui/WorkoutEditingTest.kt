@@ -5,6 +5,7 @@ import com.noop.data.WorkoutRow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -314,7 +315,82 @@ class WorkoutEditingTest {
         assertNull(WorkoutEditing.buildManualRow("my-whoop", start, 30, "Run", null, 99_999.0, now))
     }
 
+    @Test
+    fun buildManualRow_acceptsEndExactlyAtNow_rejectsOneSecondFuture() {
+        val now = 1_700_003_600L
+        val endingNow = WorkoutEditing.buildManualRow(
+            "my-whoop", startSeconds = now - 60, durationMin = 1, sport = "Run",
+            avgHr = null, energyKcal = null, nowSeconds = now,
+        )
+        requireNotNull(endingNow)
+        assertEquals(now, endingNow.endTs)
+
+        val endingOneSecondFuture = WorkoutEditing.buildManualRow(
+            "my-whoop", startSeconds = now - 59, durationMin = 1, sport = "Run",
+            avgHr = null, energyKcal = null, nowSeconds = now,
+        )
+        assertNull(endingOneSecondFuture)
+    }
+
+    @Test
+    fun buildManualRow_rejectsEndTimestampOverflow() {
+        val now = Long.MAX_VALUE
+        assertNull(
+            WorkoutEditing.buildManualRow(
+                "my-whoop", startSeconds = Long.MAX_VALUE - 30, durationMin = 1, sport = "Run",
+                avgHr = null, energyKcal = null, nowSeconds = now,
+            ),
+        )
+    }
+
+    @Test
+    fun buildManualRow_acceptsAndBoundsDistance() {
+        // #1195: distance is now a manual field. A valid entry is stored verbatim (metres); 0 and the
+        // 1,000 km ceiling are allowed; negative and beyond are rejected; null means "no distance".
+        val now = 1_700_003_600L
+        fun build(d: Double?) = WorkoutEditing.buildManualRow(
+            "my-whoop", startSeconds = now - 1800, durationMin = 30, sport = "Run",
+            avgHr = null, energyKcal = null, nowSeconds = now, distanceM = d,
+        )
+        assertEquals(5_234.0, build(5_234.0)?.distanceM)
+        assertNull(build(null)?.distanceM)
+        assertNotNull(build(0.0))
+        assertNotNull(build(1_000_000.0))   // exactly 1,000 km
+        assertNull(build(-1.0))
+        assertNull(build(1_000_001.0))
+    }
+
     // MARK: - preservingCaptured
+
+    @Test
+    fun preservingCaptured_takesDistanceFromRebuiltNotOld() {
+        // #1195: distance is a sheet field now, so an edit's value wins over the old row's captured
+        // distance (the sheet pre-fills from old, so an untouched field still round-trips it), while
+        // maxHr/route stay carried. A cleared field clears, not resurrects.
+        val old = row("my-whoop", 100, 3700, "Running", "manual", maxHr = 175)
+            .copy(distanceM = 10_000.0, routePolyline = "abc")
+        val edited = row("my-whoop", 100, 3700, "Running", "manual").copy(distanceM = 12_500.0)
+        val merged = WorkoutEditing.preservingCaptured(edited, old)
+        assertEquals(12_500.0, merged.distanceM)   // edited distance wins
+        assertEquals(175, merged.maxHr)            // maxHr still carried
+        assertEquals("abc", merged.routePolyline)  // route still carried
+        val cleared = row("my-whoop", 100, 3700, "Running", "manual").copy(distanceM = null)
+        assertNull(WorkoutEditing.preservingCaptured(cleared, old).distanceM)
+    }
+
+    /**
+     * #1444: per-session steps (#1058) has NO sheet field, so buildManualRow leaves it null and copy()
+     * carries the NEW row's null rather than the stored value — copy() only protects a field when the
+     * row being copied IS the stored one. Renaming the sport silently wiped a value the user never saw
+     * and never touched. Twin of Swift `testPreservingCapturedCarriesStepsFromOld`.
+     */
+    @Test
+    fun preservingCaptured_carriesStepsFromOld() {
+        val old = row("my-whoop", 100, 3700, "Running", "manual").copy(steps = 4_200)
+        val edited = row("my-whoop", 100, 3700, "Trail Running", "manual")
+        assertNull(edited.steps)   // the sheet cannot supply steps
+        assertEquals(4_200, WorkoutEditing.preservingCaptured(edited, old).steps)
+    }
 
     @Test
     fun preservingCaptured_carriesUnexposedFieldsOnEdit() {
@@ -453,6 +529,22 @@ class WorkoutEditingTest {
         assertNull(m?.strain)                    // rescored by analyzeRecent, never summed
         assertNull(m?.zonesJSON)
         assertEquals(138, m?.avgHr)              // (150*3600 + 120*2400) / 6000
+    }
+
+    /**
+     * #1444: steps is cumulative per session, exactly like distance, so a merge must SUM it rather than
+     * drop it. It was dropped until the Swift twin's explicit-field audit forced the question. Twin of
+     * Swift `testMergeSumsStepsLikeDistance`.
+     */
+    @Test
+    fun merge_sumsStepsLikeDistance() {
+        val a = fullRow(1000, 4600, "Running", "manual", dist = 10_000.0).copy(steps = 6_200)
+        val b = fullRow(5000, 7400, "Running", "manual", dist = 5_000.0).copy(steps = 3_100)
+        assertEquals(9_300, WorkoutMerge.merge(listOf(a, b))?.steps)
+        // Nothing carried steps -> null, never a fake 0 (same rule energy and distance follow).
+        val c = fullRow(1000, 4600, "Running", "manual")
+        val d = fullRow(5000, 7400, "Running", "manual")
+        assertNull(WorkoutMerge.merge(listOf(c, d))?.steps)
     }
 
     @Test

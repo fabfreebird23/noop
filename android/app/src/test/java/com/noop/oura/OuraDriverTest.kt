@@ -219,6 +219,19 @@ class OuraDriverTest {
         )
     }
 
+    @Test
+    fun testLiveHRDisableWritesModeOffNotAutomatic() {
+        // 0x00 = "off" per OURA_PROTOCOL.md s7.2's APK-sourced feature-mode table; 0x01 is "automatic"
+        // and was falsified on two hardware nights (green 0x28 kept arriving after the old 0x01 write).
+        assertArrayEquals(intArrayOf(0x2F, 0x03, 0x22, 0x02, 0x00), OuraCommands.liveHRDisable().bytes)
+    }
+
+    @Test
+    fun testLiveHRUnsubscribeWritesSubscriptionOff() {
+        // Matching teardown for the enable triplet's step 3 (subscribe "latest" = 0x02).
+        assertArrayEquals(intArrayOf(0x2F, 0x03, 0x26, 0x02, 0x00), OuraCommands.liveHRUnsubscribe().bytes)
+    }
+
     // MARK: - Ring-time -> UTC anchor (s5.5)
 
     /**
@@ -567,6 +580,164 @@ class OuraDriverTest {
         )
     }
 
+    // MARK: - Real steps features (0x7E/0x7F, Tier B, third-party formula) - real Gen 3 capture
+    //
+    // PARITY/PROVENANCE: the two pairs below are byte-for-byte the same two CONSECUTIVE real_steps pairs
+    // pinned in the Swift OuraDriverTests (real capture, ring times 3499176-3499474 and their +1 0x7F
+    // partners). Expected fields are RECOMPUTED from the [oura-rs] unpack formula, not copied blind.
+
+    @Test
+    fun testRealStepsFieldsDecodesRealCapture0x7E() {
+        val d = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = key, allowTierB = true)
+        val rec = OuraRecord(type = OuraEventTag.REAL_STEPS_1.raw, ringTimestamp = 3_499_176,
+                             payload = bytes("6feb5e0a633e106865da4c136571"))
+        val events = d.ingest(rec)
+        assertEquals(
+            listOf<OuraEvent>(
+                OuraEvent.RealStepsFields(
+                    OuraRealStepsFields(
+                        tag = OuraEventTag.REAL_STEPS_1.raw, ringTimestamp = 3_499_176,
+                        fields = listOf(222, 470, 188, 10, 99, 62, 16, 104, 202, 436, 152, 19, 101, 113),
+                    ),
+                ),
+            ),
+            events,
+        )
+        assertTrue("realStepsFields must still report isTierB - the formula is UNVERIFIED", events[0].isTierB)
+    }
+
+    @Test
+    fun testRealStepsFieldsDecodesRealCapture0x7F() {
+        val d = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = key, allowTierB = true)
+        // The 0x7F partner of the same pair (ring time = the 0x7E record's rt + 1). Its packed block
+        // starts at byte 2, NOT byte 0 (see OuraDecoders.realStepsFieldOffset), so it yields 12 fields:
+        // 12/13 would need record bytes 14/15, which do not exist in a 14-byte body.
+        val rec = OuraRecord(type = OuraEventTag.REAL_STEPS_2.raw, ringTimestamp = 3_499_177,
+                             payload = bytes("24d467b25c127e3721a0a34dbde3"))
+        assertEquals(
+            listOf<OuraEvent>(
+                OuraEvent.RealStepsFields(
+                    OuraRealStepsFields(
+                        tag = OuraEventTag.REAL_STEPS_2.raw, ringTimestamp = 3_499_177,
+                        fields = listOf(206, 356, 184, 18, 126, 55, 33, 160, 327, 154, 378, 99),
+                    ),
+                ),
+            ),
+            d.ingest(rec),
+        )
+    }
+
+    // MARK: - 0x7F's +2 block offset (NOOP finding, 2026-08-01)
+
+    @Test
+    fun testRealStepsBlockOffsetIsTagDependent() {
+        assertEquals(0, OuraDecoders.realStepsFieldOffset(OuraEventTag.REAL_STEPS_1.raw))
+        assertEquals(
+            "0x7F's packed block starts 2 bytes later than 0x7E's - see OURA_PROTOCOL.md s6.13",
+            2, OuraDecoders.realStepsFieldOffset(OuraEventTag.REAL_STEPS_2.raw),
+        )
+    }
+
+    @Test
+    fun testRealStepsFields0x7FYields12Fields0x7EYields14() {
+        // 0x7F drops fields 12/13 rather than zero-filling them: they would read past the 14-byte body,
+        // and a fabricated zero is indistinguishable from a real one (honest-data invariant).
+        val e = OuraRecord(type = OuraEventTag.REAL_STEPS_1.raw, ringTimestamp = 3_499_176,
+                           payload = bytes("6feb5e0a633e106865da4c136571"))
+        val f = OuraRecord(type = OuraEventTag.REAL_STEPS_2.raw, ringTimestamp = 3_499_177,
+                           payload = bytes("24d467b25c127e3721a0a34dbde3"))
+        assertEquals(14, OuraDecoders.decodeRealStepsFields(e)?.fields?.size)
+        assertEquals(12, OuraDecoders.decodeRealStepsFields(f)?.fields?.size)
+    }
+
+    @Test
+    fun testRealSteps0x7FOffsetReadsTheCarryBitFromTheRightByte() {
+        // The regression this offset fixes: fields 0/8 take their 9th bit from the block's byte 3 / byte 11
+        // MSB. For 0x7F those are RECORD bytes 5 and 13. Craft a body where the OLD (unshifted) read would
+        // see a clear carry and the CORRECT (shifted) read sees a set one - the two decodes cannot agree.
+        val payload = IntArray(14)
+        payload[2] = 0xFF     // block byte 0 for 0x7F -> field0's high bits
+        payload[5] = 0x80     // block byte 3 for 0x7F -> field0's carry bit SET; old read would use byte 3 (=0)
+        val rec = OuraRecord(type = OuraEventTag.REAL_STEPS_2.raw, ringTimestamp = rt, payload = payload)
+        val fields = OuraDecoders.decodeRealStepsFields(rec)?.fields
+        assertEquals("0xFF<<1 | carry(1) - the carry must come from record byte 5, not byte 3", 511, fields?.get(0))
+        assertEquals("block byte 3 (record byte 5) = 0x80, & 0x7f = 0", 0, fields?.get(3))
+    }
+
+    @Test
+    fun testRealStepsFieldsDecodesSecondRealPair() {
+        val d = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = key, allowTierB = true)
+        val recE = OuraRecord(type = OuraEventTag.REAL_STEPS_1.raw, ringTimestamp = 3_499_474,
+                              payload = bytes("6b556d05356b1d6faa2c85aa2368"))
+        assertEquals(
+            listOf<OuraEvent>(
+                OuraEvent.RealStepsFields(
+                    OuraRealStepsFields(
+                        tag = OuraEventTag.REAL_STEPS_1.raw, ringTimestamp = 3_499_474,
+                        fields = listOf(214, 170, 218, 5, 53, 107, 29, 111, 341, 88, 266, 42, 35, 104),
+                    ),
+                ),
+            ),
+            d.ingest(recE),
+        )
+
+        val recF = OuraRecord(type = OuraEventTag.REAL_STEPS_2.raw, ringTimestamp = 3_499_475,
+                              payload = bytes("213590eb62a4515c22b4c381512c"))
+        assertEquals(
+            listOf<OuraEvent>(
+                OuraEvent.RealStepsFields(
+                    OuraRealStepsFields(
+                        tag = OuraEventTag.REAL_STEPS_2.raw, ringTimestamp = 3_499_475,
+                        fields = listOf(289, 470, 196, 36, 81, 92, 34, 180, 390, 258, 162, 44),
+                    ),
+                ),
+            ),
+            d.ingest(recF),
+        )
+    }
+
+    @Test
+    fun testRealStepsFieldsCarryBitCombinesWithNeighborByte() {
+        // Synthetic, isolating the carry-bit mechanic the [oura-rs] source documents: byte0=0xFF (all
+        // ones) with byte3's MSB SET must read field0 = 0xFF*2 + 1 = 511 (the 9-bit max), and byte3's
+        // own value (field3) must read only its low 7 bits (the MSB was consumed by field0's carry).
+        val rec = OuraRecord(
+            type = OuraEventTag.REAL_STEPS_1.raw, ringTimestamp = rt,
+            payload = intArrayOf(0xFF, 0x00, 0x00, 0x80, 0, 0, 0, 0, 0x00, 0x00, 0x00, 0x00, 0, 0),
+        )
+        val fields = OuraDecoders.decodeRealStepsFields(rec)?.fields
+        assertEquals(511, fields?.get(0))   // 0xFF<<1 | 1
+        assertEquals(0, fields?.get(3))     // byte3 = 0x80, & 0x7f = 0
+        assertEquals(0, fields?.get(8))     // byte11's MSB is clear -> no carry
+    }
+
+    @Test
+    fun testRealStepsFieldsDroppedByDefaultLikeOtherTierB() {
+        val d = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = key)   // allowTierB defaults to false
+        val rec = OuraRecord(type = OuraEventTag.REAL_STEPS_1.raw, ringTimestamp = rt,
+                             payload = bytes("6feb5e0a633e106865da4c136571"))
+        assertEquals(
+            "the Tier-B gate must cover RealStepsFields too",
+            emptyList<OuraEvent>(),
+            d.ingest(rec),
+        )
+    }
+
+    @Test
+    fun testRealStepsFieldsWrongLengthDecodesToNull() {
+        // The source's own length gate: anything other than exactly 14 bytes -> honest null, never a guess.
+        assertNull(
+            OuraDecoders.decodeRealStepsFields(
+                OuraRecord(type = OuraEventTag.REAL_STEPS_1.raw, ringTimestamp = rt, payload = bytes("00")),
+            ),
+        )
+        assertNull(
+            OuraDecoders.decodeRealStepsFields(
+                OuraRecord(type = OuraEventTag.REAL_STEPS_1.raw, ringTimestamp = rt, payload = intArrayOf()),
+            ),
+        )
+    }
+
     // MARK: - Live-HR push routing + decode
 
     @Test
@@ -658,5 +829,46 @@ class OuraDriverTest {
         // The normal command builders never produce a reboot/reset opcode.
         assertTrue(OuraCommands.getBattery().bytes[0] != 0x0E)
         assertTrue(OuraCommands.getBattery().bytes[0] != 0x1A)
+    }
+
+    /**
+     * #1073: a banked sample that converts to the future is rejected (the caller falls back to arrival
+     * time), while a historical sample still converts. "now" is injected so the test does not touch the
+     * wall clock. Byte-parity with Swift `testSampleConvertingToFutureIsRejected`.
+     */
+    @Test
+    fun sampleConvertingToFutureIsRejected() {
+        val anchorSeconds = 1_700_000_000L               // 2023-11-14, mid anchor window
+        val anchorRt = 1_000_000L
+        // Freeze "now" AT the anchor instant, so any sample after the anchor is "in the future".
+        val d = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = key, nowMsProvider = { anchorSeconds * 1000 })
+        assertTrue(d.adoptSyncTimeAnchor(ringTimestamp = anchorRt, unixSeconds = anchorSeconds))
+
+        // Historical (10s before now) and exactly-now still convert.
+        assertEquals(anchorSeconds - 10, d.unixSeconds(forRingTimestamp = anchorRt - 100))
+        assertEquals(anchorSeconds, d.unixSeconds(forRingTimestamp = anchorRt))
+        // Inside the 300s skew tolerance (+200s) still converts.
+        assertEquals(anchorSeconds + 200, d.unixSeconds(forRingTimestamp = anchorRt + 2_000))
+        // Just past the tolerance (+301s) is rejected as future/corrupt.
+        assertNull(d.unixSeconds(forRingTimestamp = anchorRt + 3_010))
+        // The regression #1073 is about: a sample ~1 year ahead (inside the OLD 2020-2035 window, so the
+        // old gate banked it) is now rejected because it is after `now`.
+        assertNull(d.unixSeconds(forRingTimestamp = anchorRt + 315_360_000))
+    }
+
+    /**
+     * The two gates are decoupled (#1073): anchor ADOPTION still uses the full 2020-2035 window even when
+     * "now" is frozen years earlier — only per-sample conversion is bounded by now. Byte-parity with Swift
+     * `testAnchorAdoptionStillUsesFullWindowIndependentOfNow`.
+     */
+    @Test
+    fun anchorAdoptionStillUsesFullWindowIndependentOfNow() {
+        val futureAnchorSeconds = 2_020_000_000L         // 2034, inside the 2020-2035 anchor window
+        val anchorRt = 500L
+        val d = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = key, nowMsProvider = { 1_700_000_000L * 1000 })
+        assertTrue("a 2034 anchor is still adopted — adoption uses the window, not now",
+            d.adoptSyncTimeAnchor(ringTimestamp = anchorRt, unixSeconds = futureAnchorSeconds))
+        assertNull("but converting a 2034 sample is rejected because it is after now (2023)",
+            d.unixSeconds(forRingTimestamp = anchorRt))
     }
 }

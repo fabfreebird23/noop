@@ -5,6 +5,7 @@ import com.noop.data.EventRow
 import com.noop.data.GravitySample
 import com.noop.data.V18AuxRow
 import com.noop.data.HrSample
+import com.noop.data.OuraRespScale
 import com.noop.data.SkinTempSample
 import com.noop.data.Spo2Sample
 import com.noop.data.RespSample
@@ -15,6 +16,7 @@ import com.noop.protocol.Whoop4SkinTemp
 import com.noop.protocol.skinTempCelsius
 import org.json.JSONObject
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import kotlin.math.max
@@ -40,6 +42,38 @@ import kotlin.math.roundToLong
  * uses Int seconds.
  */
 object AnalyticsEngine {
+
+    /**
+     * Skip the redundant calendar-day re-read in [IntelligenceEngine.analyzeRecent]'s per-day scan
+     * (#997, ryanbr). For a PAST day the night window [nightLo, nightHi] reads through to the NEXT
+     * local midnight, so the calendar day [dayLo, dayHi] is a strict SUBSET of the hr/steps/gravity
+     * streams already in memory — the dayHr/daySteps/dayGravity re-reads (~60 per pass, including the
+     * big ~86k-row HR ones) re-query rows the caller already holds. When the day span is a
+     * non-truncated subset of the night window, return the day's samples by filtering the night list
+     * in memory; return null when the shortcut is unsafe and the caller must read the store directly:
+     *   - TODAY: its calendar day runs past the 18 h night cap ([dayHi] > [nightHi]).
+     *   - a night read that came back at [limit] rows may be truncated INSIDE the day span (ORDER BY
+     *     ts ASC LIMIT drops the LATE rows — exactly where the day sits).
+     * Byte-identical to the direct read: same owner (the caller reads both windows from one device),
+     * same INCLUSIVE [dayLo, dayHi] bounds (matching the DAO's `ts >= from AND ts <= to` range), same
+     * ts-ASC order (the night list came from the SAME ts-ASC DAO method, and filtering preserves
+     * order), and the store's HR coalesce (measured ∪ v26 PPG, #172/#219) dedups on a
+     * range-INDEPENDENT `ts` anti-join, so coalescing-then-filtering equals coalescing over the day
+     * range. The guards are self-protecting — a DST-shifted [dayLo]/[dayHi] simply falls outside the
+     * window and declines — so the shortcut can only ever DECLINE to a direct read, never return wrong
+     * data. Mirrors Swift `AnalyticsEngine.daySliceFromNight`; lives here (like [offWristIntervals]) so
+     * the pure logic is unit-testable. (#997)
+     */
+    fun <T> daySliceFromNight(
+        night: List<T>,
+        nightLo: Long, nightHi: Long,
+        dayLo: Long, dayHi: Long,
+        limit: Int = 200_000,
+        ts: (T) -> Long,
+    ): List<T>? {
+        if (dayLo < nightLo || dayHi > nightHi || night.size >= limit) return null
+        return night.filter { ts(it) in dayLo..dayHi }
+    }
 
     /**
      * Pair the strap's WRIST_OFF/WRIST_ON events into off-wrist [start, end) intervals for the sleep
@@ -72,8 +106,12 @@ object AnalyticsEngine {
     // Day-string helper (UTC YYYY-MM-DD), mirrors Swift AnalyticsEngine.isoDay.
     // ─────────────────────────────────────────────────────────────────────────
 
+    // Locale.ROOT so the stored day-key stays ASCII yyyy-MM-dd regardless of the app-language selection
+    // (#1004): the six shipped languages already emit Latin digits, but pinning keeps this the primary
+    // DailyMetric.day writer's numerals stable if a non-Latin-digit locale is ever added — and keeps it
+    // byte-identical to Swift AnalyticsEngine.isoDay.
     private val isoDay: DateTimeFormatter =
-        DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC)
+        DateTimeFormatter.ofPattern("yyyy-MM-dd").withZone(ZoneOffset.UTC).withLocale(java.util.Locale.ROOT)
 
     /** Format a unix-seconds timestamp as a UTC YYYY-MM-DD day string. */
     fun dayString(ts: Long): String = isoDay.format(Instant.ofEpochSecond(ts))
@@ -91,6 +129,18 @@ object AnalyticsEngine {
      * pure-function callers/tests on UTC are unchanged.
      */
     fun dayString(ts: Long, offsetSec: Long): String = dayString(ts + offsetSec)
+
+    /**
+     * UTC-midnight epoch seconds of an ISO [day] key (yyyy-MM-dd). [isoDay] is a FIXED-UTC formatter, so
+     * `dayString(ts, offsetSec) == day` ⇔ `(ts + offsetSec) ∈ [dayStartUtcSeconds(day), +86400)` — an integer
+     * range check that replaces the per-sample DateFormatter the full-day stream filters in [analyzeDay] used
+     * to run (~170k formatter invocations per scored day, ×maxDays, every pass; #996). A malformed [day] falls
+     * back to 0 — an empty 1970 window no real sample matches — rather than throwing, so a single bad key can
+     * never take down a whole scoring pass. Byte-identical twin of the Swift `AnalyticsEngine.dayStartUtcSeconds`
+     * (locked cross-platform by AnalyticsEngineDayBoundsTest / AnalyticsEngineDayBoundsTests).
+     */
+    fun dayStartUtcSeconds(day: String): Long =
+        runCatching { LocalDate.parse(day).atStartOfDay(ZoneOffset.UTC).toEpochSecond() }.getOrDefault(0L)
 
     /**
      * JSON-encode stage segments to the verbatim array shape the sleepSession cache
@@ -130,6 +180,51 @@ object AnalyticsEngine {
     }
 
     /**
+     * Inverse of [encodeStages]: decode a stored `stagesJSON` back to a list of [StageSegment]. Only the
+     * on-device SEGMENT-ARRAY shape (`[{start,end,stage}]`) decodes; the imported minute-dict shape
+     * (`{light,deep,rem,awake}`) is not a segment timeline and yields an empty list. Mirrors Swift
+     * `AnalyticsEngine.decodeStages`. (#804)
+     */
+    fun decodeStages(json: String?): List<StageSegment> {
+        if (json == null) return emptyList()
+        return try {
+            val arr = org.json.JSONArray(json)
+            val out = ArrayList<StageSegment>(arr.length())
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                if (!o.has("start") || !o.has("end")) continue
+                val stage = o.optString("stage", "")
+                if (stage.isEmpty()) continue
+                out.add(StageSegment(o.getLong("start"), o.getLong("end"), stage))
+            }
+            out
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Reconstruct the [DetectedSleep] the analyzer stages from a persisted, device-PROVIDED [SleepSession]
+     * row — e.g. an Oura ring's own SleepNet hypnogram (#773), whose `stagesJSON` uses the same
+     * deep/light/rem/wake vocabulary the stager reads. Uses the effective (edit-aware) onset, preserves the
+     * stored efficiency (deriving it from the decoded stage minutes only when the row stored none), and
+     * passes restingHr/avgHrv through as stored — null for a ring night, which [analyzeDay] then re-derives
+     * from that day's hr/rr. Returns null when the row has no decodable stage timeline, so a non-hypnogram
+     * (minute-dict) row is never injected. Mirrors Swift `sleepSession(fromProvided:)`. (#804 Fix A)
+     */
+    fun sleepSessionFromProvided(c: com.noop.data.SleepSession): DetectedSleep? {
+        val stages = decodeStages(c.stagesJSON)
+        if (stages.isEmpty()) return null
+        val efficiency = c.efficiency
+            ?: SleepStageTotals.minutes(c.stagesJSON)?.let { if (it.inBed > 0) it.asleep / it.inBed else null }
+            ?: 0.0
+        return DetectedSleep(
+            start = c.effectiveStartTs, end = c.endTs, efficiency = efficiency,
+            stages = stages, restingHR = c.restingHr, avgHRV = c.avgHrv,
+        )
+    }
+
+    /**
      * Analyze one day's streams into a [DayResult].
      *
      * @param day the calendar day (UTC) this metric is for; a sleep session is
@@ -141,11 +236,53 @@ object AnalyticsEngine {
      * @param maxHROverride explicit HRmax (bpm) to use for strain/zones; null →
      *   Tanaka from profile.age.
      */
+    @Suppress("UNUSED_PARAMETER") // sleepNeedNights kept for signature stability (unused in the current body)
+    /**
+     * Minimum span (seconds) a night's vendor respiration rows must cover before their median is taken
+     * as the night's rate. One hour: enough that the value describes the night rather than a fragment,
+     * and low enough to keep a partially-drained night. Twin of the Swift constant.
+     */
+    const val VENDOR_RESP_MIN_SPAN_S = 3_600L
+
+    /**
+     * The night's respiratory rate (breaths/min) from a strap's OWN per-window rate rows, or null when
+     * the night has too little of it to summarise. Pure → unit-testable, and byte-twinned in Swift.
+     *
+     * This is NOT the RSA estimate `SleepStager.respRateFromRR` computes: these rows are a measurement
+     * the device made and NOOP decoded (the Oura ring's 0x6A `breath`, stored in milli-bpm), so the
+     * question is coverage, not method. The night's value is the MEDIAN of the rows that fall inside a
+     * matched in-bed session — the same statistic the ledger this decode was validated with used, and
+     * robust to the odd out-of-band record.
+     *
+     * Two guards, both about representativeness rather than trust:
+     *  * the in-session rows must SPAN at least [VENDOR_RESP_MIN_SPAN_S]. A record cadence is not a
+     *    reliable proxy for coverage (real nights hold both ~30 s and ~296 s spacing), so the gate is on
+     *    the time the rows actually cover: a 36-minute tail of a night is not that night's respiration,
+     *    and it would enter the personal baseline as though it were.
+     *  * the median must land inside `SleepStager.respPlausibleRangeBpm` (8–25), the SAME band the RSA
+     *    path is clamped to, so one corrupt record can never publish an impossible rate.
+     */
+    fun vendorRespRateBpm(rows: List<RespSample>, sessions: List<Pair<Long, Long>>): Double? {
+        if (rows.isEmpty() || sessions.isEmpty()) return null
+        val inSession = rows.filter { r -> sessions.any { r.ts >= it.first && r.ts <= it.second } }
+        val first = inSession.minOfOrNull { it.ts } ?: return null
+        val last = inSession.maxOfOrNull { it.ts } ?: return null
+        if (last - first < VENDOR_RESP_MIN_SPAN_S) return null
+        val median = HrvAnalyzer.median(inSession.map { OuraRespScale.breathsPerMin(it.raw) })
+        return if (median in SleepStager.respPlausibleRangeBpm) median else null
+    }
+
     fun analyzeDay(
         day: String,
         hr: List<HrSample> = emptyList(),
         rr: List<RrInterval> = emptyList(),
         resp: List<RespSample> = emptyList(),
+        // The strap's OWN per-window respiratory RATE rows, when it measures one (the Oura ring's 0x6A
+        // `breath`, stored in milli-bpm — see [com.noop.data.OuraRespScale]). Kept separate from [resp]
+        // on purpose: [resp] is the WHOOP raw respiration ADC WAVEFORM the stager peak-detects, a
+        // different quantity that must never be pooled with a rate. Empty for every WHOOP night, which
+        // therefore scores exactly as before.
+        vendorResp: List<RespSample> = emptyList(),
         gravity: List<GravitySample> = emptyList(),
         steps: List<StepSample> = emptyList(),
         // Calendar-day-scoped overrides for the ADDITIVE daily totals (steps + activeKcalEst) AND
@@ -178,6 +315,11 @@ object AnalyticsEngine {
         // owner's own worn median. null → the family-aware conversion uses the global Whoop4SkinTemp.ANCHOR_RAW,
         // so every 5/MG + pure-function caller stays byte-identical (WHOOP5 ignores the anchor entirely).
         skinTempAnchorRaw: Double? = null,
+        // #1467: 0 (default) keeps every existing caller's skin-temp "worn" gate exact-timestamp,
+        // byte-identical. IntelligenceEngine passes a non-zero value for an owner whose HR and
+        // skin-temp streams aren't co-sampled at 1 Hz (an Oura ring) — see
+        // [AnalyticsEngine.DEFAULT_OURA_WORN_TOLERANCE_SEC].
+        skinTempWornToleranceSec: Long = 0,
         // WHOOP 4.0 raw SpO2 PPG ADC samples (red/IR) for the night window (#93). The nightly red/IR
         // means over detected sleep are banked on the DailyMetric as RAW ADC — honest "the sensor
         // decoded" data, NOT a calibrated blood-oxygen % (that needs WHOOP's proprietary curve). Default
@@ -232,6 +374,15 @@ object AnalyticsEngine {
         // flag. Default false keeps every pure-function caller/test byte-identical; IntelligenceEngine
         // threads PuffinExperiment.from(context).motionAwareWake. Mirrors Swift.
         useMotionAwareWake: Boolean = false,
+        // Caller-supplied, already-staged sessions to fold in ALONGSIDE the motion detector's — the day
+        // owner's OWN device-provided hypnogram (an Oura ring's SleepNet night, #773), reconstructed via
+        // [sleepSessionFromProvided]. The fix for #804: a ring sends no gravity vector, so detectSleep stages
+        // nothing and the night scored blank even though the ring's hypnogram was persisted + shown on the
+        // timeline. Provided sessions are PRE-staged: they bypass detectSleep AND wake refinement. Where a
+        // provided session overlaps a detected one the PROVIDED session wins; a non-overlapping detected nap
+        // survives. Each provided session's nightly restingHR/avgHRV is re-derived here from this day's hr/rr
+        // when the stored row carried none. Default empty (every WHOOP / pure caller) = motion-only path.
+        providedSleep: List<DetectedSleep> = emptyList(),
         // Sleep & Rest test-mode trace sink (E11). null = byte-identical default. When non-null the gate
         // trace from detectSleep and the Rest sub-score line are forwarded line-by-line. Mirrors Swift.
         traceSink: ((String) -> Unit)? = null,
@@ -248,7 +399,23 @@ object AnalyticsEngine {
         // the whole-night mean. Display-only preference threaded from the caller (UnitPrefs.hrvWindow). The
         // default (false) is byte-identical to the historical whole-night value.
         deepHrvWindow: Boolean = false,
+        // #1545: which TRIMP recipe scores Effort. EDWARDS (the default) is time-in-zone and pays NOTHING
+        // below 50% HRR, so intermittent work — a lifting session, once the sets are averaged against the
+        // rests — can score near zero however long it lasts. BANISTER is exponential in %HRR with no floor.
+        // Threaded rather than read from a global so this stays a pure function, and defaulted so every
+        // existing caller and test is byte-identical.
+        effortMethod: StrainScorer.Method = StrainScorer.Method.EDWARDS,
     ): DayResult {
+
+        // Precompute the day's UTC bounds ONCE (#996). isoDay is a FIXED-UTC formatter, so
+        // `dayString(ts, tzOffsetSeconds) == day` is exactly membership in [dayStartUtc, +86400). That turns
+        // the day-bucketing filters below — otherwise a per-sample DateFormatter over the full-day
+        // dayHr/daySteps streams (~86k 1 Hz samples each) once per analyzeDay, ×maxDays every pass — into an
+        // integer range check. Byte-identical to the formatter compare (locked by AnalyticsEngineDayBoundsTest,
+        // incl. fractional offsets), matching the Swift twin.
+        val dayStartUtc = dayStartUtcSeconds(day)
+        val dayEndUtc = dayStartUtc + 86_400
+        fun tsInDay(ts: Long): Boolean = (ts + tzOffsetSeconds) >= dayStartUtc && (ts + tzOffsetSeconds) < dayEndUtc
 
         // ── Sleep detection + staging ─────────────────────────────────────────
         val detectedSessions = SleepStager.detectSleep(
@@ -262,14 +429,35 @@ object AnalyticsEngine {
         // night-window stream the caller passed for the rest of this analysis; the pass self-gates on its
         // observed density, so an empty/sparse `steps` (e.g. a WHOOP 4.0, which never emits a step sample
         // at all) is a no-op regardless of `useMotionAwareWake`.
-        val allSessions = if (useMotionAwareWake) {
+        val refinedSessions = if (useMotionAwareWake) {
             detectedSessions.map { WakeMotionRefinement.refine(it, gravity, steps) }
         } else {
             detectedSessions
         }
+        // #804 Fix A: fold in the caller's device-provided hypnogram (see [providedSleep]). Empty = the
+        // byte-identical motion-only path. Otherwise enrich each provided session's nightly restingHR/avgHRV
+        // from THIS day's hr/rr over its window (the stored ring row carries neither), using the SAME helpers
+        // detectSleep populates a session with, then keep only the detected sessions that DON'T overlap a
+        // provided one (provided is authoritative where they collide; a separate nap survives).
+        val allSessions: List<DetectedSleep> = if (providedSleep.isEmpty()) {
+            refinedSessions
+        } else {
+            val rrSorted = rr.sortedBy { it.ts }
+            val enrichedProvided = providedSleep.map { s ->
+                if (s.restingHR != null && s.avgHRV != null) s
+                else s.copy(
+                    restingHR = s.restingHR ?: SleepStager.sessionRestingHR(s.start, s.end, hr),
+                    avgHRV = s.avgHRV ?: SleepStager.sessionAvgHRV(s.start, s.end, rrSorted),
+                )
+            }
+            val keptDetected = refinedSessions.filter { d ->
+                enrichedProvided.none { it.start < d.end && d.start < it.end }
+            }
+            keptDetected + enrichedProvided
+        }
         // Sessions attributed to `day` = those whose end falls on `day` (LOCAL day, #277). `day` is
         // the caller's local-day key; attribute by the same offset so the bucket and the key agree.
-        val matched = allSessions.filter { dayString(it.end, tzOffsetSeconds) == day }
+        val matched = allSessions.filter { tsInDay(it.end) }
 
         // ── The day's MAIN night (#525) ───────────────────────────────────────
         // A day can hold an overnight AND a daytime nap (both end on `day`, so both are in `matched`).
@@ -368,6 +556,14 @@ object AnalyticsEngine {
             }
         }
 
+        // Five-minute SDNN index over R-R intervals inside the matched sleep sessions. This preserves the
+        // timestamps needed for segmentation and stays distinct from avgHrv (RMSSD). The half-open sleep
+        // bounds match every other in-bed aggregate; no qualifying 20-clean-beat segment means null.
+        val avgSDNNDaily = HrvAnalyzer.sdnnIndex(
+            rr.filter { sample -> matched.any { sample.ts >= it.start && sample.ts < it.end } },
+            segmentSec = 300,
+        )
+
         // ── HRV & Autonomic nightly trace (#141) ──────────────────────────────
         // Per-5-min-window RMSSD tagged by the sleep stage at its center, then a night summary comparing
         // NOOP's whole-night mean (what it reports) against a deep-only mean and a WHOOP-style
@@ -413,11 +609,23 @@ object AnalyticsEngine {
         // NOT a cloud/clinical respiration value. Per matched in-bed session, estimate
         // over [start, end]; the night's value = median of finite per-session
         // estimates; null only when no session yields a finite estimate.
+        //
+        // A DEVICE-MEASURED rate wins over that estimate when the night has one. [vendorResp] carries a
+        // strap's own respiratory-rate rows — today the Oura ring's 0x6A `breath`, one value per sleep
+        // window, computed by the ring's firmware rather than derived here (see [vendorRespRateBpm]).
+        // Preferring it is not a close call: on a ring night the RSA estimate is built from BANKED R-R,
+        // where shuffling or reversing the night returns the same 13.3333 bpm — it carries no breathing
+        // information at all. A WHOOP night passes no [vendorResp], so it keeps the RSA path verbatim.
         val respRateDaily: Double? = run {
-            val perSession = matched
-                .map { SleepStager.respRateFromRR(rr, it.start, it.end) }
-                .filter { it.isFinite() }
-            if (perSession.isEmpty()) null else HrvAnalyzer.median(perSession)
+            val vendor = vendorRespRateBpm(vendorResp, matched.map { it.start to it.end })
+            if (vendor != null) {
+                vendor
+            } else {
+                val perSession = matched
+                    .map { SleepStager.respRateFromRR(rr, it.start, it.end) }
+                    .filter { it.isFinite() }
+                if (perSession.isEmpty()) null else HrvAnalyzer.median(perSession)
+            }
         }
 
         // sleepStart/sleepEnd available for callers wiring sleep_start/end columns.
@@ -430,7 +638,8 @@ object AnalyticsEngine {
         // mean is harvested; IntelligenceEngine seeds the baseline from those means and re-derives the
         // deviation in pass 2 (mirrors avgHrv→recovery). Computed BEFORE Charge so the Charge skin-temp
         // penalty can read it. APPROXIMATE. (PR #85)
-        val nightlySkinTempC = wornNightlySkinTempC(matched, hr, skinTemp, skinTempFamily, skinTempAnchorRaw)
+        val nightlySkinTempC = wornNightlySkinTempC(matched, hr, skinTemp, skinTempFamily, skinTempAnchorRaw,
+            wornToleranceSec = skinTempWornToleranceSec)
         val skinTempDevC: Double? = nightlySkinTempC?.let { v ->
             baselines.skinTemp?.takeIf { it.usable }?.let { round2(Baselines.deviation(v, it).delta) }
         }
@@ -444,7 +653,7 @@ object AnalyticsEngine {
         // ── Rest (sleep_performance composite, 0–100) ─────────────────────────
         // Replaces the bare efficiency proxy: duration-vs-personal-need 0.50 + efficiency 0.20 +
         // restorative (deep+REM)/asleep 0.20 + consistency 0.10. Stored under the sleep_performance
-        // key. null when no in-bed session. (Charge/Effort/Rest)
+        // key. null when there is no asleep time. (Charge/Effort/Rest)
         val rest: Double? = if (matched.isEmpty()) null else RestScorer.rest(
             asleepSeconds = tstS,
             efficiency = efficiency,
@@ -460,12 +669,14 @@ object AnalyticsEngine {
         // IDENTICAL inputs `rest` consumed above so the trace can never disagree with the score. Emitted
         // only when a trace is requested and this day scored a night. Mirrors Swift.
         if (traceSink != null && matched.isNotEmpty()) {
-            traceSink(RestScorer.subScoreLine(
-                tstSeconds = tstS, inBedSeconds = inBedS, efficiency = efficiency,
-                restorativeSeconds = deepS + remS,
-                needHours = sleepNeedHours ?: RestScorer.defaultSleepNeedHours,
-                consistency = sleepConsistency, deepSeconds = deepS,
-                groupFragments = mainGroup.size, groupInBedSeconds = inBedS))
+            if (rest != null) {
+                traceSink(RestScorer.subScoreLine(
+                    tstSeconds = tstS, inBedSeconds = inBedS, efficiency = efficiency,
+                    restorativeSeconds = deepS + remS,
+                    needHours = sleepNeedHours ?: RestScorer.defaultSleepNeedHours,
+                    consistency = sleepConsistency, deepSeconds = deepS,
+                    groupFragments = mainGroup.size, groupInBedSeconds = inBedS))
+            }
             // #319: the motion-coverage + staging context behind the Rest number, so a high score on a poor
             // night can be explained from an export — WHOOP 4.0 banks motion coarsely (sparse=true), so most
             // epochs default to sleep → over-counted duration → high Rest; `stager` says whether V1/V2 ran.
@@ -519,6 +730,7 @@ object AnalyticsEngine {
             hr = dayHr ?: hr,
             maxHR = effMaxHR,
             restingHR = restForStrain,
+            method = effortMethod,
             sex = profile.sex,
         )
 
@@ -531,9 +743,25 @@ object AnalyticsEngine {
             hr = dayHr ?: hr,
             gravity = dayGravity ?: gravity,
             restingHR = restingHRDaily?.toDouble(),
-            maxHR = maxHROverride,
+            // #1545: the DAY's effective HRmax, not just the override. Passing maxHROverride meant an
+            // install with no override left the detector to fall back to StrainScorer.estimateHRmax,
+            // which returns max(observed p99.5, Tanaka) -- so every bout was measured against a HRmax at
+            // least as high as, and usually higher than, the one its own day used. A higher HRmax is a
+            // bigger reserve and therefore a SMALLER %HRR, so bouts were held to a stricter yardstick
+            // than the day containing them: for age 30 / RHR 60 with an observed 195, a 125 bpm minute is
+            // zone 1 for the day and zone 0 for the bout. Same day-disagrees-with-its-own-workouts
+            // failure #1562 fixed for the TRIMP method.
+            //
+            // This also feeds the z2+ qualification gate below, so it changes which bouts are DETECTED,
+            // not only how they score -- in the direction of no longer dropping a workout by a standard
+            // its own day never applied. Still null for an age-less profile.
+            maxHR = effMaxHR,
             age = if (profile.age > 0) profile.age else null,
             profile = profile,
+            // #1545: the bouts inside a day MUST be scored by the same recipe as the day itself. A day
+            // on Banister whose workouts were still on Edwards would show a session scoring less than
+            // the day it sits inside, which is a worse inconsistency than either method.
+            effortMethod = effortMethod,
         )
 
         // ── Steps (APPROXIMATE) ───────────────────────────────────────────────
@@ -554,7 +782,7 @@ object AnalyticsEngine {
             // day's read window may include adjacent-day samples, so filter to the LOCAL-day key first
             // (#277); the wrap-aware tick math itself lives in the shared StepsCounter kernel so the daily
             // and per-workout (#398) totals can never disagree.
-            val inDay = (daySteps ?: steps).filter { dayString(it.ts, tzOffsetSeconds) == day }
+            val inDay = (daySteps ?: steps).filter { tsInDay(it.ts) }
             val ticks = StepsCounter.stepsInWindow(inDay) ?: return@run null
             // @57 counts motion ticks, not validated steps — the 5/MG counter overcounts. Divide
             // by the user-calibrated ticks-per-step (default 1.0 = raw pass-through; floor 0.5 so
@@ -576,7 +804,7 @@ object AnalyticsEngine {
         // (dayString(ts, tzOffset)) so it agrees with the bucket (#277). Fall back to the
         // night-window hr for pure-function callers that don't supply dayHr. Strain keeps the full
         // window (bounded log).
-        val dayHrFiltered = (dayHr ?: hr).filter { dayString(it.ts, tzOffsetSeconds) == day }
+        val dayHrFiltered = (dayHr ?: hr).filter { tsInDay(it.ts) }
         val activeKcalEst: Double? = if (dayHrFiltered.isEmpty()) {
             null
         } else {
@@ -613,6 +841,7 @@ object AnalyticsEngine {
             activeKcalEst = activeKcalEst,
             spo2Red = nightlySpo2Raw?.first,
             spo2Ir = nightlySpo2Raw?.second,
+            avgSdnn = avgSDNNDaily,
         )
 
         // ── Per-score confidence tiers (mirror Swift ScoreConfidence.derive decisions) ──
@@ -670,6 +899,7 @@ object AnalyticsEngine {
             restConfidence = restConfidence,
             sessionMotionByStart = sessionMotionByStart,
             sessionSleepStateByStart = sessionSleepStateByStart,
+            gravitySparse = gravitySparse,
         )
     }
 
@@ -703,7 +933,11 @@ object AnalyticsEngine {
         // 5/MG + pure-function callers byte-identical. Threaded straight to the funnel's conversion.
         anchorRaw: Double? = null,
         minSamples: Int = MIN_SKIN_TEMP_SAMPLES_INLINE,
-    ): Double? = skinTempFunnel(sessions, hr, skinTemp, family, anchorRaw, minSamples).mean
+        // #1467: how many seconds apart a "worn" HR sample may sit from a skin-temp sample and still
+        // count it as concurrent. Default 0 = today's exact-timestamp match, byte-identical for every
+        // existing caller. See [skinTempFunnel]'s doc for why a ring needs this > 0.
+        wornToleranceSec: Long = 0,
+    ): Double? = skinTempFunnel(sessions, hr, skinTemp, family, anchorRaw, minSamples, wornToleranceSec).mean
 
     /**
      * Nightly means of the WHOOP 4.0 raw SpO2 PPG channels (red/IR ADC) over the detected in-bed
@@ -774,6 +1008,61 @@ object AnalyticsEngine {
         return Pair((sum / kept).toInt(), kept)
     }
 
+    /**
+     * #1169 SHADOW METRIC: the primary-session MEAN resting HR — window each detected sleep session's HR
+     * samples to `[start, end)` and delegate to the #1174-defined [PrimarySessionRestingHR.meanHR] (that
+     * definition is UNCHANGED). IntelligenceEngine stores the result beside the shipped nightly HR FLOOR
+     * (`daily.restingHr`) as "rhr_primary_session" — instrumentation only, never shown, never scored — so
+     * the mean-vs-floor comparison #1169 asks for can be evaluated from exports without a headline switch.
+     * Byte-parity twin of the Swift `primarySessionRestingHR`.
+     */
+    internal fun primarySessionRestingHR(
+        sessions: List<DetectedSleep>,
+        hr: List<HrSample>,
+        validBpm: IntRange = PrimarySessionRestingHR.DEFAULT_VALID_BPM,
+        minValidSamples: Int = PrimarySessionRestingHR.DEFAULT_MIN_VALID_SAMPLES,
+    ): Double? = PrimarySessionRestingHR.meanHR(primarySessions(sessions, hr), validBpm, minValidSamples)
+
+    /** #1169 coverage inputs for the shadow `rhr_primary_session` mean (valid-sample count + primary-session
+     *  duration). Builds the SAME per-session inputs as [primarySessionRestingHR] and delegates to
+     *  [PrimarySessionRestingHR.coverage], so it is null in lockstep with the mean. Byte-parity twin of the
+     *  Swift `primarySessionRestingHRCoverage`. */
+    internal fun primarySessionRestingHRCoverage(
+        sessions: List<DetectedSleep>,
+        hr: List<HrSample>,
+        validBpm: IntRange = PrimarySessionRestingHR.DEFAULT_VALID_BPM,
+        minValidSamples: Int = PrimarySessionRestingHR.DEFAULT_MIN_VALID_SAMPLES,
+    ): PrimarySessionRestingHR.Coverage? =
+        PrimarySessionRestingHR.coverage(primarySessions(sessions, hr), validBpm, minValidSamples)
+
+    /** Window [hr] to each session's `[start, end)` once — the shared input BOTH the #1169 mean and its coverage
+     *  average over. Extracted so a caller that needs both windows the samples a SINGLE time (this is O(sessions
+     *  × hr); doing it once per metric is pure duplicate work). Twin of the Swift `primarySessions`. */
+    private fun primarySessions(
+        sessions: List<DetectedSleep>,
+        hr: List<HrSample>,
+    ): List<PrimarySessionRestingHR.Session> = sessions.map { s ->
+        PrimarySessionRestingHR.Session(
+            durationSec = (s.end - s.start).toDouble(),
+            bpm = hr.filter { it.ts >= s.start && it.ts < s.end }.map { it.bpm },
+        )
+    }
+
+    /** The #1169 mean AND its coverage from ONE windowing of [hr] (both read the same longest primary session).
+     *  Byte-identical to calling [primarySessionRestingHR] + [primarySessionRestingHRCoverage] separately, but
+     *  windows the per-session samples once instead of twice — the only caller (IntelligenceEngine) needs both.
+     *  Twin of the Swift `primarySessionRestingHRWithCoverage`. */
+    internal fun primarySessionRestingHRWithCoverage(
+        sessions: List<DetectedSleep>,
+        hr: List<HrSample>,
+        validBpm: IntRange = PrimarySessionRestingHR.DEFAULT_VALID_BPM,
+        minValidSamples: Int = PrimarySessionRestingHR.DEFAULT_MIN_VALID_SAMPLES,
+    ): Pair<Double?, PrimarySessionRestingHR.Coverage?> {
+        val built = primarySessions(sessions, hr)
+        return PrimarySessionRestingHR.meanHR(built, validBpm, minValidSamples) to
+            PrimarySessionRestingHR.coverage(built, validBpm, minValidSamples)
+    }
+
     /** Plausible worn skin-temperature range (°C). Off-wrist/charging samples drift to ambient and are
      *  excluded; the strap's own decode gate is the looser 20–45. (PR #85) */
     private const val SKIN_TEMP_MIN_C: Double = 28.0
@@ -836,6 +1125,19 @@ object AnalyticsEngine {
     }
 
     /**
+     * #1467: how far apart (seconds) a valid HR sample may sit from a skin-temp sample and still mark
+     * it "worn", when the caller opts in via [wornToleranceSec] > 0. Ground-truthed against a 7-night
+     * Oura gap: exact-timestamp co-occurrence (tolerance 0) landed every one of those nights just under
+     * [MIN_SKIN_TEMP_SAMPLES_INLINE] (155-296 kept, floor 300) despite 269-675 raw skin-temp samples
+     * and 3,900-14,600 valid HR samples each night — the ring's HR and skin-temp channels are
+     * independently clocked, unlike a WHOOP strap's single co-sampled per-second stream, so only
+     * ~40-55% of timestamps coincide exactly by chance. A ±2 s window alone recovered every real
+     * (non-fragment) night comfortably past the floor (622-635 kept); this default carries margin. See
+     * worklog/BOARD.md queue 11b and worklog/analysis/2026-08-19-1745-oura-app-skintemp-groundtruth-check.txt.
+     */
+    const val DEFAULT_OURA_WORN_TOLERANCE_SEC = 5L
+
+    /**
      * Read-only skin-temp funnel for one night (#752). Re-runs the SAME wear/window/range gates
      * [wornNightlySkinTempC] uses (and produces the IDENTICAL mean), additionally counting where each
      * sample dropped, so an absent skin temp is self-explaining. [wornNightlySkinTempC] is a thin wrapper
@@ -850,6 +1152,11 @@ object AnalyticsEngine {
         // Whoop4SkinTemp.ANCHOR_RAW, so 5/MG + pure-function callers are byte-identical.
         anchorRaw: Double? = null,
         minSamples: Int = MIN_SKIN_TEMP_SAMPLES_INLINE,
+        // #1467: 0 (default) = exact-timestamp "worn" match, byte-identical to every caller before this
+        // change. A device whose HR and skin-temp streams aren't co-sampled at 1 Hz (an Oura ring)
+        // needs > 0 — see [DEFAULT_OURA_WORN_TOLERANCE_SEC]'s doc for the ground truth behind the value.
+        // IntelligenceEngine threads it per the OWNER device, never globally, so WHOOP is untouched.
+        wornToleranceSec: Long = 0,
     ): SkinTempFunnelDiagnostic {
         val total = skinTemp.size
         // #skin-diag: raw-ADC band + resolved anchor — PURE observation of the input, computed once and
@@ -880,15 +1187,43 @@ object AnalyticsEngine {
                 inBandCount = inBandCount, resolvedAnchorRaw = usedAnchor, medianMappedC = medianMappedC,
             )
         }
-        val wornSeconds = HashSet<Long>(hr.size)
-        for (h in hr) if (h.bpm in 30..220) wornSeconds.add(h.ts)
+        // #1467: tolerance 0 keeps the ORIGINAL O(1) exact-second HashSet lookup, untouched — every
+        // caller before this change, and every WHOOP night today, takes this branch and is byte-
+        // identical. tolerance > 0 (an Oura owner) instead sorts the valid HR timestamps once and
+        // binary-searches each skin-temp sample for the nearest one, so the check stays
+        // O(hr log hr + skinTemp log hr) rather than an O(hr × skinTemp) scan.
+        val wornSeconds: HashSet<Long>?
+        val sortedValidHrTs: LongArray?
+        if (wornToleranceSec <= 0) {
+            val s = HashSet<Long>(hr.size)
+            for (h in hr) if (h.bpm in 30..220) s.add(h.ts)
+            wornSeconds = s
+            sortedValidHrTs = null
+        } else {
+            wornSeconds = null
+            sortedValidHrTs = hr.filter { it.bpm in 30..220 }.map { it.ts }.sorted().toLongArray()
+        }
+        // True when some valid HR reading sits within [wornToleranceSec] of [ts] (inclusive both sides).
+        fun isWorn(ts: Long): Boolean {
+            if (wornSeconds != null) return ts in wornSeconds
+            if (sortedValidHrTs == null || sortedValidHrTs.isEmpty()) return false
+            var lo = 0
+            var hi = sortedValidHrTs.size - 1
+            while (lo <= hi) {
+                val mid = (lo + hi) / 2
+                val d = sortedValidHrTs[mid] - ts
+                if (kotlin.math.abs(d) <= wornToleranceSec) return true
+                if (d < 0) lo = mid + 1 else hi = mid - 1
+            }
+            return false
+        }
         var sum = 0.0
         var kept = 0
         var notWorn = 0
         var outOfWindow = 0
         var outOfRange = 0
         for (t in skinTemp) {
-            if (t.ts !in wornSeconds) { notWorn++; continue }
+            if (!isWorn(t.ts)) { notWorn++; continue }
             if (sessions.none { t.ts in it.start..it.end }) { outOfWindow++; continue }
             // WHOOP 4.0 ONLY (#938 second capture): drop raws outside the plausible worn ADC band BEFORE the
             // anchor map. The no-contact floor (~509) and the 11-bit saturation ceiling (2047) are doff /
@@ -945,6 +1280,55 @@ object RestScorer {
     const val defaultSleepNeedHours: Double = 8.0
 
     /**
+     * Minimum trailing nights before a personal sleep-need estimate is trusted; below this the
+     * population default is used (cold-start honesty — never learn a need from a few nights). Mirrors
+     * Swift `AnalyticsEngine.Rest.minNeedNights`.
+     */
+    const val minNeedNights: Int = 7
+
+    /** Hard cap on personalized need (h): beyond typical adult need even for genuine long sleepers.
+     *  Mirrors Swift `AnalyticsEngine.Rest.maxNeedHours`. */
+    const val maxNeedHours: Double = 9.5
+
+    /**
+     * Population TARGET nightly sleep need (hours) for an age (NSF/AASM recommended-range midpoint).
+     * Used as a FLOOR: the personal estimate can only adjust it UP for genuine long sleepers, NEVER
+     * below the population target — so a chronic under-sleeper's need can't drift toward their own
+     * deficit (which would falsely erase their sleep debt and read a short night as "Strong").
+     * Deliberately the target, not the minimum: flooring at the low end of the range would understate
+     * a sleep-deprived (vs genuinely short-sleeping) user's deficit. Byte-identical to Swift
+     * `AnalyticsEngine.Rest.populationNeedFloorHours`.
+     */
+    fun populationNeedFloorHours(age: Int?): Double {
+        if (age == null || age <= 0) return 8.0   // unknown → adult target
+        return if (age < 18) 9.0 else 8.0         // children/teens ~9 (NSF 8–12); adults & older ~8 (NSF 7–9)
+    }
+
+    /**
+     * Personalized nightly sleep need (hours), population-ANCHORED and age-floored (T1). The personal
+     * component is the user's UPPER-QUARTILE nightly duration over the trailing window — what they
+     * sleep on their less-restricted nights, NOT their average (which a chronic deficit drags down) —
+     * floored at the age-appropriate population TARGET and capped at [maxNeedHours]. So it only ever
+     * ADJUSTS UP for genuine long sleepers, never below the target. Fewer than [minNeedNights] scorable
+     * nights → the population default (cold-start). Zero/negative entries (no-data days) are dropped and
+     * do not count toward the minimum. Byte-identical to Swift
+     * `AnalyticsEngine.Rest.personalizedNeedHours`.
+     */
+    fun personalizedNeedHours(nightlyHours: List<Double>, age: Int?): Double {
+        val floor = populationNeedFloorHours(age)
+        val xs = nightlyHours.filter { it > 0.0 }.sorted()
+        if (xs.size < minNeedNights) {
+            return minOf(maxOf(defaultSleepNeedHours, floor), maxNeedHours)
+        }
+        // Linear-interpolated 75th percentile — the "unrestricted" nights.
+        val pos = 0.75 * (xs.size - 1)
+        val lo = pos.toInt()
+        val hi = minOf(lo + 1, xs.size - 1)
+        val q = xs[lo] + (pos - lo) * (xs[hi] - xs[lo])
+        return minOf(maxOf(q, floor), maxNeedHours)
+    }
+
+    /**
      * Healthy restorative (deep + REM) share of asleep time. A share at/above this earns full
      * restorative credit; below it scales linearly. ~0.50 reflects ~20% deep + ~25–30% REM in a
      * well-structured night.
@@ -987,7 +1371,8 @@ object RestScorer {
         if (asleepSeconds <= 0.0) return null
 
         val asleepHours = asleepSeconds / 3600.0
-        val needHours = (sleepNeedHours ?: defaultSleepNeedHours).coerceAtLeast(1e-9)
+        // Parity: Swift Rest.composite and Kotlin's own subScoreLine both floor need at 0.1 h (not 1e-9).
+        val needHours = (sleepNeedHours ?: defaultSleepNeedHours).coerceAtLeast(0.1)
 
         // Duration vs personal need (clamped at 100 — sleeping past need does not over-credit).
         val durationScore = min(100.0, asleepHours / needHours * 100.0)
@@ -1064,6 +1449,7 @@ object RestScorer {
         return "sleep-onset onsetTs=$onsetTs hrAtOnset=$hrAtOnsetBpm baselineHr=$baselineHrBpm hrRatio=$r2"
     }
 
+    @Suppress("UNUSED_PARAMETER") // inBedSeconds mirrors the Swift subScoreLine signature (parity)
     fun subScoreLine(
         tstSeconds: Double, inBedSeconds: Double, efficiency: Double, restorativeSeconds: Double,
         needHours: Double, consistency: Double?, deepSeconds: Double?,

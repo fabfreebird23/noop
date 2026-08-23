@@ -114,8 +114,12 @@ final class AppModel: ObservableObject {
         var avgHr: Int = 0
         var peakHr: Int = 0
     }
+    struct HealthAlert: Equatable {
+        let message: IllnessSignalEngine.Message
+        let firedSignals: [String]
+    }
     /// Illness/strain early-warning (recent RHR up + HRV down + skin-temp up vs baseline). nil = clear.
-    @Published var healthAlert: String?
+    @Published var healthAlert: HealthAlert?
 
     // MARK: - v5 pillar snapshot (engines run in the analytics pass; the views read these)
     //
@@ -402,6 +406,7 @@ final class AppModel: ObservableObject {
             #endif
             await self.repo.refresh()                          // surface any imported data at once
             await self.wireSourceCoordinator()                 // dormant unless a generic strap is active
+            await self.recordAppVersionChangeIfNeeded()        // #1410: stamp an update transition once
             try? await Task.sleep(nanoseconds: 6_000_000_000)  // give the first offload a moment
             // FIX 2(a): DEFER the heavy one-shot 4000-day heal/rescore while an import is in flight. A
             // large Apple Health import is the worst-case launch overlap , running a 4000-iteration heal
@@ -439,11 +444,37 @@ final class AppModel: ObservableObject {
                 // `force: false` skips the heavy 21-day rescore when the raw HR stream is unchanged since the
                 // last run, instead of re-reading ~21×54 h of HR every 15 min on a big-import library. A new
                 // sample (the heal above, or a sync) moves the fingerprint and the tick rescores as before.
-                await self.intelligence.analyzeRecent(force: false)
+                // #1538: the backstop is subject to the same background reality as the post-offload pass,
+                // and it was the LAST way the livelock could survive. This loop lives as long as the
+                // process, so it keeps ticking while backgrounded as a bluetooth-central, and its own
+                // `force: false` watermark gate cannot save it: a killed pass never advances the
+                // watermark, so the tick still reads the data as new and starts another full pass. The
+                // comment above says the gate also can't skip while the strap streams live HR. Wrapping
+                // it means a tick that cannot finish here does not start.
+                //
+                // `owesOnDefer: false` — a skipped BACKSTOP owes nothing. Every real update forces its
+                // own pass, so conjuring a debt here would send a processing task off to run a forced
+                // full pass when most likely nothing changed. A debt a real pass already recorded is
+                // untouched.
+                // `live = self.live` spelled out: this is nested inside the cadence `Task`, which
+                // requires explicit `self`, so the bare-name capture shorthand used elsewhere in this
+                // type would not resolve here.
+                await RescoreBackgroundScheduler.run(owesOnDefer: false,
+                                                     log: { [live = self.live] line in
+                                                         live.append(log: line)
+                                                     }) {
+                    await self.intelligence.analyzeRecent(force: false)
+                }
                 // v5: recompute the skin-temp suite snapshots (cycle phase + body clock) from the
                 // freshly-scored history so the Health hub cards read a ready result.
                 await self.refreshV5Signals()
-                try? await Task.sleep(nanoseconds: 900_000_000_000)  // 15 min, matches the offload cadence
+                // #836 battery: 30-min BACKSTOP cadence (twin of Android ANALYZE_INTERVAL_MS). The
+                // `force: false` gate above can't skip while the strap streams live HR — the fingerprint
+                // advances every second — so this re-scored the whole 21-day window every 15 min even though
+                // only today's daytime HR changed. It's a pure backstop (every real update rescores via its
+                // own forced call above), so halving the cadence only delays the idle refresh of today's
+                // live Effort/steps; recovery/sleep are night-computed and unaffected.
+                try? await Task.sleep(nanoseconds: 1_800_000_000_000)  // 30 min backstop (#836 battery)
             }
         }
     }
@@ -455,6 +486,8 @@ final class AppModel: ObservableObject {
     /// The riskier connection-priority idle throttle is intentionally not wired (Android-only, and dormant).
     func applyPowerSaving() {
         let on = PuffinExperiment.powerSavingEnabled
+        // Sub-option: only in effect while the Power-saving master is on, like the HRV-pause lever below.
+        ble.setLowRefreshMode(on && PuffinExperiment.lowRefreshEnabled)
         ble.setLowBatteryOffloadThrottle(on ? PuffinExperiment.powerSavingBatteryPct : 0)
         // HRV pause is battery-%-aware like the offload lever — pass the same threshold.
         ble.setPauseCaptureOnPowerSave(on && PuffinExperiment.pauseHrvOnPowerSaveEnabled,
@@ -466,6 +499,31 @@ final class AppModel: ObservableObject {
     /// untouched. The coordinator only acts if/when a non-WHOOP strap becomes the active device.
     /// `startWhoop`/`stopWhoop` are thin closures over BLEManager's EXISTING public methods (via the
     /// model's `scan()` / `disconnect()`), so the coordinator never references BLEManager directly.
+    /// #1410: record an `APP_VERSION_CHANGED` event on the first launch after an update. UserDefaults holds
+    /// the last-seen version; `"noop-app"` is a synthetic non-strap deviceId sentinel (strap ids are UUIDs,
+    /// so it can't collide) — the same sentinel the Android twin uses.
+    private func recordAppVersionChangeIfNeeded() async {
+        let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let last = UserDefaults.standard.string(forKey: "noop.lastSeenVersion")
+        guard AppVersionEvent.shouldRecord(lastSeen: last, current: current), let last else {
+            // First launch (last == nil) or unchanged: nothing to record, just anchor the pointer.
+            UserDefaults.standard.set(current, forKey: "noop.lastSeenVersion")
+            return
+        }
+        // A real transition: advance the pointer only once the event is durably recorded, so a not-yet-ready
+        // store or a failed insert retries next launch instead of silently dropping the change.
+        guard let store = await repo.storeHandle() else { return }
+        let payload = AppVersionEvent.payloadJson(from: last, to: current,
+                                                  schemaVersion: WhoopStoreInfo.schemaVersion)
+        do {
+            try await store.recordEvent(deviceId: "noop-app", ts: Int(Date().timeIntervalSince1970),
+                                        kind: AppVersionEvent.kind, payloadJSON: payload)
+            UserDefaults.standard.set(current, forKey: "noop.lastSeenVersion")
+        } catch {
+            // insert failed — leave last-seen so the transition is retried next launch
+        }
+    }
+
     private func wireSourceCoordinator() async {
         guard sourceCoordinator == nil, let store = await repo.storeHandle() else { return }
         let registry = DeviceRegistry(store: DeviceRegistryStore(dbQueue: store.registryWriter))
@@ -539,6 +597,27 @@ final class AppModel: ObservableObject {
     var healthWriteBack: (() async -> Void)?
     #endif
 
+    /// Settle a re-score that is owed (#1538) — one an earlier attempt started and was killed partway
+    /// through, or one a background trigger deferred rather than start where it could not finish.
+    ///
+    /// Called from the iOS `BGProcessingTask` handler, which gets minutes rather than the seconds a
+    /// bluetooth-central background wake is worth, and from foreground entry, whichever comes first. A
+    /// no-op unless something is actually owed, so both callers are safe to invoke unconditionally.
+    ///
+    /// Forced rather than `skipIfUnchanged`: an interrupted pass never advanced the watermark — by design,
+    /// so that it cannot mark unscored data as scored — so gating on the fingerprint here would be asking
+    /// a question whose answer is already known to be "yes, there is work".
+    func runDeferredRescoreIfOwed() async {
+        guard RescoreBackgroundScheduler.isRescoreOwed else { return }
+        live.append(log: "re-score: resuming a pass an earlier attempt could not finish (#1538)")
+        await intelligence.analyzeRecent()
+        #if os(iOS)
+        // The deferred pass is the one that finally produces today's score, and it runs with no UI
+        // attached — so publish the snapshot here too, for the same reason the post-offload path does.
+        await WidgetSnapshot.publish(from: self)
+        #endif
+    }
+
     private func refreshAfterCompletedBackfill() async {
         live.append(log: "Backfill: refreshing dashboard cache from completed sync")
         await repo.refresh(days: 120)
@@ -546,7 +625,21 @@ final class AppModel: ObservableObject {
         // analyzeRecent tick , otherwise a just-synced night's Charge / Effort / Rest can take up to
         // 15 minutes to appear on a strap-only (no-import) dashboard. analyzeRecent no-ops if a tick is
         // already running and refreshes the dashboard itself once the new scores persist. (PR #218)
-        await intelligence.analyzeRecent()
+        // #1196/#1146: `skipIfUnchanged` gates THIS post-offload pass on the HR fingerprint — an empty/
+        // duplicate offload (nothing new banked, common on a flapping link) skips the whole-window rescore
+        // instead of churning it, which was surfacing as a Trends/streak "0 days" flicker. Only this
+        // post-offload caller opts in; every other analyzeRecent path still forces unconditionally.
+        // #1538: this offload routinely completes while the app is BACKGROUNDED — it stays alive as a
+        // bluetooth-central to receive the offload at all — and the pass is all-or-nothing, so on a heavy
+        // install iOS suspends the process minutes before it can finish and every scored night is lost.
+        // Worse, the watermark advances only on completion, so the next trigger still sees new data and
+        // starts another doomed pass: a livelock that burned nearly eight minutes of CPU per attempt in
+        // the #1538 report while never producing a score. Decide first whether this pass can finish here,
+        // and hand it to a background-processing task when it cannot. A no-op on macOS, and on iOS a
+        // foreground pass is never deferred.
+        await RescoreBackgroundScheduler.run(log: { [live] line in live.append(log: line) }) {
+            await intelligence.analyzeRecent(skipIfUnchanged: true)
+        }
         await refreshV5Signals()
         #if os(iOS)
         // #980: a strap backfill routinely completes while the app is BACKGROUNDED (it runs as a
@@ -626,7 +719,7 @@ final class AppModel: ObservableObject {
         // off (the gate is one UserDefaults bool read), so the lifecycle of a missing workout is visible.
         emitWorkoutsTrace(WorkoutsTrace.sessionLine(
             event: "start", sportKey: WorkoutSource.traceSportKey(resolved), hrSamples: 0))
-        buzz(loops: 1)
+        buzz(loops: 1, gate: HapticPrefs.workout)
     }
 
     /// Emit one Workouts & GPS test-mode line tagged `.workouts` iff the mode is on. The cheap
@@ -739,7 +832,8 @@ final class AppModel: ObservableObject {
         let restingHR = repo.today?.restingHr.map(Double.init) ?? StrainScorer.defaultRestingHR
         let strain = samples.count >= 2
             ? StrainScorer.strain(samples, maxHR: Double(profile.hrMax),
-                                  restingHR: restingHR, sex: profile.sex) : nil
+                                  restingHR: restingHR,
+                                  method: PuffinExperiment.effortMethod, sex: profile.sex) : nil
         // Estimate calories from the captured HR window (same Keytel/Harris–Benedict model the
         // auto-detector uses) so a manual session shows energy too, not just duration/strain. (#117)
         let up = UserProfile(weightKg: profile.weightKg, heightCm: profile.heightCm,
@@ -760,7 +854,7 @@ final class AppModel: ObservableObject {
             // GPS distance rides the shared row so the Workouts list / detail show it like any other
             // distance workout; the polyline itself is persisted alongside in RouteStore (the shared
             // WorkoutRow has no route column on Apple). Only a real route sets distance , honest ",".
-            distanceM: route?.distanceM, zonesJSON: nil, notes: nil)
+            distanceM: route?.distanceM, zonesJSON: nil, notes: nil, steps: nil)
         // Persist the route polyline under the row's natural key so WorkoutDetailView can draw it. On
         // device only; mirrors the moments / sleepMarks UserDefaults persistence. (#524)
         if let route { RouteStore.store(route, startTs: startTs, sport: w.sport) }
@@ -773,7 +867,7 @@ final class AppModel: ObservableObject {
             event: "end", sportKey: WorkoutSource.traceSportKey(w.sport), hrSamples: samples.count,
             durationSec: Int(end.timeIntervalSince(w.start)),
             gpsPoints: wasGps ? gpsRecorder.pointCount : nil))
-        buzz(loops: 2)
+        buzz(loops: 2, gate: HapticPrefs.workout)
         Task { [weak self] in
             guard let self else { return }
             if let store = await self.repo.storeHandle() {
@@ -791,7 +885,8 @@ final class AppModel: ObservableObject {
         w.samples.append(HRSample(ts: Int(Date().timeIntervalSince1970), bpm: hr))
         w.peakHr = max(w.peakHr, hr)
         w.avgHr = Int((Double(w.samples.map(\.bpm).reduce(0, +)) / Double(w.samples.count)).rounded())
-        w.liveStrain = StrainScorer.strain(w.samples, maxHR: Double(profile.hrMax), sex: profile.sex) ?? 0
+        w.liveStrain = StrainScorer.strain(w.samples, maxHR: Double(profile.hrMax),
+                                              method: PuffinExperiment.effortMethod, sex: profile.sex) ?? 0
         activeWorkout = w
         // Re-snapshot the durable session so a kill keeps the latest accumulated HR window (#529).
         persistActiveWorkout()
@@ -951,6 +1046,49 @@ final class AppModel: ObservableObject {
         }
     }
 
+    #if os(iOS)
+    /// Materialize Apple Health as a device and update the source that feeds Today.
+    /// Only replaces the seeded WHOOP row while it is still a placeholder with no strap and no data;
+    /// a physical or user-selected source always keeps priority.
+    func refreshAfterAppleHealthSync(authorized: Bool, now: Date = Date()) async {
+        await wireSourceCoordinator()
+        guard let registry = deviceRegistry, let store = await repo.storeHandle() else {
+            await repo.refresh()
+            return
+        }
+
+        let current = registry.devices.first(where: { $0.id == registry.activeDeviceId })
+        var currentHasRecentData = false
+        if let current {
+            let range = AppleWatchDevice.recentDayRange(now: now)
+            let cutoff = Int(now.timeIntervalSince1970) - AppleWatchDevice.recentWindowDays * 86_400
+            let latestHR = (try? await store.latestHRSampleTs(deviceId: current.id)) ?? nil
+            let recentDaily = (try? await store.dailyMetrics(
+                deviceId: current.id, from: range.from, to: range.to)) ?? []
+            currentHasRecentData = (latestHR ?? 0) >= cutoff || !recentDaily.isEmpty
+        }
+
+        await AppleWatchDevice.registerIfAuthorized(
+            registry: registry, store: store, authorized: authorized, now: now)
+        guard registry.devices.contains(where: { $0.id == AppleWatchDevice.deviceId }) else {
+            await repo.refresh()
+            return
+        }
+
+        if AppleWatchDevice.shouldAutoActivate(
+            current: current, currentHasRecentData: currentHasRecentData) {
+            registry.setActive(AppleWatchDevice.deviceId)
+            await adoptActiveDevice(AppleWatchDevice.deviceId)
+        } else if registry.activeDeviceId == AppleWatchDevice.deviceId {
+            // Covers relaunches: the row was already active, but the read spine may still be initializing.
+            await adoptActiveDevice(AppleWatchDevice.deviceId)
+            await repo.refresh()
+        } else {
+            await repo.refresh()
+        }
+    }
+    #endif
+
     // MARK: - Oura adopt (factory-reset-and-adopt)
 
     /// The live adopt outcome of the active Oura ring, mirrored off the coordinator's live `OuraLiveSource`
@@ -1050,6 +1188,15 @@ final class AppModel: ObservableObject {
     /// For a user-facing "buzz the strap now" action use `buzzStrapOnce()` instead (#921).
     func buzz(loops: UInt8 = 2) {
         ble.send(.runHapticsPattern, payload: [2, loops, 0, 0, 0])
+    }
+
+    /// #haptics (#1115): an IN-SESSION cue buzz, GATED by its per-event `HapticPrefs` toggle (default-off /
+    /// opt-in, migrated-on for existing installs). Each in-session cue site passes its `gate` key so the
+    /// enable check lives in ONE place rather than at every call site. The ungated `buzz` / `buzzStrapOnce`
+    /// remain for ambient cues (which carry their own gates) and explicit user buzzes. Twin of Android
+    /// `AppViewModel.buzz(loops, gate)`.
+    func buzz(loops: UInt8 = 2, gate: String) {
+        if HapticPrefs.enabled(gate) { buzz(loops: loops) }
     }
 
     /// One-shot user buzz (#921): the on-device-confirmed pattern (patternId=2, 3 loops) followed by
@@ -1344,7 +1491,7 @@ final class AppModel: ObservableObject {
     /// encoding (#460) so a double-tap buzzes the time the way the user reads it. Derived from the
     /// locale's "j" (hour) template: a 12-hour locale includes the AM/PM ("a") symbol.
     static var localeUses24HourClock: Bool {
-        let fmt = DateFormatter.dateFormat(fromTemplate: "j", options: 0, locale: .current) ?? "h"
+        let fmt = DateFormatter.dateFormat(fromTemplate: "j", options: 0, locale: AppLanguage.activeLocale) ?? "h"
         return !fmt.contains("a")
     }
 
@@ -1405,10 +1552,10 @@ final class AppModel: ObservableObject {
     /// HR-zone haptic coaching: buzz when crossing into the top zone (ease off) or back to recovery.
     private func coachZone(_ hr: Int?) {
         guard behavior.zoneCoaching, live.bonded, live.worn, let hr, hr >= 30 else { return }
-        let maxHR = Double(profile.hrMax)
-        guard maxHR > 0 else { return }
-        let pct = Double(hr) / maxHR
-        let zone = pct >= 0.9 ? 5 : pct >= 0.8 ? 4 : pct >= 0.7 ? 3 : pct >= 0.6 ? 2 : 1
+        guard profile.hrMax > 0 else { return }
+        // #531: route the haptic coach through the profile's effective zone set (personalized when set,
+        // conventional %HRmax otherwise) instead of hardcoded percentage bands.
+        let zone = profile.hrZoneSet.zoneNumber(forBPM: Double(hr))
         defer { lastCoachZone = zone }
         guard lastCoachZone != -1, zone != lastCoachZone else { return }
         if zone == 5, lastCoachZone < 5 { buzz(loops: 3) }          // entered max , ease off
@@ -1474,7 +1621,7 @@ final class AppModel: ObservableObject {
     }
 
     /// Run the `IllnessSignalEngine` from the day history + the journal-derived confounder context, then
-    /// publish the result + the legacy `healthAlert` banner string (kept for the existing banner surface).
+    /// publish the result + the semantic `healthAlert` banner payload.
     private func applyIllnessSignal(_ days: [DailyMetric], alcohol: Bool,
                                     hardOrLateWorkout: Bool, alreadyUnwell: Bool) {
         let previous = healthAlert
@@ -1535,25 +1682,38 @@ final class AppModel: ObservableObject {
         // Caller-rendered phrases for the signals that fire (the engine surfaces only the firing ones).
         var labels: [String: String] = [:]
         if let r = rm({ $0.restingHr.map(Double.init) }), let b = mean(base.compactMap { $0.restingHr.map(Double.init) }), r > b {
-            labels["restingHR"] = "RHR +\(Int((r - b).rounded()))"
+            let delta = Int((r - b).rounded())
+            labels["restingHR"] = String(localized: "RHR +\(delta)")
         }
         if let r = rm({ $0.avgHrv }), let b = mean(base.compactMap { $0.avgHrv }), b > 0, r < b {
-            labels["hrv"] = "HRV −\(Int(((1 - r / b) * 100).rounded()))%"
+            let percent = Int(((1 - r / b) * 100).rounded())
+            labels["hrv"] = String(localized: "HRV −\(percent)%")
         }
         if let r = rm({ $0.skinTempDevC }), r > 0 {
-            labels["skinTemp"] = "skin temp +\(String(format: "%.1f", r)) °C"
+            let temperature = String(format: "%.1f", locale: AppLanguage.activeLocale, r)
+            labels["skinTemp"] = String(localized: "Skin temperature +\(temperature) °C")
         }
         if let r = rm({ $0.respRateBpm }), let b = mean(base.compactMap { $0.respRateBpm }), r > b {
-            labels["respiration"] = "respiration up"
+            labels["respiration"] = String(localized: "Respiration up")
         }
 
         let result = IllnessSignalEngine.evaluate(inputs, context: context, firedLabels: labels)
         illnessSignal = result
-        // The amber banner string reflects the raised / already-unwell levels only (the calmer levels
+        // The amber banner payload reflects the raised / already-unwell levels only (the calmer levels
         // surface in the Health hub's Heads-Up card, never as a scary banner).
-        healthAlert = (result.level == .raised || result.level == .alreadyUnwell) ? result.copy : nil
-        if let alert = healthAlert, previous == nil {
-            IllnessNotifier.post(alert)
+        switch result.level {
+        case .raised:
+            healthAlert = HealthAlert(message: result.message ?? .raised,
+                                      firedSignals: result.firedSignals)
+        case .alreadyUnwell:
+            healthAlert = HealthAlert(message: result.message ?? .alreadyUnwell,
+                                      firedSignals: result.firedSignals)
+        case .quiet, .mild, .suppressed:
+            healthAlert = nil
+        }
+        if healthAlert != nil, previous == nil {
+            // Notifications retain their established copy contract; Home renders the semantic result.
+            IllnessNotifier.post(result.copy)
         }
     }
 
@@ -1594,6 +1754,37 @@ final class AppModel: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: Self.cycleAwarenessKey) }
     }
 
+    /// The user's "not for me" opt-out of cycle awareness — a respectful, USER-controlled hide, never
+    /// age-based (menopause age varies too widely to infer). When true, the cycle-awareness OFFER is
+    /// suppressed on Today and Health; the Automations toggle stays visible so it's reversible. Default
+    /// false. Distinct from `cycleAwarenessEnabled` (active tracking): this hides the invitation itself.
+    static let cycleAwarenessHiddenKey = "noopCycleAwarenessHidden"
+    var cycleAwarenessHidden: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.cycleAwarenessHiddenKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.cycleAwarenessHiddenKey) }
+    }
+
+    /// #polar-debug: whether a connecting Polar strap logs the model NOOP identifies it as (+ its PMD/HRV
+    /// capability summary) to the strap log. Default off; the Test Centre only exposes the toggle when a
+    /// Polar strap is paired. Diagnostic-only — nothing gates behaviour on it. Twin of Android
+    /// `NoopPrefs.KEY_POLAR_DEBUG_LOGGING`.
+    static let polarDebugLoggingKey = "noopPolarDebugLogging"
+    var polarDebugLogging: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.polarDebugLoggingKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.polarDebugLoggingKey) }
+    }
+
+    /// #1284 residual 3 (EXPERIMENTAL, default OFF): generation-side 0x49-onset keying for Oura sleep. When
+    /// on, an Oura hypnogram persist keys its startTs on the rounded 0x49 onset (the stable per-night anchor)
+    /// and a completeness guard suppresses/replaces a duplicate re-serve BEFORE it is banked — closing the
+    /// window where the wrong night shows until the next analyze pass. Off = the shipped end-anchored persist.
+    /// A hardware-validation toggle (Test Centre); no effect for a user with no Oura ring.
+    static let ouraOnsetKeyingKey = "noopOuraOnsetKeying"
+    var ouraOnsetKeying: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.ouraOnsetKeyingKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.ouraOnsetKeyingKey) }
+    }
+
     /// Recompute the v5 skin-temp suite snapshots (cycle phase + body clock) from the current history.
     /// Called from the analytics pass and when the cycle opt-in flips. Honest-nil throughout: cycle is
     /// nil unless opted in; circadian is nil unless a usable activity profile exists.
@@ -1629,7 +1820,13 @@ final class AppModel: ObservableObject {
             nights.append(CyclePhaseEngine.Night(day: d.day, tempZ: tempZ, rhrZ: rhrZ, hrvZ: hrvZ))
             if let fused = CyclePhaseEngine.fusedIndex(tempZ: tempZ, rhrZ: rhrZ, hrvZ: hrvZ) { curve.append(fused) }
         }
-        cyclePhase = CyclePhaseEngine.classify(nights, baselineUsable: skinState.usable)
+        // Optional user-entered cycle-day-1 anchors live under the isolated `noop-cycle` source.
+        // The pure engine cross-validates them against the temperature shift rather than trusting a
+        // mistimed log blindly.
+        let loggedPeriodStarts = await repo.periodStarts()
+        cyclePhase = CyclePhaseEngine.classify(nights,
+                                               baselineUsable: skinState.usable,
+                                               loggedPeriodStarts: loggedPeriodStarts)
         cycleCurve = curve
     }
 

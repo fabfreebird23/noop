@@ -258,4 +258,107 @@ class RhythmScreenerTest {
             }
         }
     }
+
+    // --- Beat-time integrity gate. Twin of the Swift RhythmScreenerTests gate tests. ---
+
+    /** A window whose beats are partly held twice describes a rhythm the heart never had — and describes
+     *  it as MORE varied, because every statistic here is a spread over the interval cloud. The honest
+     *  answer is unreadable. Same beats, same label inputs; only the timestamps differ. */
+    @Test fun bankedOverCountedWindow_isUnreadableRatherThanVaried() {
+        val rr = regularSinus()
+        val bankedTs = (rr.indices).map { (it / 6) * 5 }
+        val banked = RhythmScreener.screenWindow(
+            RhythmScreener.WindowInput(rrMs = rr, ts = bankedTs, motionStill = true, meanHR = 60.0))
+        assertEquals(RhythmRegularity.UNREADABLE, banked.label)
+        assertNull("SD2 is built from SDNN — it must not survive the gate", banked.sd2)
+    }
+
+    /** The same beats, honestly stamped, still read normally: the gate keys on MEASURED over-count, not
+     *  on the presence of timestamps. */
+    @Test fun honestlyStampedWindow_stillReads() {
+        val rr = regularSinus()
+        val r = RhythmScreener.screenWindow(
+            RhythmScreener.WindowInput(rrMs = rr, ts = rr.indices.toList(),
+                                       motionStill = true, meanHR = 60.0))
+        assertEquals(RhythmRegularity.STEADY, r.label)
+        assertNotNull(r.sd2)
+    }
+
+    /** A LIVE spot capture carries no timestamps, so coverage is unmeasurable — and unmeasurable is not
+     *  over-counted. Those readings must keep working exactly as before. */
+    @Test fun windowWithoutTimestamps_isUnaffected() {
+        val rr = regularSinus()
+        val withTs = RhythmScreener.screenWindow(
+            RhythmScreener.WindowInput(rrMs = rr, ts = rr.indices.toList(),
+                                       motionStill = true, meanHR = 60.0))
+        val withoutTs = RhythmScreener.screenWindow(
+            RhythmScreener.WindowInput(rrMs = rr, motionStill = true, meanHR = 60.0))
+        assertEquals(withTs.label, withoutTs.label)
+        assertEquals(withTs.sd2, withoutTs.sd2)
+    }
+
+    // ── Empty-state diagnosis (#1360) — twin of the Swift tests ───────────────────────
+
+    private fun readableWindow() = RhythmScreener.screenWindow(
+        RhythmScreener.WindowInput(rrMs = regularSinus(), motionStill = true, meanHR = 60.0))
+
+    private fun unreadableWindow() = RhythmScreener.screenWindow(
+        RhythmScreener.WindowInput(rrMs = regularSinus(), motionStill = false, meanHR = 60.0))
+
+    @Test fun nightBeatsAreBanked_detectsBankedButNotHonestOrAbsent() {
+        val rr = regularSinus()
+        // Banked: 6 beats per record, records 5 s apart (mirrors the gate-4 banked fixture).
+        val bankedTs = rr.indices.map { (it / 6) * 5 }
+        assertTrue(RhythmScreener.nightBeatsAreBanked(rr, bankedTs))
+        // Honestly stamped ~1 s apart (mean ~1000 ms) — a real per-beat train.
+        assertFalse(RhythmScreener.nightBeatsAreBanked(rr, rr.indices.toList()))
+        // No timestamps / a length mismatch → unmeasurable, which is NOT 'banked'.
+        assertFalse(RhythmScreener.nightBeatsAreBanked(rr, emptyList()))
+        assertFalse(RhythmScreener.nightBeatsAreBanked(rr, listOf(0, 1, 2)))
+    }
+
+    @Test fun classifyEmptyState_noneWhenAnyWindowReadable() {
+        val windows = listOf(unreadableWindow(), readableWindow())
+        assertEquals(
+            RhythmEmptyState.NONE,
+            RhythmScreener.classifyEmptyState(windows, hadMotionSignal = false, beatsAreBanked = true))
+    }
+
+    @Test fun classifyEmptyState_bankedBeatsWhenStructurallyIncapable() {
+        val windows = listOf(unreadableWindow(), unreadableWindow())
+        // No stillness signal at all (the ring) AND banked beats → the more informative structural copy.
+        assertEquals(
+            RhythmEmptyState.DEVICE_BANKS_BEATS,
+            RhythmScreener.classifyEmptyState(windows, hadMotionSignal = false, beatsAreBanked = true))
+    }
+
+    /** Regression guard (#1118 × #1360): a WHOOP night reads BANKED R-R too, so beatsAreBanked can be
+     *  true — but WHOOP always writes an accelerometer track, so its motion signal is present and it must
+     *  keep the honest "try again", NEVER "this device can't support it". */
+    @Test fun classifyEmptyState_whoopBankedNightStaysGathering() {
+        val windows = listOf(unreadableWindow(), unreadableWindow())
+        assertEquals(
+            RhythmEmptyState.GATHERING_DATA,
+            RhythmScreener.classifyEmptyState(windows, hadMotionSignal = true, beatsAreBanked = true))
+    }
+
+    @Test fun classifyEmptyState_noMotionWhenDenseWindowsButNoStillnessSignal() {
+        val windows = listOf(unreadableWindow(), unreadableWindow())
+        assertEquals(
+            RhythmEmptyState.DEVICE_NO_MOTION,
+            RhythmScreener.classifyEmptyState(windows, hadMotionSignal = false, beatsAreBanked = false))
+    }
+
+    @Test fun classifyEmptyState_gatheringWhenMotionPresentButNightRefused() {
+        val windows = listOf(unreadableWindow(), unreadableWindow())
+        assertEquals(
+            RhythmEmptyState.GATHERING_DATA,
+            RhythmScreener.classifyEmptyState(windows, hadMotionSignal = true, beatsAreBanked = false))
+    }
+
+    @Test fun classifyEmptyState_noDataIsGatheringNotStructural() {
+        assertEquals(
+            RhythmEmptyState.GATHERING_DATA,
+            RhythmScreener.classifyEmptyState(emptyList(), hadMotionSignal = false, beatsAreBanked = false))
+    }
 }

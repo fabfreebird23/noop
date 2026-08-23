@@ -15,15 +15,19 @@ import Foundation
 //
 // A breath cycle of `bpm` breaths/min lasts 60000/bpm ms; `inhaleFraction` splits it into inhale vs
 // exhale (the calming long-exhale ratio Breathe's "Relax" preset uses is ~0.4 inhale : 0.6 exhale).
-// Mirrors `HapticClockEncoder.pulses` in shape: a pure `(params) -> [Cue]` list, walkable by the BLE seam.
+// Mirrors `HapticClock.pulses` in shape: a pure `(params) -> [Cue]` list, walkable by the BLE seam.
 
 /// Which phase of the breath a cue marks. The on-screen orb (when the screen is on) is driven by the
 /// same phase clock; screen-off, the buzz is the whole cue.
 public enum BreathPhase: String, Equatable, Sendable {
     /// The start of an inhale — a single light pulse.
     case inhale
+    /// A breath hold (full or empty) — no buzz by default (loops: 0).
+    case hold
     /// The start of an exhale — a heavier (two-pulse) cue.
     case exhale
+    /// Instruction-only beat (e.g. nostril side) — no buzz.
+    case textOnly
 }
 
 /// One element of a paced-breathing haptic schedule: fire `loops` buzz loops at `offsetMs` from session
@@ -31,15 +35,18 @@ public enum BreathPhase: String, Equatable, Sendable {
 public struct BreathCue: Equatable, Sendable {
     /// Milliseconds from the start of the session at which to fire this cue.
     public let offsetMs: Int
-    /// Which breath phase this cue marks (inhale = light, exhale = heavy).
+    /// Which breath phase this cue marks (inhale = light, exhale = heavy, hold/textOnly = silent).
     public let phase: BreathPhase
-    /// How many buzz loops to play — the felt-strength language (1 = inhale, 2 = exhale).
+    /// How many buzz loops to play — the felt-strength language (1 = inhale, 2 = exhale, 0 = silent).
     public let loops: Int
+    /// Optional UI label for `textOnly` / nostril cues (English source; localize at the view layer).
+    public let label: String?
 
-    public init(offsetMs: Int, phase: BreathPhase, loops: Int) {
+    public init(offsetMs: Int, phase: BreathPhase, loops: Int, label: String? = nil) {
         self.offsetMs = offsetMs
         self.phase = phase
         self.loops = loops
+        self.label = label
     }
 }
 

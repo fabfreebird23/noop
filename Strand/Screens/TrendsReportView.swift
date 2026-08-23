@@ -214,11 +214,11 @@ struct TrendsReportPage: View {
     // MARK: Header
 
     private var header: some View {
-        // WHOOP-flat header: a plain raised surface, no scenic hero gradient or starfield. Fill
-        // contrast carries the edge; the blue NOOP wordmark is the only accent.
+        // Report chrome uses the same shared panel surface as the in-app cards.
         ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius: NoopMetrics.cardRadius, style: .continuous)
-                .fill(StrandPalette.surfaceRaised)
+            NoopPanelSurface(tint: StrandPalette.accent,
+                             cornerRadius: NoopMetrics.cardRadius,
+                             elevated: true)
             VStack(alignment: .leading, spacing: NoopMetrics.space1) {
                 HStack(alignment: .firstTextBaseline) {
                     BrandMark(size: 22)
@@ -506,6 +506,10 @@ struct TrendsReportSheet: View {
             .screenPadding()
             .padding(.vertical, NoopMetrics.space6)
         }
+        #if os(iOS)
+        // #697/#horizontal-swipe parity, see ScreenScaffold.
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        #endif
         .background(StrandPalette.surfaceBase)
         .frame(width: 460, height: 640)
         #if os(iOS)

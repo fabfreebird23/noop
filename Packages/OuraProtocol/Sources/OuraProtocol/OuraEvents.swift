@@ -10,13 +10,50 @@ import Foundation
 // (OuraStreamMapping) apply the anchor. Honest-data invariant: a short/malformed record decodes to
 // nil upstream, so these structs only ever hold real decoded values.
 
+/// WHICH optical channel decoded an `OuraIBI` (#1071).
+///
+/// The ring reports the SAME heartbeats on more than one tag. They are not different beats and not
+/// duplicate records — they are independent measurements of one beat train, so a consumer that folds
+/// them together holds two copies of every night and every variability statistic built on successive
+/// differences (RMSSD, SDNN) breaks. The tag is the only thing that separates them at ingest; after the
+/// fact the two are only separable by the accident that their quantisation grids differ.
+///
+/// The raw values are the DURABLE cross-platform storage codes (they reach `rrInterval.srcChannel` via
+/// `WhoopProtocol.RRSourceChannel`, which pins the same numbers, and the Kotlin twin `OuraIbiChannel`).
+/// Never renumber a case; only append.
+public enum OuraIBIChannel: Int, Equatable, Sendable, Codable, CaseIterable {
+    /// 0x80 `green_ibi_quality_event` (s6.4) — green LED, gated on the ring's own `quality == 1` flag
+    /// and a 300-2000 ms physiological window, and it runs for the WHOLE wear period.
+    case greenQuality = 1
+    /// 0x6E `spo2_ibi_and_amplitude_event` (s6.3) — the SpO2 measurement's own beat train, quantised to
+    /// an 8 ms grid with NO quality gate, and only present while an SpO2 measurement is running.
+    case spo2Ibi = 2
+    /// 0x60 `ibi_and_amplitude_event` (s6.1) — the bit-packed IBI + amplitude family.
+    case ibiAmplitude = 3
+    /// 0x44 `ibi_event` (s6 / s0) — the SAME bit-packed layout as 0x60 and decoded by the same routine,
+    /// but a DIFFERENT tag on the wire, so it gets its own code.
+    ///
+    /// Both tags stamped `ibiAmplitude` until now, which made them indistinguishable once stored. That
+    /// hid the question the scoring-channel choice turns on: when that channel covers 1.25x the
+    /// wall-clock it spans, is ONE tag repeating beats across its records, or are TWO tags reporting the
+    /// same beats to each other? No stored night could answer it, because the label collapsed them.
+    /// Separating the codes costs nothing and makes the next capture decisive. Labelling only — both
+    /// tags decode and are read exactly as before.
+    case ibiBare = 4
+}
+
 /// One decoded inter-beat interval (and optional amplitude), in milliseconds.
 public struct OuraIBI: Equatable, Sendable, Codable {
     public let ringTimestamp: UInt32
     public let ibiMs: Int
     public let amplitude: Int?
-    public init(ringTimestamp: UInt32, ibiMs: Int, amplitude: Int? = nil) {
+    /// Which optical channel measured this beat (#1071). Every decoder stamps its own; nil only for a
+    /// value built by something that is not one of them.
+    public let channel: OuraIBIChannel?
+    public init(ringTimestamp: UInt32, ibiMs: Int, amplitude: Int? = nil,
+                channel: OuraIBIChannel? = nil) {
         self.ringTimestamp = ringTimestamp; self.ibiMs = ibiMs; self.amplitude = amplitude
+        self.channel = channel
     }
 }
 
@@ -30,26 +67,56 @@ public struct OuraHR: Equatable, Sendable, Codable {
     }
 }
 
-/// One decoded HRV (RMSSD-derived) sample from the ring's own 0x5D tag (OURA_PROTOCOL.md s6.9).
-/// NOOP also reconstructs RMSSD itself from the IBI streams for its own scoring; this is the ring's
-/// open HRV tag, NOT Oura's encrypted readiness score.
+/// One decoded 5-minute HRV bucket from the ring's own 0x5D tag (OURA_PROTOCOL.md s6.9): the ring's
+/// OWN average HR and RMSSD for that bucket. The 0x5D body is a run of `(u8 avg HR bpm, u8 avg RMSSD ms)`
+/// pairs, one per 5 min; `index` is the pair's position in the record. This is the ring's open HRV tag,
+/// NOT Oura's encrypted readiness score. NOOP also reconstructs RMSSD from the IBI streams for its own
+/// scoring; this tag is the ring's own summary (validated overnight — the hr byte tracks sleeping HR).
 public struct OuraHRV: Equatable, Sendable, Codable {
     public let ringTimestamp: UInt32
-    public let timeMs: Int
-    public let b1: Int
-    public let b2: Int
-    public init(ringTimestamp: UInt32, timeMs: Int, b1: Int, b2: Int) {
-        self.ringTimestamp = ringTimestamp; self.timeMs = timeMs; self.b1 = b1; self.b2 = b2
+    /// 0-based pair index within the record, counting from the record's FIRST byte-pair — which is its
+    /// **OLDEST** bucket (#1167). The consumer needs `count` as well as `index` to place the bucket:
+    /// `bucketTs = ts - (count - index) * 300`.
+    public let index: Int
+    /// The ring's average HR for the 5-min bucket, in bpm (u8, no scaling).
+    public let hrBpm: Int
+    /// The ring's average RMSSD for the 5-min bucket, in ms (u8, no scaling).
+    public let rmssdMs: Int
+    /// Total pairs in the record this bucket came from — INCLUDING any `00 00` padding pair the decoder
+    /// dropped (#1128/#1131). `index` is always in `0..<count`. Needed because the record's timestamp
+    /// marks the END of the span it covers, so a bucket's offset is measured from the record's tail, not
+    /// its head: dropping a pad without counting it would slide every surviving bucket in the record.
+    /// Mirrors `OuraSpO2.count`, which the SpO2 path already uses for the same reason.
+    public let count: Int
+    public init(ringTimestamp: UInt32, index: Int, hrBpm: Int, rmssdMs: Int, count: Int = 1) {
+        self.ringTimestamp = ringTimestamp; self.index = index; self.hrBpm = hrBpm
+        self.rmssdMs = rmssdMs; self.count = count
     }
 }
 
 /// One decoded SpO2 sample. `value` is the raw SpO2 reading; `unit` documents its scale.
+///
+/// A single 0x6F / 0x77 record carries MANY samples, all sharing the record's `ringTimestamp`.
+/// `index`/`count` carry the sample's position within its record so the consumer can give each one its
+/// own second — without them the position is lost at decode time and cannot be recovered downstream,
+/// which is exactly how 12 of every 13 samples were silently dropped on the `(deviceId, ts)` primary
+/// key (#1070). `ringTimestamp` is deliberately left at the RECORD's time: it is the wire anchor, and
+/// the per-sample offset is applied where the durable row is minted (`OuraStreamMapping`), the same
+/// split the hypnogram path already uses. `index` mirrors `OuraSleepPhase.index`.
+///
+/// Both default (`index: 0, count: 1` = "the only sample in its record"), so single-sample decoders
+/// like 0x7B keep the record's own second unchanged.
 public struct OuraSpO2: Equatable, Sendable, Codable {
     public let ringTimestamp: UInt32
     public let value: Int
     public let unit: String
-    public init(ringTimestamp: UInt32, value: Int, unit: String = "raw") {
+    /// 0-based position of this sample within its record; samples are 1 s apart (consumer applies it).
+    public let index: Int
+    /// Total samples decoded from the same record. `index` is always in `0..<count`.
+    public let count: Int
+    public init(ringTimestamp: UInt32, value: Int, unit: String = "raw", index: Int = 0, count: Int = 1) {
         self.ringTimestamp = ringTimestamp; self.value = value; self.unit = unit
+        self.index = index; self.count = count
     }
 }
 
@@ -92,8 +159,15 @@ public struct OuraSleepPhase: Equatable, Sendable, Codable {
     public let ringTimestamp: UInt32
     public let index: Int          // position within the record's phase sequence
     public let stage: OuraSleepStage
-    public init(ringTimestamp: UInt32, index: Int, stage: OuraSleepStage) {
+    /// #1246: this epoch came from an UNWRITTEN hypnogram page (a whole record of the erased-flash value
+    /// `0xFF`, which the 2-bit decode would otherwise read as four `awake` codes). It keeps a placeholder
+    /// `stage` so it still OCCUPIES its 30 s slot in the burst's time axis (dropping it would mis-time the
+    /// real codes laid around it), but the assembler EXCLUDES it from the reconstructed hypnogram — a gap,
+    /// not `awake`. Defaults false so every real decoded/constructed phase is a written epoch.
+    public let unwritten: Bool
+    public init(ringTimestamp: UInt32, index: Int, stage: OuraSleepStage, unwritten: Bool = false) {
         self.ringTimestamp = ringTimestamp; self.index = index; self.stage = stage
+        self.unwritten = unwritten
     }
 }
 
@@ -221,6 +295,121 @@ public struct OuraActivityInfo: Equatable, Sendable, Codable {
     }
 }
 
+/// One decoded `0x7E`/`0x7F` real_steps_features record: 14 unpacked feature values from a 14-byte
+/// bit-packed body. THIRD-PARTY FORMULA ([oura-rs] - Th0rgal/open_oura `crates/oura-protocol/src/
+/// events.rs`, clean-room fact citation, no code copied; the source itself marks this decode
+/// `"_status": "unvalidated"`): two of the 14 fields (index 0 and 8) are genuine 9-bit values built as
+/// `byte*2 + carry_bit`, where the carry bit is stolen from the MSB of a neighboring byte (index 3 for
+/// field 0, index 11 for field 8); the rest are either plain bytes or a bare `byte<<1` with no carry.
+/// NOOP's OWN investigation (2026-07-30, a 2661-pair real Gen 3 capture cross-correlated against the
+/// already-anchored 0x50 MET corpus) found `fields[0]` and `fields[8]` - the two carry-completed
+/// 9-bit values - are also the ONLY fields with a consistent movement correlation (r≈+0.3 vs mean MET,
+/// effect size +1.5/+1.25 resting-vs-moving), a real convergence between the bit-layout hint and the
+/// empirical signal.
+///
+/// ⛔ **NO FIELD IS A STEP COUNT** - settled by ground truth, not left open (OURA_PROTOCOL.md §6.13):
+/// a measured 13,349-step day tested against 805 paired records found every one of the 14 fields large
+/// and non-zero during sleep (`fields[3]` sums HIGHER asleep than walking), and no byte offset on either
+/// tag yields a monotonic counter across 5,122 records. What these ARE is what the tag name says -
+/// `real_steps_FEATURES`, the *inputs* to Oura's step model, computed every 30 s whether walking or
+/// asleep. `f0`/`f8` rank top by movement discrimination (Cohen's d +2.35/+2.37), which is why they
+/// correlated: genuine movement-intensity features, useless as a count. A count would require
+/// reimplementing Oura's model over them - unvalidatable, and the §194 precedent forbids fitting one.
+///
+/// Stays Tier B end to end: emitted only behind `OuraDriver.allowTierB`, and NEVER folded into
+/// `OuraStreamMapping`/scoring - not even from `fields[0]`/`fields[8]`. `fields` holds all values
+/// verbatim, in the source's own order, as an activity-signal corpus.
+public struct OuraRealStepsFields: Equatable, Sendable, Codable {
+    /// The originating tag byte (`0x7E` realSteps1 or `0x7F` realSteps2) - both route through the same
+    /// decoder and event case, so this is what lets a consumer (or the diagnostic dump) tell which half
+    /// of the pair a given event came from.
+    public let tag: UInt8
+    public let ringTimestamp: UInt32
+    public let fields: [Int]
+    public init(tag: UInt8, ringTimestamp: UInt32, fields: [Int]) {
+        self.tag = tag; self.ringTimestamp = ringTimestamp; self.fields = fields
+    }
+}
+
+/// One decoded `0x6A` sleep_period_info record: the ring's OWN per-window sleep summary — an average
+/// heart rate and, notably, a **breath rate**. THIRD-PARTY FIELD NAMES ([open_ring]
+/// `decode_sleep_period_info_2` / native `parse_api_sleep_period_info`, clean-room fact citation, no
+/// code copied; the multipliers are its `.rodata` constants). Our own §6.12 already carried the right
+/// OFFSETS and the right `/8.0` from [ringverse] but no names, and mistyped `average_hr` as an `int8`
+/// with no `× 0.5`.
+///
+/// STRUCTURALLY VERIFIED on four consecutive real Gen 3 overnights (2026-08-05→09, 3 493 records):
+/// every body is exactly 10 bytes; every record satisfies the source's own declared invariants
+/// (`motionCount < 121`, `sleepState ∈ {0,1,2}` — only 0 and 1 ever observed); every `breath` is an
+/// exact multiple of 0.125, which confirms the `/8.0` fixed point FROM THE DATA rather than assuming
+/// it; and `averageHrBpm` medians 53.0–54.0 bpm across the four nights, agreeing with the 54 bpm
+/// median the independently-decoded banked-IBI channel gives for the same wearer (#511, itself
+/// WHOOP-validated against RHR 55). The `× 0.5` scale is settled by its falsifier: read as `× 1.0`
+/// the same records sit +56 … +62 bpm above every other HR channel we hold.
+///
+/// WHOSE measurement this is decides which bar applies. `breath` is computed BY THE RING and read off
+/// the wire — it is not a signal NOOP derives from raw sensor data. The #194 rule is written for the
+/// opposite case (PPG→HR autocorrelation, RSA-from-R-R: methods where NOOP invents the number and can
+/// manufacture a peak that looks physiological), so what has to be right here is the DECODE, which is
+/// what the structural verification above establishes. Same standing as the ring's own SleepNet
+/// hypnogram, which NOOP already persists and scores from (#773 / #877).
+///
+/// Independent support that byte 4 is the quantity Oura's own app calls respiratory rate: these
+/// records median 14.75/min against the SAME wearer's 851-night Oura app export at 15.250 (IQR
+/// 14.875–15.625) — same quantity, same band, though the two corpora do not overlap in date so this is
+/// a distribution check, not a paired one. Against a WHOOP worn on the same nights the decode also
+/// reproduces the VENDOR's own offset (Oura reads below WHOOP 18/18 nights, Δ −1.158; ours Δ −1.458,
+/// sign-stable 6/6), and mapping each night to the wrong date collapses the agreement (r +0.591 →
+/// −0.151), so it is date-aligned rather than coincidental.
+///
+/// It stays Tier B because the field NAMES come from third-party reverse engineering, not from Oura
+/// documentation — a decode-provenance caveat, not a doubt about whether the ring measures respiration.
+///
+/// `OuraStreamMapping` maps `breathsPerMin` — and nothing else from this record — to a `respSample` row
+/// in milli-bpm under the ring's own deviceId, and `AnalyticsEngine` takes the night's median of those
+/// rows as `dailyMetric.respRateBpm`: on a ring night that replaces an RSA-from-banked-R-R estimate
+/// which carries no breathing information at all (shuffling the night returns the same 13.3333 bpm).
+/// The baseline that value feeds is scoped to the current device era (`Baselines.deviceEraEpoch`, #459)
+/// so a strap switch — WHOOP reads ~16.1, the ring ~14.6 — is not folded into one 28-day mean and read
+/// as physiology. It still never reaches the sleep STAGER (`OuraRespScale.forScoring`): that stream is
+/// read there as a ~1 Hz raw ADC waveform and a per-window rate is the wrong shape for a peak detector,
+/// however good the rate. `averageHrBpm` stays diagnostic-only: it must not join the beat-derived HR
+/// series at a different cadence and a different provenance.
+///
+/// `mzci` / `dzci` keep the source's opaque names deliberately — we do not know what they measure, and
+/// inventing a friendlier name would assert an interpretation the evidence does not support.
+public struct OuraSleepPeriodInfo: Equatable, Sendable, Codable {
+    public let ringTimestamp: UInt32
+    /// Wire `u8 × 0.5`, so the channel has half-bpm resolution (≈50 % of real records carry an odd
+    /// wire byte — the half-steps are used, not a decode artifact).
+    public let averageHrBpm: Double
+    /// Wire `s8 × 0.0625` — signed; the only signed field in the body.
+    public let hrTrend: Double
+    /// Wire `u8 × 0.0625`. Meaning unknown (source's name kept verbatim).
+    public let mzci: Double
+    /// Wire `u8 × 0.0625`. Meaning unknown (source's name kept verbatim).
+    public let dzci: Double
+    /// Wire `u8 / 8.0` — CANDIDATE breaths per minute. See the type doc: named, not validated.
+    public let breathsPerMin: Double
+    /// Wire `u8 / 8.0` — CANDIDATE breath variability, in the same units as `breathsPerMin`.
+    public let breathVariability: Double
+    /// Wire `u8`, declared `< 121` by the source (upheld by every record we hold).
+    public let motionCount: Int
+    /// Wire `u8`, declared `∈ {0,1,2}` by the source (only 0 and 1 observed). Meaning of the codes is
+    /// NOT documented by any source we carry, so no enum is minted for it.
+    public let sleepState: Int
+    /// Wire `u16 LE / 65536`, so `[0, 1)`. Meaning unknown (source's name kept verbatim).
+    public let cv: Double
+    public init(ringTimestamp: UInt32, averageHrBpm: Double, hrTrend: Double, mzci: Double,
+                dzci: Double, breathsPerMin: Double, breathVariability: Double, motionCount: Int,
+                sleepState: Int, cv: Double) {
+        self.ringTimestamp = ringTimestamp; self.averageHrBpm = averageHrBpm; self.hrTrend = hrTrend
+        self.mzci = mzci; self.dzci = dzci; self.breathsPerMin = breathsPerMin
+        self.breathVariability = breathVariability; self.motionCount = motionCount
+        self.sleepState = sleepState; self.cv = cv
+    }
+}
+
 // MARK: - The emitted event union
 
 /// What OuraDriver.ingest(record:) emits. A single record can yield several events (e.g. an IBI+amp
@@ -251,11 +440,23 @@ public enum OuraEvent: Equatable, Sendable {
     /// formula, so an investigating consumer can log real MET numbers instead of hex. Same gate
     /// (`allowTierB`), same discipline (never reaches `OuraStreamMapping`).
     case activityInfo(OuraActivityInfo)
+    /// A decoded `0x7E`/`0x7F` real_steps_features record (14 unpacked fields). Still Tier-B (see
+    /// `OuraRealStepsFields` doc) - split out of the raw-bytes `.tierB` wrapper for the same reason
+    /// `.activityInfo` was: a cited third-party unpack formula worth surfacing as real numbers instead
+    /// of hex. Same gate (`allowTierB`), same discipline (never reaches `OuraStreamMapping`).
+    case realStepsFields(OuraRealStepsFields)
+    /// A decoded `0x6A` sleep_period_info record (avg HR + the ring's own breath rate). Still Tier-B (see
+    /// `OuraSleepPeriodInfo` doc) - split out of the raw-bytes `.tierB` wrapper for the same reason
+    /// `.activityInfo` was: a cited third-party layout worth surfacing as real numbers instead of hex.
+    /// Same gate (`allowTierB`); its `breathsPerMin` — alone among the record's fields — is mapped to a
+    /// durable `respSample` row and, on a ring night, supplies `dailyMetric.respRateBpm` (see the type
+    /// doc). Every other field of the record stays diagnostic-only.
+    case sleepPeriodInfo(OuraSleepPeriodInfo)
 
     /// True for Tier-B events, so a consumer can assert none leaked into a Tier-A-only sink.
     public var isTierB: Bool {
         switch self {
-        case .tierB, .activityInfo: return true
+        case .tierB, .activityInfo, .realStepsFields, .sleepPeriodInfo: return true
         default: return false
         }
     }
@@ -280,6 +481,8 @@ public enum OuraEvent: Equatable, Sendable {
         case .debugText(let rt, _): return rt
         case .tierB(let v): return v.ringTimestamp
         case .activityInfo(let v): return v.ringTimestamp
+        case .realStepsFields(let v): return v.ringTimestamp
+        case .sleepPeriodInfo(let v): return v.ringTimestamp
         }
     }
 }

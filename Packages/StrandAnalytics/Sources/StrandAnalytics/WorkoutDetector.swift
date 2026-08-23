@@ -55,15 +55,23 @@ public struct ExerciseSession: Equatable, Sendable {
     public let hrmaxSource: String
     public let caloriesKcal: Double?
     public let caloriesKJ: Double?
+    /// #1545: how much of the bout the HR sensor actually saw, as a percentage of 60-second buckets that
+    /// contain at least one reading. nil when it was not measured. A WHOOP 4.0's optical sensor is weak
+    /// under gripping — which is exactly what lifting is — so a low Effort has two very different causes:
+    /// the metric genuinely not rating the work, or the strap not having seen it. Those deserve opposite
+    /// advice, and until now they were indistinguishable from the outside.
+    public let hrCoveragePct: Double?
 
     public init(start: Int, end: Int, avgHR: Double, peakHR: Int, strain: Double?,
                 durationS: Double, zoneTimePct: [Int: Double], avgHRRPct: Double?,
                 hrmax: Double?, hrmaxSource: String,
-                caloriesKcal: Double?, caloriesKJ: Double?) {
+                caloriesKcal: Double?, caloriesKJ: Double?,
+                hrCoveragePct: Double? = nil) {
         self.start = start; self.end = end; self.avgHR = avgHR; self.peakHR = peakHR
         self.strain = strain; self.durationS = durationS; self.zoneTimePct = zoneTimePct
         self.avgHRRPct = avgHRRPct; self.hrmax = hrmax; self.hrmaxSource = hrmaxSource
         self.caloriesKcal = caloriesKcal; self.caloriesKJ = caloriesKJ
+        self.hrCoveragePct = hrCoveragePct
     }
 }
 
@@ -132,6 +140,74 @@ public enum WorkoutDetector {
         precondition(!bpms.isEmpty, "deriveRestingHR called with empty segment")
         let rank = max(1, Int(ceil(restingPercentile / 100.0 * Double(bpms.count))))
         return bpms[rank - 1]
+    }
+
+    /// #1545: how much of `[start, end]` the HR sensor actually covered, as a percentage of
+    /// `bucketSeconds`-wide buckets holding at least one reading.
+    ///
+    /// Bucketed rather than sample-counted on purpose. A WHOOP 5/MG sends live HR only about every 30 s,
+    /// so counting samples against a 1 Hz expectation would report ~3% for a perfectly captured bout,
+    /// which is worse than no number. A bucket is either seen or not, so a 30 s cadence reads as full
+    /// coverage and a genuine dropout reads as the gap it is.
+    public static func hrCoveragePct(sampleTs: [Int], start: Int, end: Int,
+                                     bucketSeconds: Int = 60) -> Double? {
+        guard end > start, bucketSeconds > 0 else { return nil }
+        // Integer ceil, not `ceil(Double/Double)` — same expression as the Kotlin twin, with no float
+        // rounding to reason about at a bucket boundary. A partial trailing bucket counts as a whole one,
+        // so coverage can never exceed 100.
+        let buckets = max(1, ((end - start) + bucketSeconds - 1) / bucketSeconds)
+        var seen = Set<Int>()
+        for ts in sampleTs where ts >= start && ts < end {
+            seen.insert((ts - start) / bucketSeconds)
+        }
+        return Double(seen.count) / Double(buckets) * 100.0
+    }
+
+    /// #1545: the always-on per-bout line naming what this workout's Effort was actually scored against.
+    ///
+    /// HRmax is the single biggest determinant of an Effort score — it sets every zone boundary, so being
+    /// wrong by a few bpm can move real work across the 50% floor and score it zero — and until this line
+    /// existed a user could not see which number had been used, or whether it came from their own setting
+    /// or an age formula. Working that out previously meant reversing the arithmetic from the displayed
+    /// score, which is what #1545 took to diagnose.
+    ///
+    /// No PII: a day key, a duration, bpm and percentages.
+    public static func boutCalibrationLine(day: String, durMin: Int, hrmax: Double?, hrmaxSource: String,
+                                           avgHRRPct: Double?, hrCoveragePct: Double?,
+                                           strain: Double?) -> String {
+        return "effort bout day=\(day) durMin=\(durMin) hrmax=\(round0(hrmax)) src=\(hrmaxSource) "
+            + "avgHRR=\(round0(avgHRRPct)) cover=\(round0(hrCoveragePct)) effort=\(round1(strain))"
+    }
+
+    /// The two numeric formatters this line uses, written as integer arithmetic over the value's
+    /// MAGNITUDE rather than `%.0f` / `%.1f`.
+    ///
+    /// Three things this shape avoids, all of which would break a line whose entire job is being
+    /// comparable between two users' logs — and between an iOS log and an Android one:
+    ///
+    /// - **The positive tie.** C `printf` (Swift) breaks a rounding tie to even; Java's `String.format`
+    ///   (Kotlin) breaks it up. A bout at exactly 52.5% HRR would print `52` on iOS and `53` on Android.
+    /// - **The negative tie.** Swift's `.rounded()` is half-AWAY-from-zero and Java's `Math.round` is
+    ///   half-UP, so they disagree on -4.5 (-5 vs -4). Rounding `abs(v)` and re-applying the sign makes
+    ///   the two identical in both directions; it also keeps the minus sign, which integer `/` and `%`
+    ///   truncating toward zero would otherwise drop (-0.4 printing as `0.4`).
+    /// - **The trap.** Swift's `Int(_: Double)` CRASHES on a finite value past `Int.max` while Kotlin's
+    ///   `Math.round` silently saturates to `Long.MAX_VALUE`. Today's caller cannot produce one (the
+    ///   detector gates `maxHR > restingHR` before computing %HRR), but this is public API, and a
+    ///   diagnostic that kills the process is the worst possible way for one to fail. Past the bound both
+    ///   platforms print `nil`, which is also the more honest answer: such a value is not a heart rate, a
+    ///   percentage or an Effort.
+    static let printableMagnitudeLimit = 1e15
+
+    static func round0(_ v: Double?) -> String {
+        guard let v, v.isFinite, abs(v) < printableMagnitudeLimit else { return "nil" }
+        return (v < 0 ? "-" : "") + String(Int(abs(v).rounded()))
+    }
+
+    static func round1(_ v: Double?) -> String {
+        guard let v, v.isFinite, abs(v) < printableMagnitudeLimit else { return "nil" }
+        let t = Int((abs(v) * 10).rounded())
+        return "\(v < 0 ? "-" : "")\(t / 10).\(t % 10)"
     }
 
     /// Value whose ts is nearest to `ts` within `tol` seconds, else nil. Ties go
@@ -269,7 +345,12 @@ public enum WorkoutDetector {
                               restingHR: Double? = nil,
                               maxHR: Double? = nil,
                               age: Double? = nil,
-                              profile: UserProfile? = nil) -> [ExerciseSession] {
+                              profile: UserProfile? = nil,
+                              // #1545: TRIMP recipe for each bout's Effort. Defaults to Edwards so every
+                              // existing caller and test is byte-identical; the app threads the user's
+                              // choice so a bout and the day it sits in are never scored by different
+                              // recipes, which would be worse than either one being "wrong".
+                              effortMethod: StrainScorer.Method = .edwards) -> [ExerciseSession] {
         let hrSeg = cleanHR(hr)
         let motion = activitySeries(gravity)
         if hrSeg.isEmpty || motion.isEmpty { return [] }
@@ -360,20 +441,23 @@ public enum WorkoutDetector {
             guard !bpms.isEmpty else { continue }   // skip a degenerate bout with no HR samples
             let avg = bpms.reduce(0, +) / Double(bpms.count)
             let peak = Int(bpms.max()!.rounded())
-            let strain = StrainScorer.strain(hrSamples, maxHR: effMaxHR, restingHR: restHR)
+            let strain = StrainScorer.strain(hrSamples, maxHR: effMaxHR, restingHR: restHR,
+                                             method: effortMethod, sex: profile?.sex ?? "male")
 
             sessions.append(ExerciseSession(
                 start: effStart, end: end, avgHR: avg, peakHR: peak, strain: strain,
                 durationS: Double(end - effStart), zoneTimePct: zonePct, avgHRRPct: avgHRR,
-                hrmax: effMaxHR, hrmaxSource: hrmaxSource, caloriesKcal: kcal, caloriesKJ: kj))
+                hrmax: effMaxHR, hrmaxSource: hrmaxSource, caloriesKcal: kcal, caloriesKJ: kj,
+                hrCoveragePct: hrCoveragePct(sampleTs: hrSamples.map { $0.ts },
+                                             start: effStart, end: end)))
         }
         return sessions
     }
 
     /// #510: backfill ONLY the avgHr/maxHr/energyKcal/strain fields `real` doesn't already have, from a
     /// detected bout's own computed values — never touching a field that's already present, whether
-    /// typed by the user, imported, or filled by an earlier pass. `real` unchanged (`==`) means it
-    /// already had everything, so the caller can tell whether a write is actually needed. Kotlin twin
+    /// typed by the user, imported, or filled by an earlier pass. `real` unchanged (`==`) means no
+    /// available value was filled, so the caller can tell whether a write is actually needed. Kotlin twin
     /// IntelligenceEngine.backfillWorkoutFromDetectedBout.
     public static func backfillWorkout(_ real: WorkoutRow, avgBpm: Int, peakHR: Int, caloriesKcal: Double?, strain: Double?) -> WorkoutRow {
         WorkoutRow(
@@ -383,7 +467,8 @@ public enum WorkoutDetector {
             avgHr: real.avgHr ?? avgBpm,
             maxHr: real.maxHr ?? peakHR,
             strain: real.strain ?? strain,
-            distanceM: real.distanceM, zonesJSON: real.zonesJSON, notes: real.notes)
+            distanceM: real.distanceM, zonesJSON: real.zonesJSON, notes: real.notes,
+            steps: real.steps)
     }
 }
 
@@ -398,21 +483,38 @@ public enum Calories {
         let restingWeight: Double
         let restingHeight: Double  // applied to height in METRES
         let restingAge: Double
+        // Keytel 2005 base (fitness-blind) active model: EE(kJ/min) = alpha + hr·HR + wt·W + age·A.
         let workoutHR: Double
         let workoutWeight: Double
         let workoutAge: Double
         let workoutAlpha: Double
+        // Keytel 2005 fitness-ADJUSTED active model, which reads VO2max and is the more accurate
+        // form the authors published: EE(kJ/min) = fitAlpha + fitHR·HR + fitVO2·VO2max + fitWeight·W
+        // + fitAge·A. Used only when a resting HR is known (so a Uth VO2max can be derived); otherwise
+        // the base workout* model above is used, unchanged. (Keytel et al. 2005, J. Sports Sci. 23(3).)
+        let fitHR: Double
+        let fitVO2: Double
+        let fitWeight: Double
+        let fitAge: Double
+        let fitAlpha: Double
     }
 
     static let male = Coeffs(restingAlpha: 88.362, restingWeight: 13.397, restingHeight: 479.9,
                              restingAge: 5.677, workoutHR: 0.6309, workoutWeight: 0.1988,
-                             workoutAge: 0.2017, workoutAlpha: -55.0969)
+                             workoutAge: 0.2017, workoutAlpha: -55.0969,
+                             fitHR: 0.634, fitVO2: 0.404, fitWeight: 0.394, fitAge: 0.271,
+                             fitAlpha: -95.7735)
     static let female = Coeffs(restingAlpha: 447.593, restingWeight: 9.247, restingHeight: 309.8,
                                restingAge: 4.33, workoutHR: 0.4472, workoutWeight: -0.1263,
-                               workoutAge: 0.0740, workoutAlpha: -20.4022)
+                               workoutAge: 0.0740, workoutAlpha: -20.4022,
+                               fitHR: 0.450, fitVO2: 0.380, fitWeight: 0.103, fitAge: 0.274,
+                               fitAlpha: -59.3954)
+    // Nonbinary = the male/female midpoint, the same convention the base workout* coeffs use.
     static let nonbinary = Coeffs(restingAlpha: 267.9775, restingWeight: 11.322, restingHeight: 394.85,
                                   restingAge: 5.0035, workoutHR: 0.53905, workoutWeight: 0.03625,
-                                  workoutAge: 0.13785, workoutAlpha: -37.74955)
+                                  workoutAge: 0.13785, workoutAlpha: -37.74955,
+                                  fitHR: 0.542, fitVO2: 0.392, fitWeight: 0.2485, fitAge: 0.2725,
+                                  fitAlpha: -77.58445)
 
     static let activeHRRFraction = 0.30
     /// Whole-day active gate (`estimateDayCalories` only). The Keytel 2005 equation is
@@ -440,9 +542,31 @@ public enum Calories {
         return max(0.0, bmr) / 86_400.0
     }
 
-    static func activeKcalPerS(_ c: Coeffs, hr: Double, hrmax: Double, weightKg: Double, age: Double) -> Double {
-        let eeKjMin = c.workoutHR * min(hr, hrmax) + c.workoutWeight * weightKg
-            + c.workoutAge * age + c.workoutAlpha
+    /// Uth–Sørensen VO2max estimate (ml·kg⁻¹·min⁻¹) ≈ 15.3 · HRmax / HRrest. Returns nil when no
+    /// usable resting HR — the caller then keeps the base (fitness-blind) Keytel model, so a strap
+    /// with no resting baseline is scored exactly as before. A function of HRmax + resting HR ONLY,
+    /// so every call site resolves it locally and day derivation stays deterministic (no cross-day
+    /// dependency). (Uth et al. 2004, Eur. J. Appl. Physiol. 91.)
+    // `public`: the app-target IntelligenceEngine reads this shared Uth 2004 estimate for the waist-free
+    // VO₂max fallback (#1391), across the StrandAnalytics module boundary. The Kotlin twin is already public.
+    public static func vo2maxFor(hrmax: Double, restingHR: Double?) -> Double? {
+        guard let rhr = restingHR, rhr > 0, hrmax > 0 else { return nil }
+        return 15.3 * hrmax / rhr
+    }
+
+    /// Active energy rate (kcal/s). With `vo2max` present, uses the Keytel 2005 fitness-ADJUSTED
+    /// equation (personalizes beyond age/weight/sex); with nil, the base fitness-blind Keytel model,
+    /// byte-identical to before. HR is capped at HRmax in both, as the base model always did.
+    static func activeKcalPerS(_ c: Coeffs, hr: Double, hrmax: Double, weightKg: Double, age: Double,
+                               vo2max: Double? = nil) -> Double {
+        let eeKjMin: Double
+        if let vo2 = vo2max {
+            eeKjMin = c.fitHR * min(hr, hrmax) + c.fitVO2 * vo2 + c.fitWeight * weightKg
+                + c.fitAge * age + c.fitAlpha
+        } else {
+            eeKjMin = c.workoutHR * min(hr, hrmax) + c.workoutWeight * weightKg
+                + c.workoutAge * age + c.workoutAlpha
+        }
         return max(0.0, eeKjMin) / workoutDivisor
     }
 
@@ -469,6 +593,9 @@ public enum Calories {
         let activeThreshold = effResting + activeHRRFraction * (effHRmax - effResting)
 
         let restingRate = restingKcalPerS(coeffs, weightKg: weightKg, heightCm: heightCm, age: age)
+        // Fitness anchor (Uth VO2max) when a resting HR is known → the Keytel fitness-adjusted rate;
+        // nil restingHR → base model, unchanged. Computed once (constant across the bout).
+        let vo2max = vo2maxFor(hrmax: effHRmax, restingHR: restingHR)
 
         // Weight each sample by the ACTUAL elapsed time to the next sample, not a flat 1 s.
         // restingRate / activeKcalPerS are per-SECOND rates, so summing one per sample only
@@ -492,7 +619,7 @@ public enum Calories {
             if bpm < activeThreshold {
                 totalKcal += restingRate * dur
             } else {
-                totalKcal += activeKcalPerS(coeffs, hr: bpm, hrmax: effHRmax, weightKg: weightKg, age: age) * dur
+                totalKcal += activeKcalPerS(coeffs, hr: bpm, hrmax: effHRmax, weightKg: weightKg, age: age, vo2max: vo2max) * dur
             }
         }
         return (totalKcal, totalKcal * 4.184)
@@ -537,6 +664,9 @@ public enum Calories {
         let activeThreshold = effResting + dayActiveHRRFraction * (effHRmax - effResting)
 
         let restingRate = restingKcalPerS(coeffs, weightKg: weightKg, heightCm: heightCm, age: age)
+        // Fitness anchor (Uth VO2max) when a resting HR is known → Keytel fitness-adjusted rate; nil
+        // restingHR → base model, unchanged. Constant across the day.
+        let vo2max = vo2maxFor(hrmax: effHRmax, restingHR: restingHR)
 
         var totalKcal = 0.0
         for s in hrSamples {
@@ -547,7 +677,7 @@ public enum Calories {
                 // Floor the active rate at the resting BMR rate: a worn day-second never burns
                 // LESS than resting metabolism, even where the Keytel value dips low for some
                 // profiles just above the gate.
-                let active = activeKcalPerS(coeffs, hr: bpm, hrmax: effHRmax, weightKg: weightKg, age: age)
+                let active = activeKcalPerS(coeffs, hr: bpm, hrmax: effHRmax, weightKg: weightKg, age: age, vo2max: vo2max)
                 totalKcal += max(restingRate, active)
             }
         }

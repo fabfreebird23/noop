@@ -267,17 +267,21 @@ fun SectionHeader(
     trailing: String? = null,
     modifier: Modifier = Modifier,
 ) {
-    Row(
+    Column(
         modifier = modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.Top,
     ) {
-        Column(modifier = Modifier.weight(1f)) {
-            if (overline != null) Overline(overline)
-            Text(title, style = NoopType.title2, color = Palette.textPrimary)
+        if (overline != null || trailing != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+            ) {
+                if (overline != null) Overline(overline, modifier = Modifier.weight(1f))
+                if (trailing != null) {
+                    Text(trailing, style = NoopType.footnote, color = Palette.textSecondary)
+                }
+            }
         }
-        if (trailing != null) {
-            Text(trailing, style = NoopType.footnote, color = Palette.textSecondary)
-        }
+        Text(title, style = NoopType.title2, color = Palette.textPrimary)
     }
 }
 
@@ -394,7 +398,12 @@ fun StatePill(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         if (showsDot) ConnectionDot(tone = tone, pulsing = pulsing, size = 7.dp)
-        Text(title, style = NoopType.overline.copy(letterSpacing = 0.4.sp), color = tone.color)
+        // A pill is a single line: ellipsize a long title (e.g. a long custom model id) instead of
+        // wrapping it, so it can't eat a whole Row and squeeze a sibling control to nothing (#1074).
+        Text(
+            title, style = NoopType.overline.copy(letterSpacing = 0.4.sp), color = tone.color,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -479,6 +488,7 @@ internal fun AutoSizeValue(
     color: Color,
     modifier: Modifier = Modifier,
     minScale: Float = 0.6f,
+    textAlign: TextAlign = TextAlign.Start,
 ) {
     var scale by remember(text, style) { mutableStateOf(1f) }
     Text(
@@ -489,6 +499,7 @@ internal fun AutoSizeValue(
         maxLines = 1,
         softWrap = false,
         overflow = TextOverflow.Ellipsis,
+        textAlign = textAlign,
         modifier = modifier,
         onTextLayout = { result ->
             if (result.didOverflowWidth && scale > minScale) {

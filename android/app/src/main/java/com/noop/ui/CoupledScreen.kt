@@ -80,7 +80,6 @@ private const val COUPLED_NO_DATA = "No Data"
 // a translucent near-black that floats over the day-of-sky so the vessel + white count-up numbers stay
 // crisp — the card does the contrast work, not a muted sky. heroFill = rgba(13,14,20,.80), stroke
 // white@0.11, radius 26. Mirrors the iOS LiquidTodayView heroCard.
-private val LIQUID_HERO_FILL: Color = Color(red = 13f / 255f, green = 14f / 255f, blue = 20f / 255f, alpha = 0.80f)
 private val LIQUID_HERO_RADIUS: Dp = 26.dp
 
 @Composable
@@ -105,8 +104,11 @@ fun CoupledScreen(
     LaunchedEffect(days) {
         sleeps = runCatching {
             val now = System.currentTimeMillis() / 1000L
-            val imported = vm.repo.sleepSessions("my-whoop", 0L, now)
-            val computed = vm.repo.sleepSessions(vm.repo.computedDeviceId("my-whoop"), 0L, now)
+            // #1304/#512: read across the active-strap UNION (active ∪ canonical "my-whoop"), exactly as
+            // SleepScreen does — a 2nd strap's sleep is banked under "whoop-<uuid>", invisible to a raw
+            // "my-whoop" read. A single-WHOOP install collapses to "my-whoop" only, byte-identical.
+            val imported = vm.repo.sleepSessionsUnion(vm.activeStrapId, 0L, now)
+            val computed = vm.repo.computedSleepSessionsUnion(vm.activeStrapId, 0L, now)
             val importedEnds = imported.map { it.endTs }.toHashSet()
             (imported + computed.filter { it.endTs !in importedEnds }).sortedBy { it.effectiveStartTs }
         }.getOrDefault(emptyList())
@@ -116,7 +118,9 @@ fun CoupledScreen(
     // span below resolves the IDENTICAL block (#294) instead of a screen-local heuristic.
     var habitualMidsleepSec by remember { mutableStateOf<Long?>(null) }
     LaunchedEffect(days) {
-        habitualMidsleepSec = runCatching { vm.repo.habitualMidsleepSec("my-whoop") }.getOrNull()
+        // #1304/#512: thread the active strap id — `habitualMidsleepSec` unions internally, but the
+        // literal "my-whoop" collapses that union and re-drops a 2nd strap's nights (matches SleepScreen).
+        habitualMidsleepSec = runCatching { vm.repo.habitualMidsleepSec(vm.activeStrapId) }.getOrNull()
     }
 
     // Imported export-verbatim sleep figures (sleep_performance / need), preferred over the on-device
@@ -147,8 +151,25 @@ fun CoupledScreen(
                 .toString() == todayKey
         }
     }
-    val carriedRecoveryDay = remember(days, todayKey) {
-        days.lastOrNull { it.recovery != null && it.day < todayKey }
+    val context = LocalContext.current
+    val hrvEpoch = remember { NoopPrefs.of(context).getLong(Baselines.hrvBaselineEpochKey, 0L).toDouble() }
+    // #1458: carry through the SAME helper Today uses, not a local re-derivation. The local copy was
+    // `days.lastOrNull { it.recovery != null && it.day < todayKey }`, which has no `todayScored` guard —
+    // so on a day that HAS a score it still returned a prior day, and the hero's Charge sheet opened that
+    // older night while the card beside it showed today's number. It also missed the #547 upper bound
+    // (a future-dated row from a bad strap clock is how that bug read "12 Jul") and the calibrating gate.
+    // One helper, one answer: the card and its own detail sheet cannot disagree again.
+    val carriedRecoveryDay = remember(days, todayKey, todayRow, hrvEpoch, logicalKey, localKey) {
+        lastScoredRecoveryDay(
+            days = days,
+            selectedDayKey = todayKey,
+            isToday = true,   // the Coupled view has no day selector; it is always today
+            todayScored = todayRow?.recovery != null,
+            isCalibrating = recoveryCalibrationNights(
+                days, hasRecovery = todayRow?.recovery != null, hrvBaselineEpoch = hrvEpoch,
+            ) != null,
+            today = maxOf(logicalKey, localKey),
+        )
     }
     val recovery = todayRow?.recovery ?: carriedRecoveryDay?.recovery
     val isCarrying = todayRow?.recovery == null && carriedRecoveryDay?.recovery != null
@@ -174,8 +195,6 @@ fun CoupledScreen(
     // Recovery cold-start nights (the SAME pure helper Today's ring reads), for the honest calibrating
     // caption + accessibility copy while the HRV baseline still seeds. Threads the persisted
     // "Recalibrate HRV baseline" epoch so N folds the SAME epoch-aware history the engine folds (Bug B).
-    val context = LocalContext.current
-    val hrvEpoch = remember { NoopPrefs.of(context).getLong(Baselines.hrvBaselineEpochKey, 0L).toDouble() }
     val calibrationNights = remember(days, todayRow, hrvEpoch) {
         recoveryCalibrationNights(days, hasRecovery = todayRow?.recovery != null, hrvBaselineEpoch = hrvEpoch)
     }
@@ -201,10 +220,10 @@ fun CoupledScreen(
         // The Android equivalent of the iOS `ScreenScaffold(topBackground: liquidScaffoldSky())`; it replaces
         // the classic flat-canvas backdrop with the liquid day-of-sky (LiquidSkyStatic — no per-frame cost on
         // this scrolling column). The other liquid screens drop in the SAME LiquidScreenSky() slot verbatim.
-        topBackground = if (showDayCycleBackground) { { LiquidScreenSky(fillHeight = skyBehindCards) } } else null,
+        topBackground = screenBackdropSlot(showDayCycleBackground, skyBehindCards),
         // Sky-behind-cards fills the viewport so the transparent cards reveal the sky the whole way
         // down (Today / Trends / Sleep / metric-detail parity - same two prefs, same two behaviours).
-        fullBleedBackground = showDayCycleBackground && skyBehindCards,
+        fullBleedBackground = screenBackdropFullBleed(showDayCycleBackground, skyBehindCards),
     ) {
         HeroCard(
             recovery = recovery,
@@ -310,8 +329,8 @@ private fun HeroCard(
             .fillMaxWidth()
             .liquidPress(interaction)
             .clip(RoundedCornerShape(LIQUID_HERO_RADIUS))
-            .background(LIQUID_HERO_FILL.copy(alpha = LIQUID_HERO_FILL.alpha * CardAppearance.opacity))
-            .border(1.dp, Color.White.copy(alpha = 0.11f * CardAppearance.opacity), RoundedCornerShape(LIQUID_HERO_RADIUS))
+            .background(Palette.heroFill.copy(alpha = Palette.heroFill.alpha * CardAppearance.opacity))
+            .border(1.dp, Palette.heroBorder.copy(alpha = Palette.heroBorder.alpha * CardAppearance.opacity), RoundedCornerShape(LIQUID_HERO_RADIUS))
             .clickable(
                 interactionSource = interaction,
                 indication = null,
@@ -345,8 +364,12 @@ private fun HeroCard(
                 // prior score (#543/#779, the SAME caption Today uses), or the calibrating progress while
                 // the baseline seeds. Nothing when today's own score is showing.
                 if (isCarrying && carriedDay != null) {
+                    val caption = carriedCaption(carriedDay.day, today = todayKey)
                     Text(
-                        carriedCaption(carriedDay.day, today = todayKey),
+                        when (caption) {
+                            is DisplayText.Resource -> uiString(caption.id, *caption.args.toTypedArray())
+                            is DisplayText.Dynamic -> caption.value
+                        },
                         style = NoopType.footnote,
                         color = Palette.textTertiary,
                     )
@@ -387,8 +410,8 @@ private fun HeroCentre(recovery: Double?, readinessLevel: ReadinessEngine.Level)
             Text(COUPLED_NO_DATA, style = NoopType.headline, color = Palette.textSecondary)
         }
         Text(uiString(R.string.l10n_coupled_screen_recovery_b668d988), style = NoopType.overline, color = sampled)
-        val word = readinessWord(readinessLevel)
-        if (word != null) ReadinessPill(word = word, level = readinessLevel)
+        val wordRes = readinessWord(readinessLevel)
+        if (wordRes != null) ReadinessPill(word = uiString(wordRes), level = readinessLevel)
     }
 }
 

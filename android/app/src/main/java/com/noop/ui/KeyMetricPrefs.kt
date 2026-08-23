@@ -1,6 +1,8 @@
 package com.noop.ui
 
 import android.content.Context
+import androidx.annotation.StringRes
+import com.noop.R
 
 // MARK: - Editable Key-Metrics layout (#251)
 //
@@ -18,17 +20,17 @@ import android.content.Context
  * One of the Today screen's Key-Metric tiles. The [raw] is the stable persisted identifier — keep it
  * byte-identical to the macOS `KeyMetric` enum so a backup/restore reads the same layout on either OS.
  */
-enum class KeyMetric(val raw: String, val title: String) {
-    CHARGE("charge", "Charge"),
-    EFFORT("effort", "Effort"),
-    REST("rest", "Rest"),
-    HRV("hrv", "HRV"),
-    RESTING_HR("restingHr", "Resting HR"),
-    BLOOD_OXYGEN("bloodOxygen", "Blood Oxygen"),
-    RESPIRATORY("respiratory", "Respiratory"),
-    STEPS("steps", "Steps"),
-    WEIGHT("weight", "Weight"),
-    CALORIES("calories", "Calories");
+enum class KeyMetric(val raw: String, @StringRes val titleRes: Int) {
+    CHARGE("charge", R.string.today_metric_charge),
+    EFFORT("effort", R.string.today_metric_effort),
+    REST("rest", R.string.today_metric_rest),
+    HRV("hrv", R.string.today_metric_hrv),
+    RESTING_HR("restingHr", R.string.today_metric_resting_hr),
+    BLOOD_OXYGEN("bloodOxygen", R.string.today_metric_blood_oxygen),
+    RESPIRATORY("respiratory", R.string.today_metric_respiratory),
+    STEPS("steps", R.string.today_metric_steps),
+    WEIGHT("weight", R.string.today_metric_weight),
+    CALORIES("calories", R.string.today_metric_calories);
 
     companion object {
         fun fromRaw(raw: String?): KeyMetric? = entries.firstOrNull { it.raw == raw }
@@ -63,10 +65,11 @@ object KeyMetricPrefs {
 
     private const val KEY_WINDOW = "today.keyMetricsWindowDays"
 
-    /** Trailing trend window (calendar days) the DETAILED tiles graph: 2, 7 or 14 (default). Shared key
-     *  with the iOS twin; an unknown stored value coerces to 14 so a bad pref can't skew the window math. */
+    /** Trailing trend window (calendar days) the DETAILED tiles graph: 7, 14 (default) or 30. Shared key
+     *  with the iOS twin; an unknown stored value coerces to 14 so a bad pref can't skew the window math
+     *  (this also migrates users off the retired 2-day option). */
     fun detailWindowDays(context: Context): Int =
-        NoopPrefs.of(context).getInt(KEY_WINDOW, 14).let { if (it == 2 || it == 7 || it == 14) it else 14 }
+        NoopPrefs.of(context).getInt(KEY_WINDOW, 14).let { if (it == 7 || it == 14 || it == 30) it else 14 }
 
     fun setDetailWindowDays(context: Context, value: Int) {
         NoopPrefs.of(context).edit().putInt(KEY_WINDOW, value).apply()

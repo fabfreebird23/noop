@@ -2,6 +2,7 @@ package com.noop.ingest
 
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -15,6 +16,30 @@ import java.io.ByteArrayOutputStream
  * gracefully). The XML parser seam swaps in kXML2 (android.util.Xml is a throwing stub off-device).
  */
 class ActivityFileImporterTest {
+
+    @Test
+    fun routeDistanceOrderedThreePointsUsesCanonicalBitPattern() {
+        // Fork governance #99: exact twin parity matters even when the numerical delta is too small
+        // to survive UI formatting. Keep point order and assert the binary64 result, not a tolerance.
+        val route = listOf(
+            ActivityFileImporter.RoutePoint(lat = 52.5, lon = 13.4),
+            ActivityFileImporter.RoutePoint(lat = 52.5001, lon = 13.4001),
+            ActivityFileImporter.RoutePoint(lat = 52.5002, lon = 13.4003),
+        )
+
+        assertEquals(0x403e89813f76c75cL, ActivityFileImporter.routeDistanceM(route).toRawBits())
+    }
+
+    @Test
+    fun routeDistanceOneSegmentKeepsAdjacentControlBitPattern() {
+        // Adjacent control: this first segment is already identical on both twins and must stay so.
+        val route = listOf(
+            ActivityFileImporter.RoutePoint(lat = 52.5, lon = 13.4),
+            ActivityFileImporter.RoutePoint(lat = 52.5001, lon = 13.4001),
+        )
+
+        assertEquals(0x402a0921667f2bacL, ActivityFileImporter.routeDistanceM(route).toRawBits())
+    }
 
     @Before
     fun installRealParser() {
@@ -125,6 +150,33 @@ class ActivityFileImporterTest {
         """.trimIndent()
         val r = ActivityFileImporter.parse(gpx.toByteArray(Charsets.UTF_8), "x.gpx")
         assertEquals(1, r.activity!!.gpsPointCount)
+    }
+
+    @Test
+    fun untimedGpxRequiresTwoPointsForDerivedDistance() {
+        // bhelm/noop#100: without a summary distance, one coordinate has no measurable segment.
+        // The untimed parser must preserve that absence as null, matching the timestamped branch.
+        val onePoint = """
+            <gpx><trk><trkseg>
+              <trkpt lat="48.1" lon="11.5"></trkpt>
+            </trkseg></trk></gpx>
+        """.trimIndent()
+        val single = ActivityFileImporter.parse(onePoint.toByteArray(Charsets.UTF_8), "route.gpx").activity!!
+        assertEquals(1, single.gpsPointCount)
+        assertNull(single.distanceM)
+
+        // Adjacent control: two untimed coordinates do define a segment and retain derived distance.
+        val twoPoints = """
+            <gpx><trk><trkseg>
+              <trkpt lat="48.1" lon="11.5"></trkpt>
+              <trkpt lat="48.1001" lon="11.5001"></trkpt>
+            </trkseg></trk></gpx>
+        """.trimIndent()
+        val pair = ActivityFileImporter.parse(twoPoints.toByteArray(Charsets.UTF_8), "route.gpx").activity!!
+        assertEquals(2, pair.gpsPointCount)
+        val derivedDistance = pair.distanceM
+        assertNotNull(derivedDistance)
+        assertTrue((derivedDistance ?: 0.0) > 0.0)
     }
 
     // MARK: - TCX
@@ -276,6 +328,98 @@ class ActivityFileImporterTest {
         assertEquals("Activity", ActivityFileImporter.workoutSport(""))
         assertEquals("Trail Run", ActivityFileImporter.workoutSport("Trail Run"))
         assertEquals("Kayaking", ActivityFileImporter.workoutSport("kayaking"))
+    }
+
+    @Test
+    fun detectFormatTreatsTrailingDotAsEmptyExtensionWithSwiftParity() {
+        val empty = byteArrayOf()
+        val unknownXml = "<unknown/>".toByteArray(Charsets.UTF_8)
+        val fitMagic = byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 46, 70, 73, 84)
+        val gpx = "<gpx></gpx>".toByteArray(Charsets.UTF_8)
+        val tcx = "<TrainingCenterDatabase></TrainingCenterDatabase>".toByteArray(Charsets.UTF_8)
+
+        assertEquals(
+            ActivityFileImporter.Format.UNKNOWN,
+            ActivityFileImporter.detectFormat("ride.fit.", empty),
+        )
+        assertEquals(
+            ActivityFileImporter.Format.UNKNOWN,
+            ActivityFileImporter.detectFormat("ride.fit..", empty),
+        )
+        assertEquals(
+            ActivityFileImporter.Format.UNKNOWN,
+            ActivityFileImporter.detectFormat("route.gpx.", unknownXml),
+        )
+        assertEquals(ActivityFileImporter.Format.UNKNOWN, ActivityFileImporter.detectFormat("fit", empty))
+
+        assertEquals(ActivityFileImporter.Format.FIT, ActivityFileImporter.detectFormat("ride.fit", empty))
+        assertEquals(ActivityFileImporter.Format.GPX, ActivityFileImporter.detectFormat("route.gpx", empty))
+        assertEquals(ActivityFileImporter.Format.GPX, ActivityFileImporter.detectFormat("route.GPX", empty))
+        assertEquals(ActivityFileImporter.Format.FIT, ActivityFileImporter.detectFormat("ride.fit.", fitMagic))
+        assertEquals(ActivityFileImporter.Format.FIT, ActivityFileImporter.detectFormat("ride.bin", fitMagic))
+        assertEquals(ActivityFileImporter.Format.GPX, ActivityFileImporter.detectFormat("route.gpx.", gpx))
+        assertEquals(ActivityFileImporter.Format.GPX, ActivityFileImporter.detectFormat("route.bin", gpx))
+        assertEquals(ActivityFileImporter.Format.TCX, ActivityFileImporter.detectFormat("workout.tcx.", tcx))
+    }
+
+    @Test
+    fun summaryTextIncludesOnlyPositiveStepsWithSwiftParity() {
+        fun activity(steps: Int?) = ActivityFileImporter.Activity(
+            kind = ActivityFileImporter.Kind.FIT,
+            startTs = 1_000,
+            endTs = 1_060,
+            sport = "walking",
+            distanceM = 1_000.0,
+            energyKcal = null,
+            steps = steps,
+            avgHr = null,
+            maxHr = null,
+            ascentM = null,
+            gpsPointCount = 0,
+            hrSampleCount = 0,
+            route = emptyList(),
+        )
+
+        val base = "Imported a 1.00 km Walking activity"
+        assertEquals(base, ActivityFileImporter.summaryText(activity(null)))
+        assertEquals(base, ActivityFileImporter.summaryText(activity(0)))
+        assertEquals(
+            "$base · 2350 steps",
+            ActivityFileImporter.summaryText(activity(2_350)),
+        )
+    }
+
+    @Test
+    fun distanceTextUsesExplicitHalfUpRoundingWithSwiftParity() {
+        fun activity(distanceM: Double) = ActivityFileImporter.Activity(
+            kind = ActivityFileImporter.Kind.GPX,
+            startTs = 1_000,
+            endTs = 1_060,
+            sport = "running",
+            distanceM = distanceM,
+            energyKcal = null,
+            steps = null,
+            avgHr = null,
+            maxHr = null,
+            ascentM = null,
+            gpsPointCount = 0,
+            hrSampleCount = 0,
+            route = emptyList(),
+        )
+
+        val cases = listOf(
+            9_500.0 to "9.50 km",
+            10_500.0 to "11 km",
+            11_500.0 to "12 km",
+        )
+        for ((metres, distance) in cases) {
+            val value = activity(metres)
+            assertEquals("Imported GPX · $distance", value.importNote())
+            assertEquals(
+                "Imported a $distance Running activity",
+                ActivityFileImporter.summaryText(value),
+            )
+        }
     }
 }
 

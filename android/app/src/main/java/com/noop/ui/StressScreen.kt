@@ -56,10 +56,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.noop.analytics.DaytimeBaselines
 import com.noop.analytics.DaytimeStress
 import com.noop.analytics.HrvFreqDomain
 import com.noop.analytics.StressIndex
 import com.noop.data.DailyMetric
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
 import java.util.Locale
 import kotlin.math.exp
 import kotlin.math.roundToInt
@@ -121,7 +125,7 @@ fun StressScreen(vm: AppViewModel, onBreathe: () -> Unit = {}) {
     var stressIndex by remember { mutableStateOf<StressIndex.Components?>(null) }
     var freqHrv by remember { mutableStateOf<HrvFreqDomain.Bands?>(null) }
     androidx.compose.runtime.LaunchedEffect(Unit) {
-        val read = runCatching { loadDaytimeStress(vm) }
+        val read = runCatching { loadDaytimeStress(vm, NoopPrefs.stressPersonalBaseline(context)) }
             .getOrDefault(DaytimeReadout(DaytimeStress.Result.EMPTY, null, null))
         daytime = read.daytime
         stressIndex = read.stressIndex
@@ -140,10 +144,10 @@ fun StressScreen(vm: AppViewModel, onBreathe: () -> Unit = {}) {
         // status bar via the scaffold's topBackground plumbing), and the cards float OVER it on the flat
         // surface below. The Android equivalent of the iOS `ScreenScaffold(topBackground: liquidScaffoldSky())`.
         // Gated on the "Day-cycle background" setting like Today; off passes null (the flat-canvas path).
-        topBackground = if (showDayCycleBackground) { { LiquidScreenSky(fillHeight = skyBehindCards) } } else null,
+        topBackground = screenBackdropSlot(showDayCycleBackground, skyBehindCards),
         // Sky-behind-cards fills the viewport so the transparent cards reveal the sky the whole way
         // down (Today / Trends / Sleep / metric-detail parity - same two prefs, same two behaviours).
-        fullBleedBackground = showDayCycleBackground && skyBehindCards,
+        fullBleedBackground = screenBackdropFullBleed(showDayCycleBackground, skyBehindCards),
     ) {
         when {
             model != null -> StressContent(model, daytime, stressIndex, freqHrv, onBreathe)
@@ -171,24 +175,80 @@ private data class DaytimeReadout(
  * score's math, so this is the same proxy at a finer grain (never a new score). The SAME `rr` is
  * then fed to the two additive HRV engines (no extra fetch, no DB / schema change).
  */
-private suspend fun loadDaytimeStress(vm: AppViewModel): DaytimeReadout {
+private suspend fun loadDaytimeStress(vm: AppViewModel, personalBaseline: Boolean): DaytimeReadout {
     val nowSeconds = System.currentTimeMillis() / 1000L
-    val tzOffsetSeconds = java.util.TimeZone.getDefault().getOffset(nowSeconds * 1_000L) / 1_000L
-    // Local midnight (wall-clock seconds): floor the LOCAL time to the day, then undo the
-    // offset so the bound is back on the wall clock the samples are stored in.
-    val localNow = nowSeconds + tzOffsetSeconds
-    val from = (localNow - Math.floorMod(localNow, 86_400L)) - tzOffsetSeconds
+    val zone = ZoneId.systemDefault()
+    val todayWindow = stressLocalDayWindowContaining(nowSeconds, zone)
+    val from = todayWindow.fromEpochSecond
+    val tzOffsetSeconds = zone.rules.getOffset(Instant.ofEpochSecond(nowSeconds)).totalSeconds.toLong()
     val hr = vm.repo.hrSamples("my-whoop", from, nowSeconds, limit = 200_000)
     if (hr.size < DaytimeStress.minHourHrSamples) {
         return DaytimeReadout(DaytimeStress.Result.EMPTY, null, null)
     }
     val rr = vm.repo.rrIntervals("my-whoop", from, nowSeconds, limit = 200_000)
-    val daytime = DaytimeStress.analyze(hr, rr, tzOffsetSeconds)
+    // Wrist accelerometer for the motion gate: an ambulatory hour is EXERTION, not stress, so it is
+    // masked rather than scored (DaytimeStress). Same repo read as R-R; empty on hardware or imports
+    // with no gravity, which is exactly the "no masking, prior behaviour" degradation.
+    val gravity = vm.repo.gravitySamples("my-whoop", from, nowSeconds, limit = 200_000)
+    // Score against the PERSONAL cross-day baseline only when the user opted in (#463) AND enough worn
+    // history exists (DaytimeBaselines.scoringMode is the degradation gate); else the day's own calm
+    // hours (DayRelative, the default). The trailing-history reads happen only past the HR-count guard
+    // above and only while the toggle is ON, so the default read is byte-identical to before. Twin of
+    // the iOS StressView daytimeScoringMode.
+    val mode = if (personalBaseline) {
+        daytimeScoringMode(vm, todayWindow.day, zone)
+    } else {
+        DaytimeStress.ScoringMode.DayRelative
+    }
+    val daytime = DaytimeStress.analyze(hr, rr, gravity, tzOffsetSeconds, mode)
     // ADDITIVE advanced readouts from the SAME `rr`. Each engine self-gates and returns null when
     // its requirement is not met, in which case its row is simply hidden in the UI.
     val si = StressIndex.components(rr)
     val freq = HrvFreqDomain.freqDomain(rr)
     return DaytimeReadout(daytime, si, freq)
+}
+
+/**
+ * Build the personal daytime baselines from the trailing [baselineHistoryDays] local days (TODAY
+ * EXCLUDED — it's the day being scored, not part of its own baseline) and return the scoring mode for
+ * today's intraday read: BaselineRelative once there's enough real worn daytime-HR history for a usable
+ * baseline, else DayRelative (the unchanged default). Reads each past day's raw HR once (bounded per
+ * day) via [vm].repo; unworn days (no HR) are skipped without an R-R read. Faithful twin of the iOS
+ * StressView.daytimeScoringMode. [todayLocalDay] is today's date in [zone].
+ */
+private suspend fun daytimeScoringMode(
+    vm: AppViewModel,
+    todayLocalDay: LocalDate,
+    zone: ZoneId,
+): DaytimeStress.ScoringMode {
+    // 30 mirrors the app's other rolling baselines (nightly resting-HR / HRV) and the iOS baselineHistoryDays.
+    val baselineHistoryDays = 30
+    val days = ArrayList<DaytimeBaselines.DaytimeDayStreams>(baselineHistoryDays)
+    // Oldest → newest so the EWMA fold replays the history in order.
+    for (back in baselineHistoryDays downTo 1) {
+        val window = stressLocalDayWindow(todayLocalDay.minusDays(back.toLong()), zone)
+        val dayHr = vm.repo.hrSamples(
+            "my-whoop",
+            window.fromEpochSecond,
+            window.toEpochSecondInclusive,
+            limit = 200_000,
+        )
+        if (dayHr.isEmpty()) continue   // unworn day — no floor to learn, skip the R-R read
+        val dayRr = vm.repo.rrIntervals(
+            "my-whoop",
+            window.fromEpochSecond,
+            window.toEpochSecondInclusive,
+            limit = 200_000,
+        )
+        days.add(
+            DaytimeBaselines.DaytimeDayStreams(
+                hr = dayHr,
+                rr = dayRr,
+                tzOffsetSeconds = window.offsetSeconds.toLong(),
+            ),
+        )
+    }
+    return DaytimeBaselines.scoringMode(days)
 }
 
 // MARK: - Loaded content
@@ -247,7 +307,6 @@ private fun androidx.compose.foundation.lazy.LazyListScope.StressContent(
 // translucent near-black (mock rgba(13,14,20,.80)) so it floats over the day-of-sky; the vessel + white
 // count-up number read crisp on it. Radius 26 + a white@0.11 hairline give the frosted-glass edge. Same
 // numbers as the Today pilot's hero card.
-private val LIQUID_HERO_FILL: Color = Color(red = 13f / 255f, green = 14f / 255f, blue = 20f / 255f, alpha = 0.80f)
 private val LIQUID_HERO_RADIUS = 26.dp
 
 // MARK: - 1 · Hero — the liquid stress VESSEL (the flat PipBar is gone)
@@ -268,8 +327,8 @@ private fun StressHeroCard(model: StressModel, modifier: Modifier = Modifier) {
         modifier = modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(LIQUID_HERO_RADIUS))
-            .background(LIQUID_HERO_FILL.copy(alpha = LIQUID_HERO_FILL.alpha * CardAppearance.opacity))
-            .border(1.dp, Color.White.copy(alpha = 0.11f * CardAppearance.opacity), RoundedCornerShape(LIQUID_HERO_RADIUS))
+            .background(Palette.heroFill.copy(alpha = Palette.heroFill.alpha * CardAppearance.opacity))
+            .border(1.dp, Palette.heroBorder.copy(alpha = Palette.heroBorder.alpha * CardAppearance.opacity), RoundedCornerShape(LIQUID_HERO_RADIUS))
             .padding(Metrics.cardPadding),
     ) {
         Column(

@@ -65,9 +65,46 @@ interface WhoopDao : DeviceRegistryDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertSleepState(rows: List<SleepStateSampleEntity>): List<Long>
 
-    /** Upsert one Live Session (v22). Natural key (deviceId, startTs) — start (endTs null) then end. */
-    @Upsert
-    suspend fun upsertLiveSession(row: LiveSessionRow)
+    /** Upsert one Live Session (v22). Natural key (deviceId, startTs) — start (endTs null) then end.
+     *  The `WHERE excluded.endTs IS NOT NULL OR liveSession.endTs IS NULL` guard makes a start-write
+     *  refuse to overwrite an already-ended row: start/end persist as independent, unordered coroutines,
+     *  so a late start-write would otherwise clobber the final row back to "in progress" and lose the
+     *  totals. Ordering-independent. Byte-parity with the Swift LiveSessionStore upsert. (@bhelm) */
+    @Query(
+        """
+        INSERT INTO liveSession
+            (deviceId, startTs, endTs, chargeAtStart, floorBpm, ceilingBpm,
+             inBandSec, belowSec, aboveSec, pushCount, easeCount, hrSource)
+        VALUES (:deviceId, :startTs, :endTs, :chargeAtStart, :floorBpm, :ceilingBpm,
+                :inBandSec, :belowSec, :aboveSec, :pushCount, :easeCount, :hrSource)
+        ON CONFLICT(deviceId, startTs) DO UPDATE SET
+            endTs = excluded.endTs,
+            chargeAtStart = excluded.chargeAtStart,
+            floorBpm = excluded.floorBpm,
+            ceilingBpm = excluded.ceilingBpm,
+            inBandSec = excluded.inBandSec,
+            belowSec = excluded.belowSec,
+            aboveSec = excluded.aboveSec,
+            pushCount = excluded.pushCount,
+            easeCount = excluded.easeCount,
+            hrSource = excluded.hrSource
+        WHERE excluded.endTs IS NOT NULL OR liveSession.endTs IS NULL
+        """
+    )
+    suspend fun upsertLiveSession(
+        deviceId: String,
+        startTs: Long,
+        endTs: Long?,
+        chargeAtStart: Double?,
+        floorBpm: Double,
+        ceilingBpm: Double,
+        inBandSec: Double,
+        belowSec: Double,
+        aboveSec: Double,
+        pushCount: Int,
+        easeCount: Int,
+        hrSource: String,
+    )
 
     /** Most-recent Live Sessions first, for the look-back summary + streak. */
     @Query("SELECT * FROM liveSession WHERE deviceId = :deviceId ORDER BY startTs DESC LIMIT :limit")
@@ -117,7 +154,9 @@ interface WhoopDao : DeviceRegistryDao {
     )
     suspend fun pruneRawImu(deviceId: String, keep: Int)
 
-    /** RAW 5/MG IMU buffers in [from, to] (ascending), packed i16 BLOB. (#423) */
+    /** RAW 5/MG IMU buffers in [from, to] (ascending), packed i16 BLOB. (#423)
+     *  Intentionally dormant — zero callers, retained for the eventual cross-check (see [RawImuSampleEntity]
+     *  CONSUMER STATUS, #978). Not dead code; do not delete. */
     @Query(
         "SELECT * FROM rawImuSample WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
             "ORDER BY ts ASC LIMIT :limit"
@@ -229,9 +268,18 @@ interface WhoopDao : DeviceRegistryDao {
         metricPoints: List<MetricSeriesRow>,
         provenance: List<ScoreInputProvenanceRow>,
     ) {
+        // #1196: a scoring pass that produced NO computed daily rows must NOT wipe the persisted window.
+        // That happens transiently during a reconnect+offload storm (a pass runs over a still-incomplete
+        // raw store, or the active strap momentarily resolves to an empty id) — the old unconditional
+        // whole-window delete then blanked recovery/strain/streak history until the next pass repopulated
+        // it, and the reactive Trends/streak Flows surfaced that as a "0 days / lost streak" scare that
+        // looked like data loss. In steady state `dailyMetrics` covers the window, so this guard never
+        // fires and the write is byte-identical to before. (Twin of the Swift IntelligenceEngine
+        // empty-window guard; the post-offload trigger is additionally gated on newData — see #1146.)
+        if (dailyMetrics.isEmpty()) return
         deleteDailyMetricsInRange(deviceId, from, to)
         deleteScoreInputProvenanceInRange(deviceId, from, to)
-        if (dailyMetrics.isNotEmpty()) upsertDailyMetrics(dailyMetrics)
+        upsertDailyMetrics(dailyMetrics)
         if (metricPoints.isNotEmpty()) upsertMetricSeries(metricPoints)
         if (provenance.isNotEmpty()) upsertScoreInputProvenance(provenance)
     }
@@ -363,7 +411,33 @@ interface WhoopDao : DeviceRegistryDao {
         // Byte-parity twin of Swift Reads.swift rrIntervals; both are SQLite, so NULL ordering matches.
         // Note this no longer matches the PK index (ts, rrMs, seq), so SQLite sorts; see the PR for why
         // that is acceptable at this query's size rather than adding a covering index.
+        //
+        // #1071: ONE optical channel. An Oura ring measures the same heartbeats on more than one tag and
+        // all of them are stored, so an unfiltered read returned roughly TWO complete copies of a night —
+        // 2.06x the beats the measured HR curve allows. That leaves meanNN (and resting HR) correct and
+        // destroys every statistic built on successive differences: RMSSD, and a ~200 ms nocturnal SDNN
+        // where a healthy adult asleep is 40-100 ms.
+        //
+        // The predicate EXCLUDES the one channel proven redundant (SPO2_IBI, 0x6E) rather than
+        // whitelisting the one preferred (GREEN_QUALITY, 0x80), which matters for what it does NOT drop:
+        //   - NULL is kept. Every WHOOP row is NULL by construction (one beat source), as is every row
+        //     written before v26. A whitelist would delete every WHOOP night from scoring.
+        //   - IBI_AMPLITUDE (0x60/0x44) is kept. It does not fire on the Gen-3 hardware this was measured
+        //     on, so there is no evidence it duplicates green — and dropping a ring's ONLY beat source on
+        //     an untested assumption is the more expensive mistake. If a capture ever shows 0x60 and 0x80
+        //     firing together, that is a second exclusion here, decided on that evidence.
+        // 0x6E is the one excluded because it is the demonstrated duplicate AND the worse measurement of
+        // the two: quantised to an 8 ms grid, no quality gate, and running only while an SpO2 measurement
+        // is on — so scoring off it would make HRV coverage a function of the SpO2 duty cycle.
+        //
+        // Rows are FILTERED, never deleted: the 0x6E stream stays on disk as the cross-check on green.
+        // Every R-R consumer reads through this one query, so the `hrv diag` trace moves with the scores
+        // rather than reporting a coverage nobody can reproduce. The literal 2 is RrSourceChannel.SPO2_IBI
+        // .code — a Room @Query is a compile-time constant string and cannot reference it; RrChannelTest
+        // pins the two together.
         "SELECT * FROM rrInterval WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
+            "AND (srcChannel IS NULL OR srcChannel <> 2) " +
+            "AND (tsSuspect IS NULL OR tsSuspect <> 1) " +   // #1073: exclude future-stamped beats
             "ORDER BY ts ASC, ord ASC, rrMs ASC, seq ASC LIMIT :limit"
     )
     suspend fun rrIntervals(deviceId: String, from: Long, to: Long, limit: Int): List<RrInterval>
@@ -557,6 +631,10 @@ interface WhoopDao : DeviceRegistryDao {
     @Query("DELETE FROM metricSeries WHERE deviceId = :deviceId AND day = :day AND key = :key")
     suspend fun deleteMetricSeriesPoint(deviceId: String, day: String, key: String)
 
+    /** Delete one complete source/key series atomically. */
+    @Query("DELETE FROM metricSeries WHERE deviceId = :deviceId AND key = :key")
+    suspend fun deleteMetricSeries(deviceId: String, key: String)
+
     // MARK: - Lab Book markers (Swift labMarker, v17 / LabMarkerStore.swift)
     //
     // The book is `labMarker` (one row per dated reading the user entered themselves); the daily
@@ -717,6 +795,19 @@ interface WhoopDao : DeviceRegistryDao {
     suspend fun workoutsCount(deviceId: String, from: Long, to: Long): Int
 
     /**
+     * #1058: sum per-session `steps` over one source's workouts whose startTs is in [from, to). Used to
+     * recompute an activity-file day's step total from ALL its sessions, so a second file on the same day
+     * ADDS rather than clobbers — and re-importing a file is idempotent (its row's steps are replaced, not
+     * re-added, by [upsertWorkouts]). Returns 0 when no session in the range carried steps. Byte-parity
+     * with Swift WhoopStore `sumWorkoutSteps`.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(steps), 0) FROM workout " +
+            "WHERE deviceId = :deviceId AND steps IS NOT NULL AND startTs >= :from AND startTs < :to"
+    )
+    suspend fun sumWorkoutSteps(deviceId: String, from: Long, to: Long): Int
+
+    /**
      * Apple-Health daily aggregates for days in [from, to] (lexicographic compare), oldest first.
      * Port of JournalWorkoutAppleCache.swift appleDaily(deviceId:from:to:).
      */
@@ -804,12 +895,27 @@ interface WhoopDao : DeviceRegistryDao {
     // #836: max raw-HR timestamp across all devices. Paired with countHr() as a cheap whole-history change
     // fingerprint so the 15-min idle rescore can skip when nothing new has landed (COALESCE → 0 when empty).
     @Query("SELECT COALESCE(MAX(ts), 0) FROM hrSample") suspend fun maxHrTs(): Long
+    // #1005: per-day (device + window) HR fingerprint — row count + newest ts — for analyzeRecent's per-day
+    // reuse cache. Cheap COUNT/MAX aggregate over the (deviceId, ts) index, never a row fetch; mirrors Swift
+    // WhoopStore.hrFingerprint(deviceId:from:to:). COALESCE(MAX) → 0 for an empty window.
+    @Query("SELECT COUNT(*) FROM hrSample WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to")
+    suspend fun countHrInWindow(deviceId: String, from: Long, to: Long): Int
+    @Query("SELECT COALESCE(MAX(ts), 0) FROM hrSample WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to")
+    suspend fun maxHrTsInWindow(deviceId: String, from: Long, to: Long): Long
     @Query("SELECT COUNT(*) FROM rrInterval") suspend fun countRr(): Int
     @Query("SELECT COUNT(*) FROM event") suspend fun countEvents(): Int
     @Query("SELECT COUNT(*) FROM battery") suspend fun countBattery(): Int
     @Query("SELECT COUNT(*) FROM spo2Sample") suspend fun countSpo2(): Int
     @Query("SELECT COUNT(*) FROM skinTempSample") suspend fun countSkinTemp(): Int
     @Query("SELECT COUNT(*) FROM stepSample") suspend fun countSteps(): Int
+    // The remaining accumulating decoded raw streams, so the Test-Centre footprint counts ALL of them
+    // (keep in sync with Swift storageStats / TimestampHeal's raw-table list). ppgHrSample (#156 v26
+    // PPG-derived HR), ppgWaveformSample (raw v26 optical waveform) and rawImuSample can each bank a lot.
+    @Query("SELECT COUNT(*) FROM ppgHrSample") suspend fun countPpgHr(): Int
+    @Query("SELECT COUNT(*) FROM sleepStateSample") suspend fun countSleepState(): Int
+    @Query("SELECT COUNT(*) FROM ppgWaveformSample") suspend fun countPpgWaveform(): Int
+    @Query("SELECT COUNT(*) FROM rawImuSample") suspend fun countRawImu(): Int
+    @Query("SELECT COUNT(*) FROM v18AuxSample") suspend fun countV18Aux(): Int
     @Query("SELECT COUNT(*) FROM respSample") suspend fun countResp(): Int
     @Query("SELECT COUNT(*) FROM gravitySample") suspend fun countGravity(): Int
 
@@ -863,7 +969,8 @@ interface WhoopDao : DeviceRegistryDao {
     // bad-clock strap's garbage-ts rows survived in them while every sibling stream above was cleaned.
     // They are keyed by the SAME `ts` from the SAME type-47 ingest path, so there is no reason to exempt
     // them. Legacy-rows only in practice (the #547 ingest gate now rejects an implausible ts before it is
-    // banked), which is why it went unnoticed. Swift twin: TimestampHeal.rawTables.
+    // banked), which is why it went unnoticed. Keep this list synchronized with the `rawTables` local in
+    // Swift `WhoopStore.healImplausibleTimestamps`.
     @Query("DELETE FROM sleepStateSample WHERE ts < :minTs OR ts > :maxTs")
     suspend fun pruneSleepStateByTs(minTs: Long, maxTs: Long): Int
 

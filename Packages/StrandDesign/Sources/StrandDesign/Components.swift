@@ -6,11 +6,11 @@ import SwiftUI
 // the uniform, instrument-grade look from the reference. Do not invent ad-hoc cards.
 
 public enum NoopMetrics {
-    public static let cardRadius: CGFloat = 22   // Apple x WHOOP rounded cards — matches the liquid home card (LiquidTodayView.card)   // Apple x WHOOP: rounded cards
-    public static let cardPadding: CGFloat = 16  // Apple x WHOOP: roomier card interior
-    public static let gap: CGFloat = 12          // gap between cards
-    public static let sectionGap: CGFloat = 22   // Apple x WHOOP: breathing room (not cramped)
-    public static let screenPadding: CGFloat = 18
+    public static let cardRadius: CGFloat = NoopVisualStyle.cardRadius
+    public static let cardPadding: CGFloat = NoopVisualStyle.cardPadding
+    public static let gap: CGFloat = NoopVisualStyle.itemGap
+    public static let sectionGap: CGFloat = NoopVisualStyle.sectionGap
+    public static let screenPadding: CGFloat = NoopVisualStyle.pagePadding
     public static let tileHeight: CGFloat = 96   // Design Reset: tighter metric tile
     // Key Metrics grid: one fixed height every tile snaps to, so a sparkline-and-caption tile and a
     // plain value tile read the same. maxHeight: .infinity can't equalise them inside a LazyVGrid (the
@@ -18,10 +18,36 @@ public enum NoopMetrics {
     // so we pin a single height that clears the tallest layout (value + inline sparkline + caption).
     public static let keyMetricTileHeight: CGFloat = 122
     public static let chartHeight: CGFloat = 220
+    /// Minimum macOS detail-sheet footprint for a scrollable editor/history surface.
+    public static let detailSheetMinWidth: CGFloat = 520
+    public static let detailSheetMinHeight: CGFloat = 620
     /// Canonical compact provenance-chip height; shared with overlays that align the chip to a border.
     public static let sourceBadgeHeight: CGFloat = 18
     public static let hypnogramBandMinThickness: CGFloat = 14  // floor so short stages read as bars, not ticks
     public static let tabBarClearance: CGFloat = 76  // iOS: extra bottom scroll room so the last card clears the floating tab bar
+    /// Canonical diameter for compact circular controls in dense header chrome.
+    public static let compactControlSize: CGFloat = 36
+    /// Expanded width of the compact charge-to-sync status capsule.
+    public static let syncIndicatorExpandedWidth: CGFloat = 108
+    /// Optical space between the sync ring and its transient label.
+    public static let syncIndicatorLabelSpacing: CGFloat = 5
+    /// Smallest readable scale for long localized labels inside the sync capsule.
+    public static let syncIndicatorMinimumLabelScale: CGFloat = 0.72
+    /// Even inset around the sync control before applying exact-bounds Liquid Glass, matching the inset
+    /// the system's `.small` glass chrome gives the sibling header circles. Equal on both axes so the
+    /// compact state stays circular.
+    public static let syncIndicatorGlassPadding: CGFloat = 5
+    /// Inset for the indicator's ring in BOTH states — the battery arc and the sync spinner share one
+    /// radius, so the morph changes colour and sweep without the circle also resizing. Two different
+    /// radii read as two different controls swapping places rather than one control changing state.
+    public static let syncIndicatorArcInset: CGFloat = 2.5
+    /// Width of the soft fade where long header text passes beneath trailing controls.
+    public static let headerTextFadeWidth: CGFloat = 48
+    /// Starting guess for the trailing footprint a header control row occupies, used ONLY until the host
+    /// has measured its own cluster (see `headerTrailingControlFadeMask(reserving:)`). Four compact
+    /// controls plus their gaps and the sync control's glass inset — deliberately not a fixed budget,
+    /// because a cluster that gains a control must not silently start mis-fading the title beside it.
+    public static let headerControlReserveWidth: CGFloat = 168
 
     // MARK: Standardised spacing scale (the ONE source of truth for margins)
     //
@@ -29,6 +55,8 @@ public enum NoopMetrics {
     // inset and margin lines up to the same grid. Note `cardPadding` (16) above is
     // the same value as `space4` — kept as a named alias for the existing call sites.
     public static let space1:  CGFloat = 4
+    /// Optical separation for paired labels; structural layout still follows the 4-point ramp.
+    public static let spaceHalf: CGFloat = 2
     public static let space2:  CGFloat = 8
     public static let space3:  CGFloat = 12
     public static let space4:  CGFloat = 16
@@ -39,9 +67,9 @@ public enum NoopMetrics {
 
     // MARK: Named layout constants — the canonical margins/heights screens compose with.
     /// Horizontal page margin (the gutter on the left/right edge of a screen). Use via `.screenPadding()`.
-    public static let screenHPadding: CGFloat = 20
+    public static let screenHPadding: CGFloat = NoopVisualStyle.pagePadding
     /// Vertical gap between top-level page sections.
-    public static let sectionSpacing: CGFloat = 24
+    public static let sectionSpacing: CGFloat = NoopVisualStyle.sectionGap
     /// Interior padding inside a card's content (matches `cardPadding`).
     public static let cardInnerPadding: CGFloat = 16
     /// Vertical gap between stacked elements INSIDE a card.
@@ -50,8 +78,19 @@ public enum NoopMetrics {
     public static let rowSpacing: CGFloat = 10
     /// Standard interactive-control height (buttons, fields, segmented controls).
     public static let controlHeight: CGFloat = 48
+    /// Standard one-pixel edge used by cards and compact controls.
+    public static let hairlineWidth: CGFloat = 1
+    /// Profile form dimensions shared by avatar and numeric controls.
+    public static let profileAvatarDiameter: CGFloat = 44
+    public static let formValueColumnWidth: CGFloat = 48
+    public static let formWideValueColumnWidth: CGFloat = 64
+    /// Compact metadata and explanatory-footer heights.
+    public static let compactMetadataMinHeight: CGFloat = 24
+    public static let compactHintMinHeight: CGFloat = 18
+    /// Canonical thickness for compact horizontal indicator tracks.
+    public static let indicatorTrackHeight: CGFloat = 8
     /// Fully-rounded corner radius — pills, chips, capsule buttons.
-    public static let pillRadius: CGFloat = 999
+    public static let pillRadius: CGFloat = NoopVisualStyle.pillRadius
     /// Minimum desktop size for a navigation-based customization sheet.
     public static let editorSheetMinWidth: CGFloat = 440
     public static let editorSheetMinHeight: CGFloat = 600
@@ -377,26 +416,32 @@ public struct SegmentedPillControl<T: Hashable>: View {
     /// option exists) but renders extra-dim and ignores taps; VoiceOver announces it dimmed.
     /// Defaults to everything enabled; ADDED additively, no existing call site touched.
     let isEnabled: (T) -> Bool
+    let fillsAvailableWidth: Bool
     @Binding var selection: T
-    @Environment(\.colorScheme) private var scheme
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     public init(_ items: [T], selection: Binding<T>, adaptsToAvailableWidth: Bool = false,
+                fillsAvailableWidth: Bool = false,
                 label: @escaping (T) -> String) {
         self.init(items, selection: selection, adaptsToAvailableWidth: adaptsToAvailableWidth,
+                  fillsAvailableWidth: fillsAvailableWidth,
                   isEnabled: { _ in true }, label: label)
     }
     public init(_ items: [T], selection: Binding<T>, adaptsToAvailableWidth: Bool = false,
+                fillsAvailableWidth: Bool = false,
                 isEnabled: @escaping (T) -> Bool,
                 label: @escaping (T) -> String) {
         self.items = items
         self._selection = selection
         self.adaptsToAvailableWidth = adaptsToAvailableWidth
+        self.fillsAvailableWidth = fillsAvailableWidth
         self.isEnabled = isEnabled
         self.label = label
     }
     @ViewBuilder
     public var body: some View {
-        if adaptsToAvailableWidth {
+        if fillsAvailableWidth {
+            track(equalWidth: true)
+        } else if adaptsToAvailableWidth {
             if dynamicTypeSize > .large {
                 ScrollView(.horizontal, showsIndicators: false) {
                     track(equalWidth: false)
@@ -426,11 +471,10 @@ public struct SegmentedPillControl<T: Hashable>: View {
                     Text(label(item))
                         .font(StrandFont.captionNumber)
                         .lineLimit(equalWidth ? 1 : nil)
-                        // Active segment is SELECTION CHROME, so it follows the accent: on dark a
-                        // gold-gradient pill with gold-deep ink; on light a flat blue accent pill with
-                        // white ink (so the light theme's selection matches its blue chrome, not gold).
+                        // Range selection stays deliberately neutral so the control works above charts
+                        // from every metric colour world without borrowing their green/blue/amber tint.
                         // Disabled segments drop to a fainter tertiary so the lock reads at a glance.
-                        .foregroundStyle(sel ? (scheme == .light ? Color.white : StrandPalette.textPrimary)
+                        .foregroundStyle(sel ? StrandPalette.textPrimary
                                              : StrandPalette.textTertiary.opacity(enabled ? 1 : 0.35))
                         // Fill the segment height so the selected pill has EQUAL margins to the track
                         // on every side. (The old compact pill inside a taller 44pt touch frame left
@@ -439,16 +483,27 @@ public struct SegmentedPillControl<T: Hashable>: View {
                                maxWidth: equalWidth ? .infinity : nil,
                                maxHeight: .infinity)
                         .padding(.horizontal, equalWidth ? NoopMetrics.space1 : 9)
-                        .background(
-                            // WHOOP selection chrome: a flat LIGHTER-grey pill on dark (white ink), a flat
-                            // blue accent pill on light — no gold, no gradient.
-                            Capsule(style: .continuous)
-                                .fill(sel ? (scheme == .light
-                                             ? AnyShapeStyle(StrandPalette.accent)
-                                             : AnyShapeStyle(Color(hex: "#363B41")))
-                                          : AnyShapeStyle(Color.clear))
-                        )
-                        .contentShape(Capsule(style: .continuous))
+                        .background {
+                            if sel {
+                                let selectedShape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                selectedShape
+                                    .fill(
+                                        LinearGradient(
+                                            colors: [NoopVisualStyle.surfaceTop, NoopVisualStyle.surface],
+                                            startPoint: .top,
+                                            endPoint: .bottom
+                                        )
+                                    )
+                                    .overlay(
+                                        selectedShape.strokeBorder(
+                                            NoopVisualStyle.borderHighlight.opacity(0.62),
+                                            lineWidth: 0.75
+                                        )
+                                    )
+                                    .shadow(color: .black.opacity(0.20), radius: 4, x: 0, y: 2)
+                            }
+                        }
+                        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .frame(maxWidth: equalWidth ? .infinity : nil)
@@ -460,8 +515,27 @@ public struct SegmentedPillControl<T: Hashable>: View {
         }
         .padding(3)
         .frame(maxWidth: equalWidth ? .infinity : nil)
-        .background(StrandPalette.surfaceInset, in: Capsule(style: .continuous))
-        .overlay(Capsule(style: .continuous).strokeBorder(StrandPalette.hairline, lineWidth: 1))
+        .background {
+            let trackShape = RoundedRectangle(cornerRadius: 13, style: .continuous)
+            trackShape
+                .fill(
+                    LinearGradient(
+                        colors: [NoopVisualStyle.inset, NoopVisualStyle.canvas.opacity(0.78)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .overlay(
+                    trackShape.strokeBorder(
+                        LinearGradient(
+                            colors: [NoopVisualStyle.borderHighlight.opacity(0.48), NoopVisualStyle.border],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 0.8
+                    )
+                )
+        }
     }
 }
 

@@ -140,7 +140,7 @@ func describe(_ e: OuraEvent) -> String {
     switch e {
     case .hr(let v): return "HR bpm=\(v.bpm) ibi=\(v.ibiMs)ms rt=\(v.ringTimestamp)"
     case .ibi(let v): return "IBI \(v.ibiMs)ms amp=\(v.amplitude.map(String.init) ?? "-") rt=\(v.ringTimestamp)"
-    case .hrv(let v): return "HRV t=\(v.timeMs) b1=\(v.b1) b2=\(v.b2) rt=\(v.ringTimestamp)"
+    case .hrv(let v): return "HRV idx=\(v.index) hr=\(v.hrBpm)bpm rmssd=\(v.rmssdMs)ms rt=\(v.ringTimestamp)"
     case .spo2(let v): return "SPO2 \(v.value) (\(v.unit)) rt=\(v.ringTimestamp)"
     case .temp(let v): return "TEMP \(v.celsius)C rt=\(v.ringTimestamp)"
     case .battery(let v): return "BATTERY \(v.percent)% mv=\(v.voltageMv.map(String.init) ?? "-")"
@@ -153,6 +153,8 @@ func describe(_ e: OuraEvent) -> String {
     case .debugText(_, let t): return "DEBUG \(t)"
     case .tierB(let v): return "TIER_B[UNVERIFIED] tag=0x\(String(v.tag, radix: 16)) kind=\(v.kind) bytes=\(v.rawPayload.count)"
     case .activityInfo(let v): return "ACTIVITY[TIER-B,UNVERIFIED] state=\(v.state) met=\(v.met) rt=\(v.ringTimestamp)"
+    case .realStepsFields(let v): return "REAL_STEPS[TIER-B,UNVERIFIED] tag=0x\(String(v.tag, radix: 16)) fields=\(v.fields) rt=\(v.ringTimestamp)"
+    case .sleepPeriodInfo(let v): return "SLEEP_PERIOD[TIER-B,UNVERIFIED] hr=\(v.averageHrBpm) trend=\(v.hrTrend) breath=\(v.breathsPerMin) breathV=\(v.breathVariability) mzci=\(v.mzci) dzci=\(v.dzci) motion=\(v.motionCount) state=\(v.sleepState) cv=\(v.cv) rt=\(v.ringTimestamp)"
     }
 }
 

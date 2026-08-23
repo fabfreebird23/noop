@@ -29,6 +29,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.noop.R
 import com.noop.analytics.HrvAnalyzer
+import com.noop.data.OuraRespScale
 import com.noop.protocol.DeviceFamily
 import com.noop.protocol.skinTempCelsius
 import kotlinx.coroutines.Dispatchers
@@ -107,9 +108,12 @@ fun FullDayChartScreen(vm: AppViewModel, onBack: () -> Unit) {
     var everSpo2 by remember { mutableStateOf(true) }
     var everResp by remember { mutableStateOf(true) }
     LaunchedEffect(deviceId) {
-        val model = runCatching { vm.pairedDevices() }.getOrDefault(emptyList())
-            .firstOrNull { it.id == deviceId }?.model
-        val whoop5 = DeviceFamily.forRegistryModel(model) == DeviceFamily.WHOOP5
+        val d = runCatching { vm.pairedDevices() }.getOrDefault(emptyList())
+            .firstOrNull { it.id == deviceId }
+        // A positive "is it a 5/MG", never a coalesced one (#1086): the respiration copy tells the reader
+        // their estimate is on the Health screen, which is true for a WHOOP 5 (the R-R RSA estimate runs)
+        // and false for a non-WHOOP device whose banked stream that estimate refuses.
+        val whoop5 = DeviceFamily.isWhoop5Registry(d?.model, d?.brand)
         isWhoop5 = whoop5
         val now = System.currentTimeMillis() / 1000
         everSpo2 = !whoop5 || runCatching { vm.repo.spo2Samples(deviceId, 0, now, 1) }.getOrDefault(emptyList()).isNotEmpty()
@@ -397,17 +401,23 @@ private suspend fun readTimeline(
                 .mapNotNull { if (it.ir > 0) TimelinePoint(it.ts, it.red.toDouble() / it.ir) else null }
         TimelineMetric.SkinTemp -> {
             // #938: family-aware raw→°C — 5/MG centidegrees (raw/100, #156), a WHOOP 4.0 v24 raw ADC map.
-            // The registry-model-label → family mapping lives in DeviceFamily.forRegistryModel (#171).
+            // The registry-model-label → family mapping lives in DeviceFamily.forRegistryDevice (#171).
+            // A non-WHOOP device (null) shares the non-4.0 scale, so coalesce to WHOOP5 — same conversion
+            // as before; brand-awareness just stops it claiming to be a WHOOP (#1086).
             // Mirrors Swift Repository.timelineRawMetric.
-            val model = runCatching { vm.pairedDevices() }.getOrDefault(emptyList())
-                .firstOrNull { it.id == deviceId }?.model
-            val family = DeviceFamily.forRegistryModel(model)
+            val d = runCatching { vm.pairedDevices() }.getOrDefault(emptyList())
+                .firstOrNull { it.id == deviceId }
+            val family = DeviceFamily.forRegistryDevice(d?.model, d?.brand) ?: DeviceFamily.WHOOP5
             runCatching { repo.skinTempSamples(deviceId, from, to, 200_000) }.getOrDefault(emptyList())
                 .map { TimelinePoint(it.ts, skinTempCelsius(it.raw, family)) }
         }
         TimelineMetric.Respiration ->
+            // Two quantities share this table: a WHOOP's raw respiration ADC waveform (plotted verbatim,
+            // as before) and an Oura ring's own per-window RATE in milli-bpm (0x6A instrumentation), which
+            // is scaled back to breaths/min so the track reads as ~14-16 instead of ~14,375.
+            // `OuraRespScale` is the single place that mapping lives. Mirrors Swift.
             runCatching { repo.respSamples(deviceId, from, to, 200_000) }.getOrDefault(emptyList())
-                .map { TimelinePoint(it.ts, it.raw.toDouble()) }
+                .map { TimelinePoint(it.ts, OuraRespScale.displayValue(it.raw, deviceId)) }
         TimelineMetric.Motion ->
             runCatching { repo.gravitySamples(deviceId, from, to, 200_000) }.getOrDefault(emptyList())
                 .map { TimelinePoint(it.ts, kotlin.math.sqrt(it.x * it.x + it.y * it.y + it.z * it.z)) }

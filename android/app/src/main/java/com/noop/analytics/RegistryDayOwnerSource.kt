@@ -50,10 +50,30 @@ class RegistryDayOwnerSource(private val registry: DeviceRegistry) : Intelligenc
     override suspend fun activeWriteId(): String? = registry.activeDeviceId()
 
     // #938: resolve the strap family that wrote [deviceId]'s rows from its registry model. The model-label
-    // → family mapping (and the WHOOP5 fallback for unknowns) lives in DeviceFamily.forRegistryModel (#171).
+    // → family mapping (and the WHOOP5 fallback for unknowns) lives in DeviceFamily.forRegistryDevice (#171, #1086).
     // Mirrors the Swift IntelligenceEngine.skinTempFamily(forOwner:devices:).
     override suspend fun skinTempFamily(deviceId: String): DeviceFamily {
-        val model = registry.all().firstOrNull { it.id == deviceId }?.model
-        return DeviceFamily.forRegistryModel(model)
+        val d = registry.all().firstOrNull { it.id == deviceId }
+        // Non-WHOOP device (null) shares the non-4.0 temp scale, so coalesce to WHOOP5 — same conversion
+        // as before; brand-awareness just stops it claiming to be a WHOOP (#1086).
+        return DeviceFamily.forRegistryDevice(d?.model, d?.brand) ?: DeviceFamily.WHOOP5
+    }
+
+    // #1005: the UN-coalesced registered WHOOP family (null for a non-WHOOP owner), for the reuse-cache
+    // eligibility gate. Same registry lookup as skinTempFamily but WITHOUT the WHOOP5 fallback, so a ring /
+    // import / unknown owner resolves to null and is never cached. Mirrors the Swift reuse gate's inline
+    // DeviceFamily.forRegistryDevice(model:brand:).
+    override suspend fun registeredWhoopFamily(deviceId: String): DeviceFamily? {
+        val d = registry.all().firstOrNull { it.id == deviceId }
+        return DeviceFamily.forRegistryDevice(d?.model, d?.brand)
+    }
+
+    // #1467: the worn-gate timestamp tolerance for this owner (0 for WHOOP, byte-identical). Same
+    // registry lookup skinTempFamily uses; deliberately its own small helper rather than folding into
+    // DeviceFamily, which has no Oura case (#1086) and a tolerance-in-seconds isn't a temperature-scale
+    // concern. Mirrors the Swift IntelligenceEngine.skinTempWornToleranceSec(forOwner:devices:).
+    override suspend fun skinTempWornToleranceSec(deviceId: String): Long {
+        val d = registry.all().firstOrNull { it.id == deviceId }
+        return if (d?.brand == "Oura") AnalyticsEngine.DEFAULT_OURA_WORN_TOLERANCE_SEC else 0
     }
 }

@@ -46,6 +46,9 @@ object DataBackup {
 
     /** Entry name of the optional whitelisted-settings JSON (#1000). Matches the Apple exporter. */
     private const val SETTINGS_ENTRY_NAME = BackupSettingsCodec.ENTRY_NAME
+    // #1410: a `manifest.json` entry recording which build produced this file (read only to classify, never
+    // restored). Written LAST so older importers that stop at the first .sqlite entry are unaffected.
+    private const val MANIFEST_ENTRY_NAME = BackupManifest.ENTRY_NAME
 
     private const val MAX_BACKUP_SQLITE_BYTES = 2_147_483_648L
     private const val MAX_BACKUP_SETTINGS_BYTES = 1_048_576L
@@ -56,6 +59,36 @@ object DataBackup {
             0x53, 0x51, 0x4C, 0x69, 0x74, 0x65, 0x20, 0x66,
             0x6F, 0x72, 0x6D, 0x61, 0x74, 0x20, 0x33, 0x00,
         )
+
+    /**
+     * #1014 (write-side): cheaply confirm a JUST-WRITTEN `.noopbak` at [uri] is structurally intact — its
+     * DB entry is present and begins with the SQLite magic header. A torn write (truncated ZIP / a
+     * half-flushed SAF document on a full disk or flaky provider) otherwise leaves a `.noopbak` that
+     * silently "restores" into an empty store, caught only by the import-side quick_check much later. Fail
+     * HERE at write time instead. Twin of the Apple post-write check in `writeVerifiedBackupZip`.
+     * Best-effort: any read/format error returns false (treated as not-intact).
+     */
+    fun isWrittenBackupIntact(context: Context, uri: Uri): Boolean = runCatching {
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            ZipInputStream(stream).use { zip ->
+                var entry = zip.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory && entry.name.substringAfterLast('/') == ZIP_ENTRY_NAME) {
+                        val header = ByteArray(SQLITE_MAGIC.size)
+                        var got = 0
+                        while (got < header.size) {
+                            val r = zip.read(header, got, header.size - got)
+                            if (r < 0) break
+                            got += r
+                        }
+                        return@runCatching got == header.size && header.contentEquals(SQLITE_MAGIC)
+                    }
+                    entry = zip.nextEntry
+                }
+                false
+            }
+        } ?: false
+    }.getOrDefault(false)
 
     /** First 4 bytes of every ZIP file: "PK\x03\x04". */
     private val ZIP_MAGIC: ByteArray =
@@ -110,6 +143,14 @@ object DataBackup {
         // legacy single-entry ZIP. The DB entry stays FIRST — older importers stop at the first
         // `.sqlite` entry, so entry order is part of the cross-platform container contract.
         val settingsJson = BackupSettingsBridge.snapshotJson(appContext)
+        // #1410: build provenance for this export — which build wrote the file.
+        val manifestJson = BackupManifest.json(
+            appVersion = com.noop.BuildConfig.VERSION_NAME,
+            appBuild = com.noop.BuildConfig.VERSION_CODE.toString(),
+            platform = "android",
+            schemaVersion = WhoopDatabase.SCHEMA_VERSION,
+            exportedAtMs = System.currentTimeMillis(),
+        )
 
         val resolver = appContext.contentResolver
         val output = resolver.openOutputStream(uri)
@@ -132,6 +173,9 @@ object DataBackup {
                         zip.write(settingsJson.toByteArray(Charsets.UTF_8))
                         zip.closeEntry()
                     }
+                    zip.putNextEntry(ZipEntry(MANIFEST_ENTRY_NAME))
+                    zip.write(manifestJson.toByteArray(Charsets.UTF_8))
+                    zip.closeEntry()
                 }
             }
         }
@@ -170,7 +214,7 @@ object DataBackup {
         val tempSettings = File(appContext.cacheDir, "import-settings.json")
         tempSettings.delete()
         try {
-            when (val staged = stageBackupSqlite(resolver.openInputStream(uri), header, tempSqlite, tempSettings)) {
+            when (stageBackupSqlite(resolver.openInputStream(uri), header, tempSqlite, tempSettings)) {
                 StageResult.OK -> Unit
                 StageResult.CANNOT_OPEN -> return ImportResult.Failed("Could not open the chosen file.")
                 StageResult.NO_DB_IN_ZIP -> {

@@ -196,6 +196,10 @@ struct AddDeviceWizard: View {
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            #if os(iOS)
+            // #697/#horizontal-swipe parity, see ScreenScaffold.
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            #endif
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(StrandPalette.surfaceBase)
@@ -1251,7 +1255,8 @@ struct AddDeviceWizard: View {
         let device: PairedDevice
 
         if let pickedWhoop, let type, let wm = type.whoopModel {
-            // WHOOP: full capability set; id namespaced by uuid; model "4.0" / "5.0 MG".
+            // WHOOP: honest live capability set (no calibrated SpO₂ % — import-only; #548);
+            // id namespaced by uuid; model "4.0" / "5.0 MG". Steps only on 5.0/MG.
             let modelLabel = (wm == .whoop4) ? "4.0" : "5.0 MG"
             device = PairedDevice(
                 id: "whoop-\(pickedWhoop.uuid)",
@@ -1260,7 +1265,7 @@ struct AddDeviceWizard: View {
                 nickname: name,
                 peripheralId: pickedWhoop.uuid,
                 sourceKind: .liveBLE,
-                capabilities: [.hr, .hrv, .spo2, .skinTemp, .sleep, .strainLoad],
+                capabilities: WhoopLiveCapabilities.metrics(forModel: modelLabel),
                 status: .paired,
                 addedAt: now, lastSeenAt: now)
         } else if let pickedStrap {

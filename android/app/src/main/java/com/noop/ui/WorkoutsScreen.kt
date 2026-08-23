@@ -1,7 +1,11 @@
 package com.noop.ui
 
 import com.noop.R
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.Canvas
@@ -22,6 +26,20 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
+import androidx.compose.material.icons.filled.Accessible
+import androidx.compose.material.icons.filled.Hiking
+import androidx.compose.material.icons.filled.IceSkating
+import androidx.compose.material.icons.filled.Kayaking
+import androidx.compose.material.icons.filled.Sailing
+import androidx.compose.material.icons.filled.ScubaDiving
+import androidx.compose.material.icons.filled.Skateboarding
+import androidx.compose.material.icons.filled.Snowshoeing
+import androidx.compose.material.icons.filled.SportsCricket
+import androidx.compose.material.icons.filled.SportsFootball
+import androidx.compose.material.icons.filled.SportsHandball
+import androidx.compose.material.icons.filled.SportsHockey
+import androidx.compose.material.icons.filled.SportsRugby
+import androidx.compose.material.icons.filled.Surfing
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.CheckCircle
@@ -31,6 +49,8 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.automirrored.filled.MergeType
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
+import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.SportsMotorsports
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.automirrored.filled.DirectionsBike
 import androidx.compose.material.icons.automirrored.filled.DirectionsRun
@@ -88,6 +108,15 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
+import com.noop.analytics.ActivityHeatmap
+import com.noop.analytics.RouteMath
+import com.noop.ingest.RouteExport
+import kotlinx.coroutines.launch
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -135,7 +164,6 @@ fun WorkoutsScreen(vm: AppViewModel) {
     val lastHistorySyncAt by vm.lastHistorySyncAt.collectAsStateWithLifecycle()
     // Cached daily metrics — the Charge side of the post-log activity-cost note (#439).
     val recentDays by vm.recentDays.collectAsStateWithLifecycle()
-    var loaded by remember { mutableStateOf(false) }
     var range by remember { mutableStateOf(WorkoutRange.All) }
     // Pick the default range ONCE on first non-empty load; later mutations must not fight a range the
     // user chose. Mirrors macOS, which sets the default only in `.task` / first onAppear.
@@ -209,7 +237,6 @@ fun WorkoutsScreen(vm: AppViewModel) {
 
     LaunchedEffect(Unit) {
         vm.loadWorkouts()
-        loaded = true
     }
     LaunchedEffect(allRows) {
         if (!didPickDefaultRange && allRows.isNotEmpty()) {
@@ -239,19 +266,20 @@ fun WorkoutsScreen(vm: AppViewModel) {
         // into the theme canvas behind the header + top rows (bled full-width up behind the status bar via
         // the scaffold's topBackground plumbing), and the cards float OVER it on the flat surface below. The
         // Android equivalent of the iOS `ScreenScaffold(topBackground: liquidScaffoldSky())`.
-        topBackground = if (showDayCycleBackground) { { LiquidScreenSky(fillHeight = skyBehindCards) } } else null,
+        topBackground = screenBackdropSlot(showDayCycleBackground, skyBehindCards),
         // Sky-behind-cards fills the viewport so the transparent cards reveal the sky the whole way
         // down (Today / Trends / Sleep / metric-detail parity - same two prefs, same two behaviours).
-        fullBleedBackground = showDayCycleBackground && skyBehindCards,
+        fullBleedBackground = screenBackdropFullBleed(showDayCycleBackground, skyBehindCards),
     ) {
         // Start (or stop) a workout right here, not only on Live — mirrors the Live control (#115).
+        // Start + Add sit side-by-side as an action row when a strap is bonded (EXP-018 parity).
         item {
-        WorkoutStartSection(vm)
+        WorkoutStartSection(vm, onAdd = { dialog = DialogTarget(null) })
         }
 
         if (allRows.isEmpty()) {
             item {
-            EmptyWorkouts(loaded, onAdd = { dialog = DialogTarget(null) })
+            EmptyWorkouts()
             }
         } else {
             // Resolve the effective range + windowed rows + per-sport groups once. #64: the pure
@@ -269,7 +297,6 @@ fun WorkoutsScreen(vm: AppViewModel) {
                 fellBack = fellBack,
                 filterActive = filter.isActive,
                 onSelect = { range = it },
-                onAdd = { dialog = DialogTarget(null) },
             )
             }
             item {
@@ -285,6 +312,7 @@ fun WorkoutsScreen(vm: AppViewModel) {
             postLogNote?.let { item { PostLogNoteBanner(it) } }
             item { EffortHero(rows = windowRows, effectiveRange = resolved, groups = groups) }
             item { SummarySection(rows = windowRows, effectiveRange = resolved, groups = groups) }
+            item { CalorieHeatmapSection(recentDays) }
             item { BreakdownSection(groups = groups, rows = windowRows) }
             item { ZonesSection(windowRows) }
             if (recoveryTrend.isNotEmpty()) {
@@ -317,7 +345,7 @@ fun WorkoutsScreen(vm: AppViewModel) {
                     selectionMode = false; selectedKeys = emptySet()
                 },
                 onCancelSelect = { selectionMode = false; selectedKeys = emptySet() },
-                onEdit = { dialog = DialogTarget(it) },
+                onEdit = { editRow, isCopy -> dialog = DialogTarget(editRow, isCopy) },
                 onRelabel = { row, sport ->
                     vm.relabelDetected(row, sport)
                     pendingNoteSport = WorkoutEditing.displaySport(sport)
@@ -344,6 +372,7 @@ fun WorkoutsScreen(vm: AppViewModel) {
     dialog?.let { target ->
         ManualWorkoutDialog(
             editing = target.editing,
+            isCopy = target.isCopy,
             onDismiss = { dialog = null },
             onSave = { row, replacing ->
                 vm.saveManualWorkout(row, replacing)
@@ -354,8 +383,11 @@ fun WorkoutsScreen(vm: AppViewModel) {
     }
 }
 
-/** Drives the manual add/edit dialog. [editing] null = add a new workout, non-null = edit it. */
-private data class DialogTarget(val editing: WorkoutRow?)
+/** Drives the manual add/edit dialog. [editing] null = add a new workout, non-null = edit it.
+ *  [isCopy] marks "Duplicate as manual": the dialog pre-fills FROM a read-only row, but the save is a
+ *  pure ADD and must not travel on as `replacing`. Source alone cannot express this — the copy claims
+ *  "manual" precisely so the form treats it as editable. (#1488) */
+private data class DialogTarget(val editing: WorkoutRow?, val isCopy: Boolean = false)
 
 private data class WorkoutRecoveryTrendPoint(
     val startTs: Long,
@@ -365,15 +397,14 @@ private data class WorkoutRecoveryTrendPoint(
 // MARK: - Empty / loading state
 
 @Composable
-private fun EmptyWorkouts(loaded: Boolean, onAdd: () -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        DataPendingNote(
-            title = uiString(R.string.l10n_workouts_screen_no_workouts_yet_85a92042),
-            body = "No workouts yet. They come from your WHOOP and Apple Health history. " +
-                "Import in Data Sources to bring them in, or add one you tracked elsewhere.",
-        )
-        if (loaded) AddWorkoutButton(onAdd)
-    }
+private fun EmptyWorkouts() {
+    // Add lives in the action row above (WorkoutStartSection provides it in every idle state), so the
+    // empty state is just the note — no second Add button here.
+    DataPendingNote(
+        title = uiString(R.string.l10n_workouts_screen_no_workouts_yet_85a92042),
+        body = "No workouts yet. They come from your WHOOP and Apple Health history. " +
+            "Import in Data Sources to bring them in, or add one you tracked elsewhere.",
+    )
 }
 
 /**
@@ -408,13 +439,14 @@ private fun PostLogNoteBanner(text: String) {
 /** The "Add workout" pill — opens the manual add dialog. Shown on both the populated screen
  *  (in the range bar) and the empty state, so a user with no imports can still log a session. */
 @Composable
-private fun AddWorkoutButton(onAdd: () -> Unit) {
+internal fun AddWorkoutButton(onAdd: () -> Unit, modifier: Modifier = Modifier) {
     Row(
-        modifier = Modifier
+        modifier = modifier
             .clip(RoundedCornerShape(50))
             .background(Palette.accentMuted)
             .clickable(onClick = onAdd)
-            .padding(horizontal = 14.dp, vertical = 8.dp),
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(Icons.Filled.Add, contentDescription = null, tint = Palette.accent, modifier = Modifier.size(16.dp))
@@ -433,12 +465,10 @@ private fun RangeBar(
     fellBack: Boolean,
     filterActive: Boolean,
     onSelect: (WorkoutRange) -> Unit,
-    onAdd: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        // Phone width can't fit the labelled Add button beside the 5-segment range pill without
-        // crushing/clipping one — stack them (button, then pill), matching the iPhone fix (#234/#339).
-        AddWorkoutButton(onAdd)
+        // Add moved up beside Start in WorkoutStartSection (glanceable action row), so the range pill
+        // now owns this row alone — no more Add-vs-5-segment-pill width fight (#234/#339).
         SegmentedPillControl(
             items = WorkoutRange.entries,
             selection = range,
@@ -531,21 +561,10 @@ private fun FilterBar(
                     )
                 }
             }
-            if (filter.isActive) {
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .clickable(onClick = onClear)
-                        .padding(horizontal = 8.dp, vertical = 6.dp)
-                        .semantics { contentDescription = uiString(R.string.l10n_workouts_screen_clear_filters_41222671) },
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(Icons.Filled.Close, contentDescription = null, tint = Palette.textSecondary, modifier = Modifier.size(14.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text(uiString(R.string.l10n_workouts_screen_clear_719ea396), style = NoopType.footnote, color = Palette.textSecondary)
-                }
-            }
         }
+        // Search row: the field with the Clear-filters chip beside it (parity — iOS moved Clear onto the
+        // search row with a 44pt hit target; here a 48dp minimum).
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
         OutlinedTextField(
             value = filter.search,
             onValueChange = onSearch,
@@ -560,8 +579,24 @@ private fun FilterBar(
             placeholder = { Text(uiString(R.string.l10n_workouts_screen_search_sport_004b7928), style = NoopType.body, color = Palette.textTertiary) },
             singleLine = true,
             colors = workoutFieldColors(),
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.weight(1f),
         )
+            if (filter.isActive) {
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .clickable(onClick = onClear)
+                        .heightIn(min = 48.dp)
+                        .padding(horizontal = 8.dp, vertical = 6.dp)
+                        .semantics { contentDescription = uiString(R.string.l10n_workouts_screen_clear_filters_41222671) },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.Close, contentDescription = null, tint = Palette.textSecondary, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(uiString(R.string.l10n_workouts_screen_clear_719ea396), style = NoopType.footnote, color = Palette.textSecondary)
+                }
+            }
+        }
     }
 }
 
@@ -650,7 +685,6 @@ private fun sessionSelectionKey(row: WorkoutRow): String = "${row.startTs}|${row
 // is a translucent near-black (mock rgba(13,14,20,.80)) so it floats over the day-of-sky; the vessel + the
 // white count-up read crisp on it. Radius 26 + a white@0.11 hairline give the frosted-glass edge. (These
 // are file-scoped to Workouts — the Today equivalents are private to that file.)
-private val LIQUID_HERO_FILL: Color = Color(red = 13f / 255f, green = 14f / 255f, blue = 20f / 255f, alpha = 0.80f)
 private val LIQUID_HERO_RADIUS: Dp = 26.dp
 
 // MARK: - Effort hero (typical-effort liquid vessel over the day-of-sky)
@@ -687,8 +721,8 @@ private fun EffortHero(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(LIQUID_HERO_RADIUS))
-            .background(LIQUID_HERO_FILL.copy(alpha = LIQUID_HERO_FILL.alpha * CardAppearance.opacity))
-            .border(1.dp, Color.White.copy(alpha = 0.11f * CardAppearance.opacity), RoundedCornerShape(LIQUID_HERO_RADIUS))
+            .background(Palette.heroFill.copy(alpha = Palette.heroFill.alpha * CardAppearance.opacity))
+            .border(1.dp, Palette.heroBorder.copy(alpha = Palette.heroBorder.alpha * CardAppearance.opacity), RoundedCornerShape(LIQUID_HERO_RADIUS))
             .padding(20.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -754,6 +788,142 @@ private fun HeroStat(title: String, value: String, tint: Color, modifier: Modifi
     }
 }
 
+// MARK: - Active-calorie heatmap (last 13 weeks)
+//
+// A GitHub-contribution-style grid of daily active calories: columns = weeks (Monday-first), rows =
+// weekdays, cell shade = that day's burn vs the window max. The bucketing is the pure cross-platform
+// [ActivityHeatmap] (parity with the Swift twin); this composable is just the Compose renderer. Hidden
+// entirely when there's no daily-calorie data yet.
+@Composable
+private fun CalorieHeatmapSection(recentDays: List<com.noop.data.DailyMetric>) {
+    val values = remember(recentDays) {
+        recentDays.mapNotNull { d -> d.activeKcalEst?.let { d.day to it } }
+            .groupBy({ it.first }, { it.second })
+            .mapValues { (_, v) -> v.max() }
+    }
+    val today = remember { java.time.LocalDate.now().toString() }
+    val grid = remember(values, today) { ActivityHeatmap.build(values, today) }
+    if (grid.isEmpty) return
+
+    val amber = Palette.effortColor
+    val inset = Palette.surfaceInset
+    fun colorFor(level: Int): Color = when (level) {
+        0 -> inset
+        1 -> amber.copy(alpha = 0.28f)
+        2 -> amber.copy(alpha = 0.52f)
+        3 -> amber.copy(alpha = 0.78f)
+        else -> amber
+    }
+
+    val months = remember { java.text.DateFormatSymbols().shortMonths }        // localized, index 0 = Jan
+    val weekdays = remember { java.text.DateFormatSymbols().shortWeekdays }     // localized, index 1 = Sun
+    val labelArgb = Palette.textTertiary.toArgb()
+    NoopCard(tint = Palette.effortColor) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Active calories", style = NoopType.title2, color = Palette.textPrimary)
+            Text("Last 13 weeks · daily burn", style = NoopType.footnote, color = Palette.textTertiary)
+            // Quarter total + current streak (streak reuses the Settings streak plural — no new string;
+            // the "Active calories" title above supplies the kcal unit for the big number).
+            Row(verticalAlignment = Alignment.Bottom) {
+                Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text(grouped(grid.total), style = NoopType.title1, color = Palette.textPrimary)
+                    Text("kcal", style = NoopType.caption, color = Palette.textTertiary)  // unit, as elsewhere on this screen
+                }
+                Spacer(Modifier.weight(1f))
+                if (grid.streak > 0) {
+                    Text(
+                        pluralStringResource(R.plurals.settings_streak_run, grid.streak, grid.streak),
+                        style = NoopType.caption,
+                        color = Palette.textTertiary,
+                    )
+                }
+            }
+            BoxWithConstraints(Modifier.fillMaxWidth()) {
+                val gap = 3.dp
+                val leftInset = 20.dp   // weekday gutter
+                val topInset = 14.dp    // month row
+                val cols = grid.weeks
+                val cell = ((maxWidth - leftInset - gap * (cols - 1)) / cols).coerceAtLeast(2.dp)
+                Canvas(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(cell * 7 + gap * 6 + topInset)
+                        .semantics { contentDescription = "Active-calorie heatmap, last 13 weeks" },
+                ) {
+                    val gapPx = gap.toPx()
+                    val cellPx = cell.toPx()
+                    val leftPx = leftInset.toPx()
+                    val topPx = topInset.toPx()
+                    val radius = CornerRadius(cellPx * 0.24f, cellPx * 0.24f)
+                    val labelPaint = android.graphics.Paint().apply {
+                        isAntiAlias = true
+                        color = labelArgb
+                        textSize = 10.sp.toPx()
+                    }
+                    val nc = drawContext.canvas.nativeCanvas
+                    // Weekday gutter (Mon/Wed/Fri/Sun). shortWeekdays index 1 = Sun … 7 = Sat; row r is
+                    // Monday-first, so row r → weekday ((1 + r) % 7) + 1. Baseline ≈ row centre.
+                    for (r in 0 until 7 step 2) {
+                        val sym = weekdays.getOrNull(((1 + r) % 7) + 1).orEmpty()
+                        if (sym.isEmpty()) continue
+                        val y = topPx + r * (cellPx + gapPx) + cellPx / 2f + labelPaint.textSize / 3f
+                        nc.drawText(sym, 0f, y, labelPaint)
+                    }
+                    // Month row: label a column when its month changes.
+                    var lastMonth = -1
+                    for (c in 0 until cols) {
+                        val day = grid.columns[c].firstOrNull { it.day != null }?.day ?: continue
+                        val m = day.substring(5, 7).toIntOrNull() ?: continue
+                        if (m != lastMonth) {
+                            lastMonth = m
+                            val sym = months.getOrNull(m - 1).orEmpty()
+                            if (sym.isEmpty()) continue
+                            nc.drawText(sym, leftPx + c * (cellPx + gapPx), labelPaint.textSize, labelPaint)
+                        }
+                    }
+                    // Cells; today's cell gets an outline so "where am I" reads at a glance (mirrors #222).
+                    for (c in 0 until cols) {
+                        val column = grid.columns[c]
+                        for (r in 0 until 7) {
+                            val tl = Offset(leftPx + c * (cellPx + gapPx), topPx + r * (cellPx + gapPx))
+                            drawRoundRect(
+                                color = colorFor(column[r].level),
+                                topLeft = tl,
+                                size = Size(cellPx, cellPx),
+                                cornerRadius = radius,
+                            )
+                            if (column[r].day == today) {
+                                drawRoundRect(
+                                    color = Palette.textPrimary,
+                                    topLeft = tl,
+                                    size = Size(cellPx, cellPx),
+                                    cornerRadius = radius,
+                                    style = Stroke(width = 1.5.dp.toPx()),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text("Less", style = NoopType.caption, color = Palette.textTertiary)
+                for (lvl in 0..4) {
+                    Box(
+                        Modifier
+                            .size(10.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(colorFor(lvl)),
+                    )
+                }
+                Text("More", style = NoopType.caption, color = Palette.textTertiary)
+            }
+        }
+    }
+}
+
 // MARK: - Summary tiles (uniform StatTiles)
 
 @Composable
@@ -768,7 +938,11 @@ private fun SummarySection(
     val totalCount = rows.size
     val totalTimeH = rows.mapNotNull { it.durationS }.sum() / 3600.0
     val totalKcal = rows.mapNotNull { it.energyKcal }.sum()
-    val totalKm = rows.mapNotNull { it.distanceM }.sum() / 1000.0
+    // Only POSITIVE distances count as "has distance" (a strap-detected sport with no GPS/manual
+    // distance is null; an explicit 0 is not a real distance) — matches the per-row distance label. When
+    // nothing in the window has distance, the tile shows "–" instead of a misleading "0.0 km covered".
+    val distancesM = rows.mapNotNull { it.distanceM }.filter { it > 0.0 }
+    val totalKm = distancesM.sum() / 1000.0
     val modal = groups.firstOrNull()
 
     val tiles = listOf<@Composable (Modifier) -> Unit>(
@@ -803,7 +977,7 @@ private fun SummarySection(
             StatTile(
                 modifier = m,
                 label = uiString(R.string.l10n_workouts_screen_total_distance_e8260e11),
-                value = UnitFormatter.distanceFromKilometers(totalKm, unitSystem),
+                value = if (distancesM.isEmpty()) "–" else UnitFormatter.distanceFromKilometers(totalKm, unitSystem),
                 caption = "covered",
                 accent = Palette.metricCyan,
             )
@@ -979,7 +1153,7 @@ private fun SessionsSection(
     onMerge: (List<WorkoutRow>) -> Unit,
     onBulkDelete: (List<WorkoutRow>) -> Unit,
     onCancelSelect: () -> Unit,
-    onEdit: (WorkoutRow) -> Unit,
+    onEdit: (WorkoutRow, Boolean) -> Unit,
     onRelabel: (WorkoutRow, String) -> Unit,
     onDismiss: (WorkoutRow) -> Unit,
     onDelete: (WorkoutRow) -> Unit,
@@ -1179,7 +1353,7 @@ private fun SessionRow(
     selectionMode: Boolean,
     selected: Boolean,
     onToggleRow: (WorkoutRow) -> Unit,
-    onEdit: (WorkoutRow) -> Unit,
+    onEdit: (WorkoutRow, Boolean) -> Unit,
     onRelabel: (WorkoutRow, String) -> Unit,
     onDismiss: (WorkoutRow) -> Unit,
     onDelete: (WorkoutRow) -> Unit,
@@ -1352,6 +1526,46 @@ private fun WorkoutDetailSheet(vm: AppViewModel, row: WorkoutRow, onDismiss: () 
             }
             steps?.let { DetailRow("Steps", "${grouped(it.toDouble())} steps") }  // #398, on-foot sports
             if (!row.notes.isNullOrBlank()) DetailRow("Notes", row.notes)
+
+            // Export the recorded GPS route as a GPX/FIT file (Strava / Garmin Connect / any GPS app).
+            // Only when a route with a drawable path was recorded; the file is built on-device and shared.
+            row.routePolyline?.let { poly ->
+                val track = remember(poly) { RouteMath.decode(poly) }
+                if (track.size >= 2) {
+                    val exportCtx = LocalContext.current
+                    val exportScope = rememberCoroutineScope()
+                    CardDivider()
+                    Text("Export route", style = NoopType.subhead, color = Palette.textPrimary)
+                    Text(
+                        "Save this GPS route as a file to import into Strava, Garmin Connect, or another app. " +
+                            "Built on your phone — nothing is uploaded until you choose to share it.",
+                        style = NoopType.footnote,
+                        color = Palette.textTertiary,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        NoopButton(
+                            text = "GPX",
+                            kind = NoopButtonKind.Secondary,
+                            modifier = Modifier.weight(1f),
+                            onClick = {
+                                exportScope.launch {
+                                    RouteExportShare.share(exportCtx, RouteExport.Format.GPX, track, row)
+                                }
+                            },
+                        )
+                        NoopButton(
+                            text = "FIT",
+                            kind = NoopButtonKind.Secondary,
+                            modifier = Modifier.weight(1f),
+                            onClick = {
+                                exportScope.launch {
+                                    RouteExportShare.share(exportCtx, RouteExport.Format.FIT, track, row)
+                                }
+                            },
+                        )
+                    }
+                }
+            }
 
             // #796 - per-session Effort contribution. The session's captured strain re-homed from a plain
             // value row into a prominent Effort-amber card (the big count-up value + the "This session"
@@ -1695,7 +1909,7 @@ private fun DetailRow(label: String, value: String) {
 @Composable
 private fun RowActionsMenu(
     row: WorkoutRow,
-    onEdit: (WorkoutRow) -> Unit,
+    onEdit: (WorkoutRow, Boolean) -> Unit,
     onRelabel: (WorkoutRow, String) -> Unit,
     onDismiss: (WorkoutRow) -> Unit,
     onDelete: (WorkoutRow) -> Unit,
@@ -1716,7 +1930,7 @@ private fun RowActionsMenu(
                     )
                     DropdownMenuItem(
                         text = { Text(uiString(R.string.l10n_workouts_screen_edit_details_9e62bb59), style = NoopType.body, color = Palette.textPrimary) },
-                        onClick = { open = false; onEdit(row) },
+                        onClick = { open = false; onEdit(row, false) },
                     )
                     DropdownMenuItem(
                         text = { Text(uiString(R.string.l10n_workouts_screen_dismiss_not_a_workout_560c7bb5), style = NoopType.body, color = Palette.statusCritical) },
@@ -1726,7 +1940,7 @@ private fun RowActionsMenu(
                 WorkoutSource.MANUAL -> {
                     DropdownMenuItem(
                         text = { Text(uiString(R.string.l10n_workouts_screen_edit_b454359e), style = NoopType.body, color = Palette.textPrimary) },
-                        onClick = { open = false; onEdit(row) },
+                        onClick = { open = false; onEdit(row, false) },
                     )
                     DropdownMenuItem(
                         text = { Text(uiString(R.string.l10n_workouts_screen_delete_f6fdbe48), style = NoopType.body, color = Palette.statusCritical) },
@@ -1736,7 +1950,7 @@ private fun RowActionsMenu(
                 WorkoutSource.WHOOP, WorkoutSource.APPLE, WorkoutSource.LIFTING, WorkoutSource.ACTIVITY_FILE -> {
                     DropdownMenuItem(
                         text = { Text(uiString(R.string.l10n_workouts_screen_duplicate_as_manual_2d580d46), style = NoopType.body, color = Palette.textPrimary) },
-                        onClick = { open = false; onEdit(row.copy(source = "manual", sport = WorkoutEditing.displaySport(row.sport))) },
+                        onClick = { open = false; onEdit(WorkoutEditing.asManualCopy(row), true) },
                     )
                 }
             }
@@ -1768,7 +1982,7 @@ private fun Cell(text: String, modifier: Modifier, color: Color? = null) {
 // MARK: - Manual workout add / edit dialog
 //
 // Five inputs — sport, start (date-time, here entered as minutes-ago for simplicity on phone),
-// duration, average HR, calories — validated by WorkoutEditing.buildManualRow (the same honest-row
+// duration, distance, average HR, calories — validated by WorkoutEditing.buildManualRow (the same honest-row
 // rules the engine uses). Editing carries the original's captured maxHr/strain/route over via
 // preservingCaptured so changing sport/duration never wipes them. Android mirror of macOS
 // ManualWorkoutSheet (the macOS sheet uses a DatePicker; on phone we take "minutes ago" to keep the
@@ -1777,6 +1991,7 @@ private fun Cell(text: String, modifier: Modifier, color: Color? = null) {
 @Composable
 private fun ManualWorkoutDialog(
     editing: WorkoutRow?,
+    isCopy: Boolean = false,
     onDismiss: () -> Unit,
     onSave: (row: WorkoutRow, replacing: WorkoutRow?) -> Unit,
 ) {
@@ -1796,6 +2011,19 @@ private fun ManualWorkoutDialog(
     }
     var avgHr by remember { mutableStateOf(editing?.avgHr?.toString() ?: "") }
     var kcal by remember { mutableStateOf(editing?.energyKcal?.let { it.roundToInt().toString() } ?: "") }
+    // #1195: distance as ENTERED, in the user's unit (km/mi), converted to stored metres on save. Pre-fill
+    // in that unit so an untouched edit round-trips the stored value. Period decimal (Locale.US) to match
+    // toDoubleOrNull parsing, exactly as the macOS ManualWorkoutSheet does.
+    val unitSystem = UnitPrefs.system(LocalContext.current)
+    val distUnit = if (unitSystem == UnitSystem.IMPERIAL) "mi" else "km"
+    var distance by remember {
+        mutableStateOf(
+            editing?.distanceM?.let { m ->
+                val v = (m / 1000.0).let { if (unitSystem == UnitSystem.IMPERIAL) it * UnitFormatter.MILES_PER_KILOMETER else it }
+                java.util.Locale.US.let { String.format(it, "%.2f", v) }.trimEnd('0').trimEnd('.')
+            } ?: "",
+        )
+    }
 
     // Build the validated row (null disables Save). Start = the chosen date+time. Captured fields preserved.
     val built: WorkoutRow? = run {
@@ -1805,9 +2033,15 @@ private fun ManualWorkoutDialog(
         // A typed-but-unparseable number is invalid (e.g. "abc" in Avg HR) — reject before building.
         val hr: Int? = if (hrText.isEmpty()) null else hrText.toIntOrNull()
         val k: Double? = if (kText.isEmpty()) null else kText.toDoubleOrNull()
+        val dText = distance.trim()
+        // Distance entered in the user's unit → stored metres. null for blank (no distance). (#1195)
+        val distM: Double? = if (dText.isEmpty()) null else dText.toDoubleOrNull()?.let { v ->
+            (if (unitSystem == UnitSystem.IMPERIAL) v / UnitFormatter.MILES_PER_KILOMETER else v) * 1000.0
+        }
         if (dur == null) return@run null
         if (hrText.isNotEmpty() && hr == null) return@run null
         if (kText.isNotEmpty() && k == null) return@run null
+        if (dText.isNotEmpty() && distM == null) return@run null
         // A manual workout ALWAYS lives under the strap source (where live-tracked sessions land), so
         // a "duplicate as manual" of an imported apple-health/whoop row never writes back to it.
         val base = WorkoutEditing.buildManualRow(
@@ -1817,6 +2051,7 @@ private fun ManualWorkoutDialog(
             sport = sport,
             avgHr = hr,
             energyKcal = k,
+            distanceM = distM,
             nowSeconds = nowSec,
         ) ?: return@run null
         WorkoutEditing.preservingCaptured(base, editing)
@@ -1852,6 +2087,7 @@ private fun ManualWorkoutDialog(
                 SportPickerField(sport, onChange = { sport = it })
                 StartTimeField(startMillis, onPick = { startMillis = it })
                 DialogField("Duration (minutes)", durationMin, onChange = { durationMin = it }, numeric = true)
+                DialogField("Distance ($distUnit, optional)", distance, onChange = { distance = it }, numeric = true)
                 DialogField("Avg HR (bpm, optional)", avgHr, onChange = { avgHr = it }, numeric = true)
                 DialogField("Calories (kcal, optional)", kcal, onChange = { kcal = it }, numeric = true)
                 if (built == null) {
@@ -1877,10 +2113,14 @@ private fun ManualWorkoutDialog(
             // it: a manual key change deletes the stale row; a detected original is durably dismissed).
             // Duplicating an imported WHOOP/Apple row is a pure ADD — never pass it, or a changed key
             // would delete the imported original.
-            val replacing = editing?.takeIf {
-                val c = WorkoutEditing.classify(it.source)
-                c == WorkoutSource.MANUAL || c == WorkoutSource.DETECTED
-            }
+            //
+            // The source test alone never enforced that. A duplicate is built with source "manual" so the
+            // form treats it as editable, so it classified as MANUAL and passed straight through, carrying
+            // the ORIGINAL's startTs. That reaches the Health Connect write-back, which deletes by startTs
+            // ALONE (`noop-workout-<startTs>`, no deviceId in the key) — so duplicating a strap session
+            // removed the original's records, and a duplicate saved at a new start left them deleted with
+            // nothing to restore them. [DialogTarget.isCopy] carries what the source cannot. (#1488)
+            val replacing = WorkoutEditing.replacingRowFor(editing, isCopy)
             val context = LocalContext.current
             TextButton(onClick = {
                 built?.let {
@@ -2265,30 +2505,83 @@ private fun grouped(v: Double): String = String.format(Locale.US, "%,d", v.round
 // MARK: - Sport icons (Material equivalents of the SF Symbols used on macOS)
 
 // internal (not private): reused by the Today Overview-HR chart to glyph each workout at its HR peak.
-internal fun sportIcon(sport: String): ImageVector {
+internal fun sportIcon(sport: String): ImageVector = when (sport.lowercase().trim()) {
+    // Per-sport glyphs, parity with the iOS SportIcon catalogue. Exact catalogue names first (each gets
+    // its closest Material sports glyph); free-typed / auto-detected labels fall through to the fuzzy
+    // matcher below. Sports Material has no dedicated glyph for (Dancing, Frisbee, Archery, Fishing,
+    // Hunting, Curling, Horseback riding, Elliptical, ...) resolve to the generic FitnessCenter there.
+    "running", "treadmill run" -> Icons.AutoMirrored.Filled.DirectionsRun
+    "walking", "treadmill walk" -> Icons.AutoMirrored.Filled.DirectionsWalk
+    "hiking", "rucking" -> Icons.Filled.Hiking
+    "cycling", "indoor cycle", "spinning", "mountain biking" -> Icons.AutoMirrored.Filled.DirectionsBike
+    "open-water swim", "pool swim", "water polo" -> Icons.Filled.Pool
+    "rowing", "row machine" -> Icons.Filled.Rowing
+    "kayaking", "stand-up paddleboard" -> Icons.Filled.Kayaking
+    "surfing" -> Icons.Filled.Surfing
+    "sailing" -> Icons.Filled.Sailing
+    "scuba diving" -> Icons.Filled.ScubaDiving
+    "skiing" -> Icons.Filled.DownhillSkiing
+    "snowboarding" -> Icons.Filled.Snowboarding
+    "snowshoeing" -> Icons.Filled.Snowshoeing
+    "ice skating" -> Icons.Filled.IceSkating
+    "inline skating", "skateboarding" -> Icons.Filled.Skateboarding
+    "hiit", "gymnastics" -> Icons.Filled.SportsGymnastics
+    "yoga", "pilates", "stretching", "meditation" -> Icons.Filled.SelfImprovement
+    "boxing", "martial arts", "kickboxing", "fencing" -> Icons.Filled.SportsMartialArts
+    "basketball", "netball" -> Icons.Filled.SportsBasketball
+    "soccer", "gaelic football" -> Icons.Filled.SportsSoccer
+    "american football", "australian football" -> Icons.Filled.SportsFootball
+    "rugby" -> Icons.Filled.SportsRugby
+    "cricket" -> Icons.Filled.SportsCricket
+    "baseball", "softball", "bowling" -> Icons.Filled.SportsBaseball
+    "handball" -> Icons.Filled.SportsHandball
+    "ice hockey", "field hockey", "lacrosse" -> Icons.Filled.SportsHockey
+    "tennis", "badminton", "squash", "racquetball", "table tennis", "padel", "pickleball" ->
+        Icons.Filled.SportsTennis
+    "volleyball", "sand volleyball", "spikeball" -> Icons.Filled.SportsVolleyball
+    "golf" -> Icons.Filled.SportsGolf
+    "climbing" -> Icons.Filled.Terrain
+    "wheelchair" -> Icons.Filled.Accessible
+    "gaming" -> Icons.Filled.SportsEsports
+    "motor racing" -> Icons.Filled.SportsMotorsports
+    else -> sportIconFuzzy(sport)
+}
+
+/// Free-text / auto-detected label fallback (e.g. "Morning Run", "trail hike"): fuzzy substring match,
+/// then the generic dumbbell. Catalogue names are handled exactly by [sportIcon] before this runs.
+private fun sportIconFuzzy(sport: String): ImageVector {
     val s = sport.lowercase()
     return when {
         s.contains("run") -> Icons.AutoMirrored.Filled.DirectionsRun
         s.contains("walk") || s.contains("hike") -> Icons.AutoMirrored.Filled.DirectionsWalk
-        s.contains("cycl") || s.contains("bike") || s.contains("ride") -> Icons.AutoMirrored.Filled.DirectionsBike
-        s.contains("swim") -> Icons.Filled.Pool
+        s.contains("cycl") || s.contains("bike") || s.contains("ride") || s.contains("spin") -> Icons.AutoMirrored.Filled.DirectionsBike
+        s.contains("swim") || s.contains("polo") -> Icons.Filled.Pool
         s.contains("row") -> Icons.Filled.Rowing
-        s.contains("yoga") || s.contains("pilates") || s.contains("meditat") || s.contains("stretch") -> Icons.Filled.SelfImprovement
-        s.contains("strength") || s.contains("weight") || s.contains("lift") -> Icons.Filled.FitnessCenter
-        s.contains("box") || s.contains("martial") || s.contains("jiu") || s.contains("judo") || s.contains("karate") -> Icons.Filled.SportsMartialArts
-        s.contains("hiit") || s.contains("functional") || s.contains("gymnast") -> Icons.Filled.SportsGymnastics
+        s.contains("kayak") || s.contains("paddle") -> Icons.Filled.Kayaking
+        s.contains("surf") -> Icons.Filled.Surfing
+        s.contains("sail") -> Icons.Filled.Sailing
+        s.contains("scuba") || s.contains("dive") -> Icons.Filled.ScubaDiving
         s.contains("snowboard") -> Icons.Filled.Snowboarding
         s.contains("ski") -> Icons.Filled.DownhillSkiing
-        // All racquet sports share the tennis glyph (no dedicated icon for padel/pickleball/squash etc.).
+        s.contains("skat") || s.contains("board") -> Icons.Filled.Skateboarding
+        s.contains("cricket") -> Icons.Filled.SportsCricket
+        s.contains("rugby") -> Icons.Filled.SportsRugby
+        s.contains("hockey") -> Icons.Filled.SportsHockey
+        s.contains("handball") -> Icons.Filled.SportsHandball
+        s.contains("softball") || s.contains("baseball") || s.contains("bowl") -> Icons.Filled.SportsBaseball
+        s.contains("yoga") || s.contains("pilates") || s.contains("meditat") || s.contains("stretch") -> Icons.Filled.SelfImprovement
+        s.contains("strength") || s.contains("weight") || s.contains("lift") -> Icons.Filled.FitnessCenter
+        s.contains("box") || s.contains("martial") || s.contains("jiu") || s.contains("judo") || s.contains("karate") || s.contains("wrestl") || s.contains("fenc") -> Icons.Filled.SportsMartialArts
+        s.contains("hiit") || s.contains("functional") || s.contains("gymnast") -> Icons.Filled.SportsGymnastics
         s.contains("tennis") || s.contains("padel") || s.contains("pickle") || s.contains("squash") || s.contains("racquet") || s.contains("badminton") -> Icons.Filled.SportsTennis
         s.contains("volleyball") -> Icons.Filled.SportsVolleyball
         s.contains("golf") -> Icons.Filled.SportsGolf
-        // No dedicated bowling icon in the Material set; the plain ball glyph is the closest match
-        // (iOS has figure.bowling). (D#850)
-        s.contains("bowl") -> Icons.Filled.SportsBaseball
         s.contains("climb") -> Icons.Filled.Terrain
         s.contains("soccer") || s.contains("football") -> Icons.Filled.SportsSoccer
-        s.contains("basketball") -> Icons.Filled.SportsBasketball
+        s.contains("basketball") || s.contains("netball") -> Icons.Filled.SportsBasketball
+        s.contains("gaming") || s.contains("esport") -> Icons.Filled.SportsEsports
+        s.contains("motor") || s.contains("racing") -> Icons.Filled.SportsMotorsports
+        s.contains("wheelchair") -> Icons.Filled.Accessible
         else -> Icons.Filled.FitnessCenter
     }
 }

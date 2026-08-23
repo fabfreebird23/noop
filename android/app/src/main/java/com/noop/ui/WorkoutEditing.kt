@@ -38,6 +38,18 @@ object WorkoutEditing {
     }
 
     /**
+     * The pre-fill row behind "Duplicate as manual" on a READ-ONLY session (strap, Apple, lifting, file).
+     *
+     * Re-seeds `deviceId` to the manual namespace as well as `source`. deviceId is part of the workout
+     * primary key, so a copy that kept the original's id would hand [WhoopRepository.saveManualWorkout] a
+     * `replacing` key pointing INTO the source being copied from, and the save would retire the very row
+     * the menu promises not to touch — a strap session lives under the active strap id, which the delete
+     * path can reach. Re-seeding keeps every delete that save can issue inside "my-whoop". (#1488)
+     */
+    fun asManualCopy(row: WorkoutRow): WorkoutRow =
+        row.copy(source = "manual", deviceId = "my-whoop", sport = displaySport(row.sport))
+
+    /**
      * Sport-cell text. "detected" reads as a neutral "Activity". WHOOP sport names arrive as
      * concatenated camelCase (e.g. "TraditionalStrengthTraining"), which reads as one long
      * unbreakable word and truncates badly — split it into words on the lower→Upper boundary so it
@@ -69,6 +81,21 @@ object WorkoutEditing {
     fun isDismissed(row: WorkoutRow, markers: List<DismissedWorkout>): Boolean =
         classify(row.source) == WorkoutSource.DETECTED &&
             markers.any { row.startTs < it.endTs && it.startTs < row.endTs }
+
+    /**
+     * What the edit dialog should hand [WhoopRepository.saveManualWorkout] as `replacing`.
+     *
+     * Only a stored MANUAL or DETECTED row is genuinely being replaced. [isCopy] marks "Duplicate as
+     * manual", where the form pre-fills FROM a read-only session but the save is a pure ADD — and it has to
+     * be passed in, because the copy is built with source "manual" so the form treats it as editable, and
+     * so classifies as MANUAL. Testing the source alone silently let every duplicate through carrying the
+     * ORIGINAL's startTs. (#1488)
+     */
+    fun replacingRowFor(editing: WorkoutRow?, isCopy: Boolean): WorkoutRow? =
+        if (isCopy) null else editing?.takeIf {
+            val c = classify(it.source)
+            c == WorkoutSource.MANUAL || c == WorkoutSource.DETECTED
+        }
 
     /** The durable marker for a detected [row] (caller inserts it into `dismissedWorkout`). */
     fun dismissedMarker(row: WorkoutRow): DismissedWorkout =
@@ -311,20 +338,27 @@ object WorkoutEditing {
     // MARK: - Building / preserving rows
 
     /**
-     * Carry the captured fields the add/edit sheet does NOT expose (maxHr, strain, distanceM,
-     * zonesJSON, notes, routePolyline) over from the row being edited. A live-tracked session has real
-     * captured strain/maxHr/route; rebuilding from the sheet's inputs alone would wipe them on an edit.
-     * No-op for a fresh add (old == null).
+     * Carry the captured fields the add/edit sheet does NOT expose (maxHr, strain, zonesJSON, notes,
+     * routePolyline) over from the row being edited. A live-tracked session has real captured
+     * strain/maxHr/route; rebuilding from the sheet's inputs alone would wipe them on an edit. No-op for a
+     * fresh add (old == null). distanceM is NOW a sheet field (#1195), so it comes from the freshly built
+     * row (the sheet pre-fills it from the edited row, so an untouched field preserves the captured GPS
+     * distance and a cleared one clears it); routePolyline still carries the captured map verbatim.
      */
     fun preservingCaptured(row: WorkoutRow, old: WorkoutRow?): WorkoutRow {
         if (old == null) return row
         return row.copy(
             maxHr = old.maxHr,
             strain = old.strain,
-            distanceM = old.distanceM,
+            distanceM = row.distanceM,
             zonesJSON = old.zonesJSON,
             notes = old.notes,
             routePolyline = old.routePolyline,
+            // #1444: `row` here is the sheet-built row, NOT the stored one, so copy() alone does not
+            // carry this — buildManualRow has no steps input and leaves it null. Per-session steps
+            // (#1058) is a captured field the sheet never exposes, so it is restored from `old` like
+            // the rest. Twin of Swift WorkoutSource.preservingCaptured.
+            steps = old.steps,
         )
     }
 
@@ -358,25 +392,37 @@ object WorkoutEditing {
         sport: String,
         avgHr: Int?,
         energyKcal: Double?,
+        // Trailing so the existing positional callers (which pass `nowSeconds` last) are unaffected; the
+        // one caller that sets a distance (the manual sheet) passes it by name. (#1195)
         nowSeconds: Long = System.currentTimeMillis() / 1000L,
+        distanceM: Double? = null,
     ): WorkoutRow? {
         if (durationMin <= 0 || durationMin > 24 * 60) return null
         val trimmed = sport.trim()
         if (trimmed.isEmpty() || startSeconds > nowSeconds || startSeconds <= 0) return null
         if (avgHr != null && avgHr !in 25..250) return null
         if (energyKcal != null && (energyKcal < 0 || energyKcal > 20_000)) return null
+        // Distance 0–1000 km (#1195): rejects a negative or absurd manual entry. 1000 km comfortably
+        // covers any single session (an Ironman bike is 180 km, an ultra 160 km).
+        if (distanceM != null && (distanceM < 0 || distanceM > 1_000_000)) return null
+        val durationSeconds = durationMin.toLong() * 60L
+        // Keep both the addition and the future-end check overflow-safe. A valid start can be close to
+        // Long.MAX_VALUE in a boundary test even though production timestamps are much smaller.
+        if (durationSeconds > Long.MAX_VALUE - startSeconds) return null
+        val endSeconds = startSeconds + durationSeconds
+        if (endSeconds > nowSeconds) return null
         return WorkoutRow(
             deviceId = deviceId,
             startTs = startSeconds,
-            endTs = startSeconds + durationMin * 60L,
+            endTs = endSeconds,
             sport = trimmed,
             source = "manual",
-            durationS = durationMin * 60.0,
+            durationS = durationSeconds.toDouble(),
             energyKcal = energyKcal,
             avgHr = avgHr,
             maxHr = null,
             strain = null,
-            distanceM = null,
+            distanceM = distanceM,
             zonesJSON = null,
             notes = null,
             routePolyline = null,
@@ -483,6 +529,11 @@ object WorkoutMerge {
         val energyKcal = if (kcals.isEmpty()) null else kcals.sum()
         val dists = rows.mapNotNull { it.distanceM }
         val distanceM = if (dists.isEmpty()) null else dists.sum()
+        // #1444: steps is cumulative per session exactly like distance, so a merge sums it too. It was
+        // silently dropped here (copy() does not help: this builds a NEW row), which the Swift twin's
+        // explicit-field audit surfaced.
+        val stepCounts = rows.mapNotNull { it.steps }
+        val mergedSteps = if (stepCounts.isEmpty()) null else stepCounts.sum()
 
         var hrWeight = 0.0
         var hrSum = 0.0
@@ -515,6 +566,7 @@ object WorkoutMerge {
             zonesJSON = null,
             notes = mergedNotes,
             routePolyline = null,
+            steps = mergedSteps,
         )
     }
 }

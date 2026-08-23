@@ -35,9 +35,15 @@ class BackupSettingsCodecTest {
             "profile.heightCm" to 168.0,
             "profile.waistCm" to 71.0,
             "profile.hrMax" to 191,
+            "profile.hrZoneThresholds" to "95,118,142,168,184",
             "units.system" to "imperial",
             "units.temperature" to "celsius",
             "effort.scale" to "whoop",
+            // #today-hosted-cards: the one layout pref carried, a JSON [String] stored under the String kind.
+            "today.hostedCards" to "[\"sleep.sleepMarks\"]",
+            // #1361: custom journal behaviours, a newline-joined name list — the embedded newline must
+            // survive the JSON round-trip (and stay byte-identical to the Apple value).
+            "journal.customBehaviors" to "Cold plunge\nMagnesium",
         )
         val json = requireNotNull(BackupSettingsCodec.encode(values))
         val back = BackupSettingsCodec.decode(json)
@@ -48,9 +54,12 @@ class BackupSettingsCodecTest {
         assertEquals(168.0, back["profile.heightCm"])
         assertEquals(71.0, back["profile.waistCm"])
         assertEquals(191, back["profile.hrMax"])
+        assertEquals("95,118,142,168,184", back["profile.hrZoneThresholds"])
         assertEquals("imperial", back["units.system"])
         assertEquals("celsius", back["units.temperature"])
         assertEquals("whoop", back["effort.scale"])
+        assertEquals("[\"sleep.sleepMarks\"]", back["today.hostedCards"])
+        assertEquals("Cold plunge\nMagnesium", back["journal.customBehaviors"])
         assertEquals(values.size, back.size)
     }
 

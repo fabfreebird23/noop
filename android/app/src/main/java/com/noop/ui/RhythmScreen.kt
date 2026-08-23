@@ -4,6 +4,9 @@ import com.noop.R
 import androidx.compose.ui.res.stringResource
 import android.content.Context
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,7 +22,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -43,6 +48,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.dp
 import com.noop.analytics.RhythmConfidence
+import com.noop.analytics.RhythmEmptyState
 import com.noop.analytics.RhythmRegularity
 import com.noop.analytics.RhythmScreener
 import kotlin.math.min
@@ -209,6 +215,7 @@ fun RhythmConsentGate(
 fun RhythmScreen(
     night: RhythmScreener.NightRhythmSummary?,
     windows: List<RhythmScreener.WindowResult>,
+    emptyReason: RhythmEmptyState = RhythmEmptyState.GATHERING_DATA,
     onClose: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
@@ -227,13 +234,14 @@ fun RhythmScreen(
         return
     }
 
-    RhythmVisualization(night = night, windows = windows, onClose = onClose)
+    RhythmVisualization(night = night, windows = windows, emptyReason = emptyReason, onClose = onClose)
 }
 
 @Composable
 private fun RhythmVisualization(
     night: RhythmScreener.NightRhythmSummary?,
     windows: List<RhythmScreener.WindowResult>,
+    emptyReason: RhythmEmptyState,
     onClose: (() -> Unit)?,
 ) {
     // The headline window: prefer the most-varied readable window so the "what a diffuse
@@ -263,20 +271,44 @@ private fun RhythmVisualization(
         item { SourceBadge("Experimental", tint = Palette.restColor) }
 
         if (allPoints.isEmpty()) {
-            item {
-            DataPendingNote(
-                title = uiString(R.string.l10n_rhythm_screen_no_clear_reading_yet_92f40443),
-                body = "Rhythm only looks during quiet, still, resting windows, so it needs a calm night's worth of steady beats. Once there's a clean window, the scatter and its description show here.",
-            )
-            }
+            item { RhythmEmptyStateNote(emptyReason) }
         } else {
             item { SummaryCard(night = night, headline = headline) }
             item { PlotCard(points = allPoints) }
             item { StatsCard(headline = headline) }
+            // #1298: the clinician-share button lives here on iOS, but Android's Rhythm screen is still
+            // fed null/empty (no capture pipeline yet), so a Share action would be unreachable. The pure
+            // RhythmExport builder is in place; wire the button when the Android rhythm loader lands.
         }
 
         item { MethodologyCard() }
         item { RhythmDisclaimerNote() }
+    }
+}
+
+/**
+ * #1360: a TRUTHFUL empty state. When every window was refused for a *capture* reason the device can
+ * never satisfy — its beats arrive banked, or it records no stillness signal at all — say so, instead of
+ * the "try again after a settled night" copy that is a lie when tomorrow is structurally identical.
+ * GATHERING_DATA/NONE keep the original "no clear reading yet" wording (a genuine try-again). The bodies
+ * are English literals matching the screen's existing empty-state body (localized copy follows when the
+ * Android rhythm loader lands — the screen is not yet fed real windows). Twin of the Swift `emptyState`.
+ */
+@Composable
+private fun RhythmEmptyStateNote(reason: RhythmEmptyState) {
+    when (reason) {
+        RhythmEmptyState.DEVICE_BANKS_BEATS -> DataPendingNote(
+            title = uiString(R.string.l10n_rhythm_screen_this_device_can_t_support_a_bb41aada),
+            body = "Rhythm needs beat-to-beat timing measured one beat at a time. Your device stores its heartbeats in batches, so the exact spacing between them isn't recoverable. Nothing is wrong with your night.",
+        )
+        RhythmEmptyState.DEVICE_NO_MOTION -> DataPendingNote(
+            title = uiString(R.string.l10n_rhythm_screen_this_device_can_t_support_a_bb41aada),
+            body = "Rhythm reads only during still, resting windows, and this device doesn't record the stillness signal it needs to find them. Nothing is wrong with your night.",
+        )
+        RhythmEmptyState.NONE, RhythmEmptyState.GATHERING_DATA -> DataPendingNote(
+            title = uiString(R.string.l10n_rhythm_screen_no_clear_reading_yet_92f40443),
+            body = "Rhythm only looks during quiet, still, resting windows, so it needs a calm night's worth of steady beats. Once there's a clean window, the scatter and its description show here.",
+        )
     }
 }
 
@@ -294,9 +326,39 @@ private fun SummaryCard(
                 Overline("Last night", modifier = Modifier.weight(1f))
                 ConfidencePill(headline = headline, readable = night?.readableWindows)
             }
-            Text(headlineLabel(label), style = NoopType.title2, color = Palette.textPrimary)
+            StatusChip(label)
             Text(headlineDetail(label), style = NoopType.subhead, color = Palette.textSecondary)
         }
+    }
+}
+
+/**
+ * OpenStrap-style status chip: a compact pill with an icon + the neutral regularity label. Modelled on
+ * [SourceBadge], but in the calm Rest-blue palette — NEVER a warn/alarm colour (§11 forbids alarm styling;
+ * OpenStrap tints its chip amber, NOOP does not). States differ by icon + wording only; the label reuses
+ * the short [chipLabel]; the sentence [headlineDetail] reads below. Non-diagnostic. Twin of Swift `statusChip`.
+ */
+@Composable
+private fun StatusChip(label: RhythmRegularity) {
+    val shape = RoundedCornerShape(50)
+    // Calm, non-alarm icons: a check for steady, a heart for any variation (never a warning triangle),
+    // an info glyph when unread. No red, no alarm (§11).
+    val icon = when (label) {
+        RhythmRegularity.STEADY -> Icons.Filled.CheckCircle
+        RhythmRegularity.OCCASIONAL_ECTOPY, RhythmRegularity.VARIED -> Icons.Filled.Favorite
+        RhythmRegularity.UNREADABLE -> Icons.Filled.Info
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier
+            .clip(shape)
+            .background(Palette.restColor.copy(alpha = 0.14f))
+            .border(1.dp, Palette.restColor.copy(alpha = 0.30f), shape)
+            .padding(horizontal = Metrics.space12, vertical = 7.dp),
+    ) {
+        Icon(icon, contentDescription = null, tint = Palette.restBright, modifier = Modifier.size(16.dp))
+        Text(chipLabel(label), style = NoopType.subhead, color = Palette.restBright)
     }
 }
 
@@ -492,11 +554,13 @@ private fun RhythmDisclaimerNote() {
 
 // ── Copy mapping (neutral, non-clinical — NO verdict, NO condition name) ──────────────────
 
-private fun headlineLabel(label: RhythmRegularity): String = when (label) {
-    RhythmRegularity.STEADY -> "Your rhythm looked steady"
-    RhythmRegularity.OCCASIONAL_ECTOPY -> "Some occasional extra or skipped beats"
-    RhythmRegularity.VARIED -> "Your rhythm varied more than usual"
-    RhythmRegularity.UNREADABLE -> "Couldn't read clearly"
+/** SHORT neutral status word inside the status chip (compact, so the chip reads like OpenStrap's; the
+ *  sentence-length [headlineDetail] carries the description below). Twin of Swift `chipLabel`. */
+private fun chipLabel(label: RhythmRegularity): String = when (label) {
+    RhythmRegularity.STEADY -> "Steady"
+    RhythmRegularity.OCCASIONAL_ECTOPY -> "Some variation"
+    RhythmRegularity.VARIED -> "More varied"
+    RhythmRegularity.UNREADABLE -> "No clear reading"
 }
 
 private fun headlineDetail(label: RhythmRegularity): String = when (label) {

@@ -1,8 +1,6 @@
 package com.noop.analytics
 
 import kotlin.math.abs
-import kotlin.math.exp
-import kotlin.math.roundToInt
 
 // RecoveryDrivers.kt - the USER-FACING "What shaped it" breakdown for the Charge (recovery) score.
 //
@@ -23,23 +21,57 @@ import kotlin.math.roundToInt
 // the exact rows. No em-dashes, no PII (values + baselines are the user's own, never logged here).
 
 /**
- * One driver row behind the Charge (recovery) score, in the SHARED CONTRACT shape the iOS/macOS and
- * Android dashboards both render. Field names are byte-identical across platforms.
+ * One semantic driver row behind the Charge (recovery) score. Presentation layers map its enums and
+ * measurements to localized copy and locale-aware formatting.
  *
- * @property label short signal name, e.g. "Resting HR".
+ * @property label stable semantic identity of the signal.
  * @property deltaPoints signed contribution to the 0-100 Charge score versus this signal sitting at
  *   the personal baseline (positive = lifted Charge, negative = pulled it down). A real marginal
  *   sensitivity, never a fabricated apportionment.
- * @property valueText the night's value, formatted with its unit, e.g. "58 bpm".
- * @property baselineText the personal baseline the value was scored against, e.g. "61 bpm baseline".
- * @property verdict short plain-English read, e.g. "below baseline, supporting recovery".
+ * @property value the night's numeric value in [unit].
+ * @property baseline the personal baseline the value was scored against, or null when the value is
+ *   already relative to its reference (skin temperature) or uses a fixed centre (sleep quality).
+ * @property unit semantic measurement unit shared by [value] and [baseline].
+ * @property verdict semantic interpretation for presentation by the UI layer.
  */
+enum class ChargeDriverLabel {
+    HEART_RATE_VARIABILITY,
+    RESTING_HEART_RATE,
+    SLEEP_QUALITY,
+    RESPIRATORY_RATE,
+    SKIN_TEMPERATURE,
+}
+
+enum class ChargeDriverUnit {
+    MILLISECONDS,
+    BEATS_PER_MINUTE,
+    PERCENT,
+    BREATHS_PER_MINUTE,
+    CELSIUS_DEVIATION,
+}
+
+enum class ChargeDriverVerdict {
+    ABOVE_BASELINE_SUPPORTING,
+    BELOW_BASELINE_SUPPORTING,
+    ABOVE_BASELINE_LIMITING,
+    BELOW_BASELINE_LIMITING,
+    AT_BASELINE,
+    HRV_SATURATION_LIMITING,
+    STRONG_NIGHT_SUPPORTING,
+    BELOW_GOOD_NIGHT_LIMITING,
+    TYPICAL_NIGHT,
+    NEAR_BASELINE,
+    WARMER_THAN_BASELINE_LIMITING,
+    COOLER_THAN_BASELINE_LIMITING,
+}
+
 data class ChargeDriver(
-    val label: String,
+    val label: ChargeDriverLabel,
     val deltaPoints: Int,
-    val valueText: String,
-    val baselineText: String,
-    val verdict: String,
+    val value: Double,
+    val baseline: Double?,
+    val unit: ChargeDriverUnit,
+    val verdict: ChargeDriverVerdict,
 )
 
 object RecoveryDrivers {
@@ -76,127 +108,135 @@ object RecoveryDrivers {
         sleepPerf: Double?,
         skinTempDev: Double? = null,
     ): List<ChargeDriver> {
-        // Cold-start gate: no usable HRV baseline -> no score -> no drivers (honest empty, not faked rows).
-        if (!hrvBaseline.usable) return emptyList()
+        // No score => no real contributions to attribute (cold-start). recovery(...) enforces the usable
+        // gate; mirror it so a nil headline never yields fabricated driver rows.
+        val full = RecoveryScorer.recovery(
+            hrv = hrv, rhr = rhr, resp = resp,
+            hrvBaseline = hrvBaseline, rhrBaseline = rhrBaseline,
+            respBaseline = respBaseline, sleepPerf = sleepPerf, skinTempDev = skinTempDev,
+        ) ?: return emptyList()
 
-        // Build the SAME (z, weight) term set recovery(...) builds, in the SAME append order, capturing
-        // each term's identity so a single term can be neutralized to compute its marginal point swing.
-        data class Term(val z: Double, val w: Double)
-
-        val terms = ArrayList<Term>()
-
-        // HRV term: higher is better. Always present once the baseline is usable.
-        val hrvZ = RecoveryScorer.zScore(hrv, hrvBaseline.baseline, hrvBaseline.spread)
-        val hrvIdx = terms.size
-        terms.add(Term(hrvZ, RecoveryScorer.wHRV))
-
-        // RHR term: lower is better -> (mu - x) / sigma.
-        var rhrIdx = -1
-        if (rhrBaseline != null) {
-            val z = RecoveryScorer.zScore(rhrBaseline.baseline, rhr, rhrBaseline.spread)
-            rhrIdx = terms.size
-            terms.add(Term(z, RecoveryScorer.wRHR))
+        // Marginal-vs-neutral attribution: a term's deltaPoints is the full score minus the score
+        // recomputed with THAT term held at its personal baseline (its z forced to 0) while every term,
+        // including this one, keeps its weight. Routes through recovery(...) itself (same terms, same
+        // weighting, same logistic) so the points can never drift from the headline. A term reaches
+        // z = 0 at: HRV / resting HR / respiration = the baseline mean, Rest quality = sleepPerfCenter,
+        // skin-temp deviation = 0. Mirrors the Swift ChargeDrivers `points(...)` helper.
+        fun points(neutralised: Double?): Int {
+            val delta = full - (neutralised ?: full)
+            // Shared Swift/Kotlin rule: nearest integer, with exact half-ties away from zero.
+            return if (delta < 0.0) -Math.round(-delta).toInt() else Math.round(delta).toInt()
         }
 
-        // Resp term: lower is better, needs BOTH the value and a baseline.
-        var respIdx = -1
-        if (resp != null && respBaseline != null) {
-            val z = RecoveryScorer.zScore(respBaseline.baseline, resp, respBaseline.spread)
-            respIdx = terms.size
-            terms.add(Term(z, RecoveryScorer.wResp))
-        }
+        // Did the parasympathetic-saturation signature fire on THIS night (low HRV corroborated by a low,
+        // decoupled resting HR)? Detection ONLY: the guard's easing is not applied, so deltaPoints below is
+        // the full, unguarded HRV penalty. The verdict merely NAMES the detected pattern so the UI can
+        // surface it while real firings accumulate. See the header in RecoveryScorer.kt.
+        val hrvZFull = RecoveryScorer.zScore(hrv, hrvBaseline.baseline, hrvBaseline.spread)
+        val rhrZFull: Double? = rhrBaseline?.let { RecoveryScorer.zScore(it.baseline, rhr, it.spread) }
+        val hrvSaturationDetected =
+            RecoveryScorer.parasympatheticSaturation(hrvZ = hrvZFull, rhrZ = rhrZFull).active
 
-        // Sleep-performance / Rest-quality term: no baseline, centered at sleepPerfCenter.
-        var sleepIdx = -1
-        if (sleepPerf != null) {
-            val z = (sleepPerf - RecoveryScorer.sleepPerfCenter) / RecoveryScorer.sleepPerfScale
-            sleepIdx = terms.size
-            terms.add(Term(z, RecoveryScorer.wSleep))
-        }
-
-        // Skin-temp term: SYMMETRIC penalty on |deviation|, added only when supplied.
-        var skinIdx = -1
-        if (skinTempDev != null) {
-            val z = -abs(skinTempDev) / RecoveryScorer.skinTempDevScale
-            skinIdx = terms.size
-            terms.add(Term(z, RecoveryScorer.wSkinTemp))
-        }
-
-        // The actual score, EXACTLY as recovery(...) computes it (so the rows can't disagree with the ring).
-        val totalWeight = terms.sumOf { it.w }
-        if (totalWeight <= 0.0) return emptyList()
-        val actual = scoreOf(terms.sumOf { it.z * it.w } / totalWeight)
-
-        // Marginal point swing of term [idx]: actual score minus the score with that ONE term neutralized
-        // to z = 0 (the signal sitting AT its personal baseline), the other terms and weights unchanged.
-        // The denominator stays the full totalWeight - the term still occupies its weight at z = 0, the
-        // honest "what if this signal had been exactly average for you" counterfactual.
-        fun delta(idx: Int): Int {
-            val neutralZ = terms.withIndex().sumOf { (i, t) -> if (i == idx) 0.0 else t.z * t.w } / totalWeight
-            return (actual - scoreOf(neutralZ)).roundToInt()
-        }
-
-        // One row per present term, appended in the SAME order the iOS twin uses (HRV, resting HR,
-        // Sleep, respiration, skin temp), then sorted biggest-mover-first so the row that explains the
-        // most sits on top. Labels / value text / verdicts are byte-identical to the Swift canonical.
+        // One row per present term, appended in the SAME order the iOS twin uses (HRV, resting HR, Sleep,
+        // respiration, skin temp), then sorted biggest-mover-first so the row that explains the most sits on
+        // top. The semantic cases retain the same distinctions as the Swift canonical.
         val drivers = ArrayList<ChargeDriver>()
 
+        // HRV (dominant driver; always present once the score exists). Neutral = HRV at the baseline mean.
         drivers.add(
             ChargeDriver(
-                label = "Heart rate variability",
-                deltaPoints = delta(hrvIdx),
-                valueText = "${hrv.roundToInt()} ms",
-                baselineText = "${hrvBaseline.baseline.roundToInt()} ms baseline",
-                verdict = directionVerdict(hrvZ, good = "above baseline, supporting recovery",
-                    flat = "at baseline", bad = "below baseline, limiting recovery"),
+                label = ChargeDriverLabel.HEART_RATE_VARIABILITY,
+                deltaPoints = points(
+                    RecoveryScorer.recovery(
+                        hrv = hrvBaseline.baseline, rhr = rhr, resp = resp,
+                        hrvBaseline = hrvBaseline, rhrBaseline = rhrBaseline,
+                        respBaseline = respBaseline, sleepPerf = sleepPerf, skinTempDev = skinTempDev,
+                    ),
+                ),
+                value = hrv,
+                baseline = hrvBaseline.baseline,
+                unit = ChargeDriverUnit.MILLISECONDS,
+                verdict = hrvVerdict(
+                    value = hrv,
+                    baseline = hrvBaseline.baseline,
+                    saturationDetected = hrvSaturationDetected,
+                ),
             ),
         )
-        if (rhrIdx >= 0 && rhrBaseline != null) {
-            // RHR z is already oriented "higher z = better" (lower RHR), so a positive z is good.
+        // Resting HR (lower vs baseline supports recovery). Neutral = resting HR at the baseline mean.
+        if (rhrBaseline != null) {
             drivers.add(
                 ChargeDriver(
-                    label = "Resting heart rate",
-                    deltaPoints = delta(rhrIdx),
-                    valueText = "${rhr.roundToInt()} bpm",
-                    baselineText = "${rhrBaseline.baseline.roundToInt()} bpm baseline",
-                    verdict = directionVerdict(terms[rhrIdx].z, good = "below baseline, supporting recovery",
-                        flat = "at baseline", bad = "above baseline, limiting recovery"),
+                    label = ChargeDriverLabel.RESTING_HEART_RATE,
+                    deltaPoints = points(
+                        RecoveryScorer.recovery(
+                            hrv = hrv, rhr = rhrBaseline.baseline, resp = resp,
+                            hrvBaseline = hrvBaseline, rhrBaseline = rhrBaseline,
+                            respBaseline = respBaseline, sleepPerf = sleepPerf, skinTempDev = skinTempDev,
+                        ),
+                    ),
+                    value = rhr,
+                    baseline = rhrBaseline.baseline,
+                    unit = ChargeDriverUnit.BEATS_PER_MINUTE,
+                    verdict = rhrVerdict(value = rhr, baseline = rhrBaseline.baseline),
                 ),
             )
         }
-        if (sleepIdx >= 0 && sleepPerf != null) {
+        // Rest quality (the Rest composite; neutral at sleepPerfCenter).
+        if (sleepPerf != null) {
             drivers.add(
                 ChargeDriver(
-                    label = "Sleep quality",
-                    deltaPoints = delta(sleepIdx),
-                    valueText = "${(sleepPerf * 100.0).roundToInt()}%",
-                    baselineText = "",   // centred on a fixed "good night", not a learned baseline
-                    verdict = directionVerdict(terms[sleepIdx].z, good = "a strong night, supporting recovery",
-                        flat = "a typical night", bad = "below a good night, limiting recovery"),
+                    label = ChargeDriverLabel.SLEEP_QUALITY,
+                    deltaPoints = points(
+                        RecoveryScorer.recovery(
+                            hrv = hrv, rhr = rhr, resp = resp,
+                            hrvBaseline = hrvBaseline, rhrBaseline = rhrBaseline,
+                            respBaseline = respBaseline, sleepPerf = RecoveryScorer.sleepPerfCenter,
+                            skinTempDev = skinTempDev,
+                        ),
+                    ),
+                    value = sleepPerf * 100.0,
+                    baseline = null,
+                    unit = ChargeDriverUnit.PERCENT,
+                    verdict = sleepVerdict(sleepPerf),
                 ),
             )
         }
-        if (respIdx >= 0 && resp != null && respBaseline != null) {
+        // Respiration (lower vs baseline supports recovery). Neutral = respiration at the baseline mean.
+        if (resp != null && respBaseline != null) {
             drivers.add(
                 ChargeDriver(
-                    label = "Respiratory rate",
-                    deltaPoints = delta(respIdx),
-                    valueText = String.format(java.util.Locale.US, "%.1f br/min", resp),
-                    baselineText = String.format(java.util.Locale.US, "%.1f br/min baseline", respBaseline.baseline),
-                    verdict = directionVerdict(terms[respIdx].z, good = "below baseline, supporting recovery",
-                        flat = "at baseline", bad = "above baseline, limiting recovery"),
+                    label = ChargeDriverLabel.RESPIRATORY_RATE,
+                    deltaPoints = points(
+                        RecoveryScorer.recovery(
+                            hrv = hrv, rhr = rhr, resp = respBaseline.baseline,
+                            hrvBaseline = hrvBaseline, rhrBaseline = rhrBaseline,
+                            respBaseline = respBaseline, sleepPerf = sleepPerf, skinTempDev = skinTempDev,
+                        ),
+                    ),
+                    value = resp,
+                    baseline = respBaseline.baseline,
+                    unit = ChargeDriverUnit.BREATHS_PER_MINUTE,
+                    verdict = respVerdict(value = resp, baseline = respBaseline.baseline),
                 ),
             )
         }
-        if (skinIdx >= 0 && skinTempDev != null) {
-            // Skin temp is a SYMMETRIC penalty: only |deviation| matters. Surface it as a RELATIVE
-            // deviation (signed +/- C from baseline), never an absolute temperature.
+        // Skin-temp deviation (symmetric penalty: any drift lowers Charge). Neutral = zero drift, so the
+        // delta is always <= 0 (a penalty removed). Surface it as a RELATIVE deviation, never an absolute.
+        if (skinTempDev != null) {
             drivers.add(
                 ChargeDriver(
-                    label = "Skin temperature",
-                    deltaPoints = delta(skinIdx),
-                    valueText = String.format(java.util.Locale.US, "%+.1f C vs baseline", skinTempDev),
-                    baselineText = "",   // a deviation already; the reference is the personal baseline (0)
+                    label = ChargeDriverLabel.SKIN_TEMPERATURE,
+                    deltaPoints = points(
+                        RecoveryScorer.recovery(
+                            hrv = hrv, rhr = rhr, resp = resp,
+                            hrvBaseline = hrvBaseline, rhrBaseline = rhrBaseline,
+                            respBaseline = respBaseline, sleepPerf = sleepPerf, skinTempDev = 0.0,
+                        ),
+                    ),
+                    value = skinTempDev,
+                    baseline = null,
+                    unit = ChargeDriverUnit.CELSIUS_DEVIATION,
                     verdict = skinTempVerdict(skinTempDev),
                 ),
             )
@@ -206,22 +246,49 @@ object RecoveryDrivers {
         return drivers.sortedByDescending { abs(it.deltaPoints) }
     }
 
-    /** The Charge logistic, IDENTICAL to RecoveryScorer.recovery's final squash. */
-    private fun scoreOf(z: Double): Double {
-        val s = 100.0 / (1.0 + exp(-RecoveryScorer.logisticK * (z - RecoveryScorer.logisticZ0)))
-        return s.coerceIn(0.0, 100.0)
+    /**
+     * HRV verdict matching the Swift canonical `hrvVerdict(value:baseline:saturationDetected:)`: above
+     * baseline supports recovery; below baseline limits it; at baseline is neutral. When the
+     * parasympathetic-saturation signature fired (low HRV corroborated by a low, decoupled resting HR) the
+     * pattern is NAMED, but the "limiting recovery" read stays, because that is what the score actually did:
+     * the easing is detected-only and did NOT change these points. The hedge is deliberate too, since the
+     * same low-HRV + low-RHR pattern is also reported for non-functional overreaching, which is the opposite
+     * of benign. Byte-for-byte the same strings as the iOS twin.
+     */
+    private fun hrvVerdict(
+        value: Double,
+        baseline: Double,
+        saturationDetected: Boolean,
+    ): ChargeDriverVerdict = when {
+        value > baseline -> ChargeDriverVerdict.ABOVE_BASELINE_SUPPORTING
+        value < baseline ->
+            if (saturationDetected) {
+                ChargeDriverVerdict.HRV_SATURATION_LIMITING
+            } else {
+                ChargeDriverVerdict.BELOW_BASELINE_LIMITING
+            }
+        else -> ChargeDriverVerdict.AT_BASELINE
     }
 
-    /**
-     * Direction verdict matching the Swift canonical: an "already oriented so higher z is better"
-     * z reads as supporting recovery when positive (the signal is on the good side of baseline),
-     * limiting recovery when negative, and right at baseline when exactly zero. Byte-for-byte the
-     * same strings RecoveryScorer's Swift verdicts produce, so the iOS and Android rows match.
-     */
-    private fun directionVerdict(z: Double, good: String, flat: String, bad: String): String = when {
-        z > 0.0 -> good
-        z < 0.0 -> bad
-        else -> flat
+    /** Resting-HR verdict (lower is better). Mirrors Swift `rhrVerdict` exactly. */
+    private fun rhrVerdict(value: Double, baseline: Double): ChargeDriverVerdict = when {
+        value < baseline -> ChargeDriverVerdict.BELOW_BASELINE_SUPPORTING
+        value > baseline -> ChargeDriverVerdict.ABOVE_BASELINE_LIMITING
+        else -> ChargeDriverVerdict.AT_BASELINE
+    }
+
+    /** Respiration verdict (lower is better). Mirrors Swift `respVerdict` exactly. */
+    private fun respVerdict(value: Double, baseline: Double): ChargeDriverVerdict = when {
+        value < baseline -> ChargeDriverVerdict.BELOW_BASELINE_SUPPORTING
+        value > baseline -> ChargeDriverVerdict.ABOVE_BASELINE_LIMITING
+        else -> ChargeDriverVerdict.AT_BASELINE
+    }
+
+    /** Rest-quality verdict (higher is better), centred on sleepPerfCenter. Mirrors Swift `sleepVerdict`. */
+    private fun sleepVerdict(sleepPerf: Double): ChargeDriverVerdict = when {
+        sleepPerf > RecoveryScorer.sleepPerfCenter -> ChargeDriverVerdict.STRONG_NIGHT_SUPPORTING
+        sleepPerf < RecoveryScorer.sleepPerfCenter -> ChargeDriverVerdict.BELOW_GOOD_NIGHT_LIMITING
+        else -> ChargeDriverVerdict.TYPICAL_NIGHT
     }
 
     /** Half-width (C) of the "typical" skin-temp band; matches Swift skinTempTypicalBandC. */
@@ -231,9 +298,9 @@ object RecoveryDrivers {
      * Skin-temp verdict (symmetric): a drift within the typical band reads neutral, beyond it limits
      * recovery, warmer or cooler. Mirrors the Swift skinTempVerdict exactly.
      */
-    private fun skinTempVerdict(dev: Double): String = when {
-        abs(dev) <= SKIN_TEMP_TYPICAL_BAND_C -> "near baseline"
-        dev > 0.0 -> "warmer than baseline, limiting recovery"
-        else -> "cooler than baseline, limiting recovery"
+    private fun skinTempVerdict(dev: Double): ChargeDriverVerdict = when {
+        abs(dev) <= SKIN_TEMP_TYPICAL_BAND_C -> ChargeDriverVerdict.NEAR_BASELINE
+        dev > 0.0 -> ChargeDriverVerdict.WARMER_THAN_BASELINE_LIMITING
+        else -> ChargeDriverVerdict.COOLER_THAN_BASELINE_LIMITING
     }
 }

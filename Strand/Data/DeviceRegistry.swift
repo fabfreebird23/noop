@@ -100,11 +100,35 @@ final class DeviceRegistry: ObservableObject {
         reload()
     }
 
+    /// Permanently FORGET a device: wipe all of its recorded data AND remove its registry entry, so a
+    /// duplicate/stale strap disappears from the Devices list entirely. Today an archived ("Removed")
+    /// row can only be re-activated or have its data wiped — never purged — so a duplicate strap lingers
+    /// forever (issue #1193). Routes the heavy multi-table sample wipe through the `WhoopStore` actor
+    /// (off-main, like `deleteDeviceData`), then removes the small `pairedDevice`/`device` registry rows
+    /// and refreshes the published list. Best-effort: if the data wipe fails the registry row is left in
+    /// place (we never leave orphaned recordings behind a removed row).
+    func forget(_ id: String, store: WhoopStore) async {
+        do {
+            try await store.deleteAllData(deviceId: id)
+        } catch {
+            return
+        }
+        try? self.store.remove(id)
+        reload()
+    }
+
     /// Adopt (or clear, when nil) the stable BLE identity for a device — the
     /// CBPeripheral.identifier.uuidString on iOS/Mac. Lets NOOP tell physical straps apart and map a
     /// connected peripheral back to its registry row. Refreshes the published list. Best-effort.
     func setPeripheralId(_ id: String, peripheralId: String?) {
         try? store.setPeripheralId(id, peripheralId: peripheralId)
+        reload()
+    }
+
+    /// Stamp a device as seen right now — a real connect or disconnect, not every inbound packet, which
+    /// would be a write per second for no more truth. Refreshes the published list. Best-effort. (#1527)
+    func touchLastSeen(_ id: String, at ts: Int = Int(Date().timeIntervalSince1970)) {
+        try? store.touchLastSeen(id, at: ts)
         reload()
     }
 

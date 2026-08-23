@@ -14,6 +14,8 @@ import UserNotifications
 /// `RootTabView` so the iOS app keeps the same gating without depending on the macOS-only shell.
 @main
 struct StrandiOSApp: App {
+    /// UIKit bridge for Home Screen quick actions. SwiftUI keeps ownership of the scene and window.
+    @UIApplicationDelegateAdaptor(HomeScreenQuickActionAppDelegate.self) private var appDelegate
     @StateObject private var model: AppModel
     @StateObject private var health: HealthKitBridge
     /// The phone→watch link. Built + activated here so the watch app actually receives snapshots on a
@@ -28,6 +30,12 @@ struct StrandiOSApp: App {
     @AppStorage(AppearanceMode.storageKey) private var appearanceRaw = AppearanceMode.system.rawValue
     /// Chart data-colour style (Titanium / Classic throwback). Re-colours gauges + charts.
     @AppStorage(ChartStyle.storageKey) private var chartStyleRaw = ChartStyle.titanium.rawValue
+    /// Chrome accent colour (mint / WHOOP blue / custom). Chrome only — never the data colour worlds.
+    @AppStorage(AccentColor.storageKey) private var accentRaw = AccentColor.mint.rawValue
+    @AppStorage(AccentColor.customHexKey) private var accentCustomHex = AccentColor.defaultCustomHex
+    /// Effort's display scale is also embedded in the shared widget snapshot. Observe it here so a
+    /// Settings change gets one accurate full rebuild instead of waiting for an unrelated repo refresh.
+    @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
 
     init() {
         // #1008: pin the pre-change Overnight-only default for existing installs before
@@ -39,6 +47,11 @@ struct StrandiOSApp: App {
         // MUST live here, not in StrandApp.swift — that is the macOS @main and is excluded from the iOS
         // target, so the hook there never runs on iOS.
         DemoDayHarness.applyLaunchArgsIfNeeded()
+        // DEBUG-only sync harness: `--demo-sync` drives the Today header's charge→sync control with a
+        // synthetic battery + a looping sync signal, so the morph is watchable with no strap paired.
+        // Same reason this lives here rather than StrandApp.swift: that file is the macOS @main and is
+        // excluded from the iOS target. See DemoSyncHarness.swift.
+        DemoSyncHarness.applyLaunchArgsIfNeeded()
         #endif
         // Debug-only canary: trips if the App Group entitlement is missing on this target before any
         // silent no-op (PendingIntents, WidgetSnapshot.publish, Live Activity) can mask the issue as
@@ -55,17 +68,42 @@ struct StrandiOSApp: App {
         UNUserNotificationCenter.current().delegate = NotificationPresenter.shared
         let model = AppModel()
         _model = StateObject(wrappedValue: model)
+        // #1538: a strap offload completes while the app is BACKGROUNDED — it stays alive as a
+        // bluetooth-central to receive it — and the re-score it triggers took nearly eight minutes on the
+        // reporter's install, far longer than that wake survives. The pass is all-or-nothing, so being
+        // suspended lost every scored night AND left the watermark unadvanced, which made the next offload
+        // start the same doomed pass again. This processing task is where that work is escalated to; it is
+        // the long, deferrable kind rather than the metered refresh kind the two schedulers above use.
+        // Registered before launch finishes and permitted in project.yml, or iOS never delivers it.
+        RescoreBackgroundScheduler.register { [weak model] in
+            await model?.runDeferredRescoreIfOwed()
+        }
         let bridge = HealthKitBridge(
             repo: model.repo,
             appleDeviceId: model.appleDeviceId,
             noopDeviceId: model.deviceId
         )
         _health = StateObject(wrappedValue: bridge)
+        // Register a separate, always-on-while-authorized refresh task for Apple Health write-back.
+        // The operation is write-only and bounded to the bridge's recent window; fresh BLE offloads still
+        // use the immediate hook below. BGTaskScheduler chooses the actual wake time.
+        HealthWritebackBackgroundScheduler.register { [weak bridge] in
+            guard let bridge else { return false }
+            let succeeded = await bridge.writeBackAfterNewData()
+            // A person can revoke every write type in Settings while NOOP is closed. Stop requesting
+            // wakes once the cold-launched bridge can no longer resume a prior share grant.
+            if bridge.auth != .authorized {
+                HealthWritebackBackgroundScheduler.cancel()
+            }
+            return succeeded
+        }
         // #1021: publish to Apple Health when an offload lands, not only on foreground entry - the
         // scenePhase pass below starts the offload and wrote to Health in parallel with it, so a night
         // synced on open only reached Health at the next launch. Weak so the scene owns the bridge's
         // lifetime; the bridge no-ops unless Health was authorized.
-        model.healthWriteBack = { [weak bridge] in await bridge?.writeBackAfterNewData() }
+        model.healthWriteBack = { [weak bridge] in
+            _ = await bridge?.writeBackAfterNewData()
+        }
     }
 
     var body: some Scene {
@@ -86,7 +124,11 @@ struct StrandiOSApp: App {
                 // card observes the SAME instance the central detector (AppModel.evaluateStress) posts to.
                 .environment(\.stressNudgeCenter, model.stressNudgeCenter)
                 .preferredColorScheme(AppearanceMode.resolve(appearanceRaw).colorScheme)
+                // Match SwiftUI format styles to the localization selected by the app's bundles. Language
+                // changes are process-wide on Apple and are applied after the documented reopen.
+                .environment(\.locale, AppLanguage.activeLocale)
                 .chartStyle(chartStyleRaw)
+                .noopAccent(accentRaw, customHex: accentCustomHex)
                 // Dynamic Type now scales the prose/label roles (StrandFont). Cap the upper end so the
                 // fixed-geometry tiles/gauges stay legible at the largest accessibility sizes rather than
                 // clipping; the common Larger-Text range still scales fully.
@@ -96,7 +138,9 @@ struct StrandiOSApp: App {
                     // Home/Lock widget and the watch snapshot use, so this fourth surface can't drift to a
                     // different day at the rollover (it previously read `days.last(where: recovery != nil)`,
                     // which kept pointing at yesterday's scored row after Today had moved on).
-                    let day = Repository.widgetAnchor(days: model.repo.days)
+                    // Memoized: this closure fires on EVERY live-HR tick, so re-deriving the anchor here
+                    // scanned the whole history + hit the DateFormatter lock ~1-3x/sec (#1051-shaped).
+                    let day = model.repo.cachedWidgetAnchor()
                     liveActivity.update(
                         bpm: model.live.connected ? (model.bpm ?? model.live.heartRate) : nil,
                         recovery: day?.recovery.map { Int($0.rounded()) },
@@ -107,8 +151,9 @@ struct StrandiOSApp: App {
                 // End the Live Activity the moment the link drops, even if no further HR tick arrives.
                 .onReceive(model.live.$connected) { isConnected in
                     // #911: same shared anchor as the heartRate site above, so the Live Activity, the
-                    // widget, the watch and Today never disagree about which day they describe.
-                    let day = Repository.widgetAnchor(days: model.repo.days)
+                    // widget, the watch and Today never disagree about which day they describe. Memoized
+                    // (shares the heartRate site's cache; recomputes only on a data refresh or day-roll).
+                    let day = model.repo.cachedWidgetAnchor()
                     liveActivity.update(
                         bpm: isConnected ? (model.bpm ?? model.live.heartRate) : nil,
                         recovery: day?.recovery.map { Int($0.rounded()) },
@@ -144,11 +189,11 @@ struct StrandiOSApp: App {
                 // and foreground-initiated reloads are budget-exempt. dropFirst() skips the attach replay.
                 .onReceive(model.live.$batteryPct.dropFirst()) { _ in
                     guard scenePhase == .active else { return }
-                    Task { await WidgetSnapshot.publish(from: model) }
+                    Task { await WidgetSnapshot.publishLive(from: model) }
                 }
                 .onReceive(model.live.$connected.dropFirst()) { _ in
                     guard scenePhase == .active else { return }
-                    Task { await WidgetSnapshot.publish(from: model) }
+                    Task { await WidgetSnapshot.publishLive(from: model) }
                 }
                 // #114 (follow-up): `WidgetSnapshot.bpm` reads `model.bpm` (WidgetPublish.swift), the
                 // smoothed live HR — same LIVE-not-repo-cache category as battery/connected above, so it
@@ -156,12 +201,22 @@ struct StrandiOSApp: App {
                 // widget's HR froze at the last foreground snapshot for the rest of the session. UNLIKE
                 // battery/connection, HR is HIGH-frequency (the smoothed median moves every few seconds
                 // under activity), so — unlike the ungated hooks above — this one is throttled through
-                // `HRPublishThrottle` (60 s, mirroring Android's PushGate HR cadence) so it can't re-run
-                // publish's `exploreSeries` read + `reloadAllTimelines()` on every tick.
+                // `HRPublishThrottle` (60 s, mirroring Android's PushGate HR cadence). `publishLive` then
+                // updates the saved live fields without re-reading the full Rest series, while the throttle
+                // still bounds the App-Group writes + WidgetKit timeline reloads.
                 .onReceive(model.$bpm.dropFirst()) { _ in
                     guard scenePhase == .active else { return }
                     guard WidgetSnapshot.HRPublishThrottle.admit() else { return }
+                    Task { await WidgetSnapshot.publishLive(from: model) }
+                }
+                .onChange(of: effortScaleRaw) { _, _ in
+                    guard scenePhase == .active else { return }
                     Task { await WidgetSnapshot.publish(from: model) }
+                }
+                // Apple Health is explicitly opt-in. Once any write type is authorized, keep one
+                // best-effort BGAppRefresh request armed; revoking all write access cancels it.
+                .onChange(of: health.auth) { _, auth in
+                    HealthWritebackBackgroundScheduler.updateSchedule(isAuthorized: auth == .authorized)
                 }
                 // #581: the `noop://import-health` deep link the iOS Shortcut opens after building the
                 // HealthKit-free payload. Filter on the host so other future schemes don't trip the
@@ -213,9 +268,28 @@ struct StrandiOSApp: App {
                 // timer or an incidental reconnect. Floored at 90s and never clock/empty-streak-suppressed
                 // (BackfillPolicy.shouldRun's .foreground case), so this is a safe no-op on rapid re-opens.
                 model.ble.requestSync(.foreground)
+                // #1538: settle a re-score an earlier background attempt could not finish, rather than
+                // waiting on the 15-minute idle tick now that there is a foreground with no suspension
+                // deadline. A no-op unless one is genuinely outstanding.
+                //
+                // Its OWN task, deliberately. This pass is minutes long on the installs that need it —
+                // that is the whole reason it was deferred — and the sequential block below owns Health
+                // sync, the widget snapshot and the watch push. Awaiting it there would leave the widget
+                // and the watch showing stale numbers for the entire re-score every time the app is
+                // opened, which is a worse regression than the bug being fixed. `analyzeRecent`
+                // serialises itself, so overlapping with the sync this foreground also kicks off is safe.
+                Task { await model.runDeferredRescoreIfOwed() }
                 Task {
                     health.refreshAuthIfPreviouslyGranted()
-                    await health.sync()
+                    HealthWritebackBackgroundScheduler.updateSchedule(
+                        isAuthorized: health.auth == .authorized)
+                    await HealthSyncRefreshCoordinator.run(
+                        sync: { await health.sync() },
+                        refresh: {
+                            await model.refreshAfterAppleHealthSync(
+                                authorized: health.auth == .authorized)
+                        }
+                    )
                     await WidgetSnapshot.publish(from: model)
                     // Push the wrist on the SAME refresh as the Home-screen widget so the watch, the
                     // widget and Today never disagree about which day they describe. Without this the
@@ -223,6 +297,16 @@ struct StrandiOSApp: App {
                     await watch.pushLatest(from: model)
                 }
             } else if phase == .background {
+                // Re-submit on every transition because iOS may discard an old best-effort request.
+                HealthWritebackBackgroundScheduler.updateSchedule(
+                    isAuthorized: health.auth == .authorized)
+                // #1538: same reasoning for the re-score continuation, plus one case of its own. A pass
+                // can be left owed with NOTHING scheduled — a foreground pass killed by a force-quit
+                // never runs the deferral path that submits the request, and iOS can discard a request
+                // that was submitted. Without this the work would wait for the next offload to defer it
+                // or the next launch to drain it. Re-submitting on the way out costs nothing when
+                // nothing is owed, because it is skipped entirely.
+                if RescoreBackgroundScheduler.isRescoreOwed { RescoreBackgroundScheduler.schedule() }
                 // #114: capture the LAST in-app live state on the way out so the Home widget matches what
                 // the user just saw — its battery/HR/score otherwise lag to the last FOREGROUND refreshSeq
                 // bump. One reload per app-exit is low-frequency and well within WidgetKit's daily budget.
@@ -248,6 +332,9 @@ private struct iOSRootView: View {
     @AppStorage("noop.lastSeenChangelogVersion") private var lastSeenChangelog = ""
     @AppStorage("noop.acceptedTermsVersion") private var acceptedTerms = ""
     @State private var showWhatsNew = false
+    /// Starts false so a cold-launch external action can't race this view's onAppear decision about the
+    /// automatic What's New sheet. It becomes true only when no sheet is due or its dismissal completes.
+    @State private var automaticLaunchSheetResolved = false
 
     var body: some View {
         #if DEBUG
@@ -271,7 +358,9 @@ private struct iOSRootView: View {
 
     private var shell: some View {
         ZStack {
-            RootTabView()
+            RootTabView(homeScreenQuickActionsEnabled:
+                demoBypass || (onboarded && acceptedTerms == Terms.currentVersion
+                    && automaticLaunchSheetResolved))
             if !onboarded && !demoBypass {
                 OnboardingWizard(onFinished: {
                     onboarded = true
@@ -285,14 +374,19 @@ private struct iOSRootView: View {
             // Terms acknowledgment gate — over EVERYTHING (before onboarding/pairing/Bluetooth) until
             // the current terms version is accepted; re-appears if the terms materially change.
             if acceptedTerms != Terms.currentVersion && !demoBypass {
-                TermsGateView(onAccept: { acceptedTerms = Terms.currentVersion })
+                TermsGateView(onAccept: {
+                    // Keep any external action behind the gate while the accepted-terms change decides
+                    // whether What's New must present next. This write must precede acceptedTerms.
+                    automaticLaunchSheetResolved = false
+                    acceptedTerms = Terms.currentVersion
+                })
                     .transition(.opacity)
                     .zIndex(2)
             }
         }
         .animation(.easeInOut(duration: 0.35), value: onboarded)
         .animation(.easeInOut(duration: 0.35), value: acceptedTerms)
-        .sheet(isPresented: $showWhatsNew) {
+        .sheet(isPresented: $showWhatsNew, onDismiss: { automaticLaunchSheetResolved = true }) {
             WhatsNewView(onClose: {
                 lastSeenChangelog = AppChangelog.currentVersion
                 showWhatsNew = false
@@ -321,11 +415,17 @@ private struct iOSRootView: View {
     }
 
     private func showWhatsNewIfDue() {
-        if demoBypass { return }
+        if demoBypass {
+            automaticLaunchSheetResolved = true
+            return
+        }
         // Existing users who updated: their last-seen version is behind the current one.
         if onboarded && acceptedTerms == Terms.currentVersion
             && lastSeenChangelog != AppChangelog.currentVersion {
+            automaticLaunchSheetResolved = false
             showWhatsNew = true
+        } else {
+            automaticLaunchSheetResolved = true
         }
     }
 }

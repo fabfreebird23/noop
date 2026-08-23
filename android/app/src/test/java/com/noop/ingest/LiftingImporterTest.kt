@@ -190,6 +190,38 @@ class LiftingImporterTest {
         assertEquals(1, LiftingImporter.parseLiftosaur(wrapped).sessions.size)
     }
 
+    @Test
+    fun liftosaurHeterogeneousHistoryCountsEveryRejectedRecord() {
+        val json =
+            """
+            { "history": [
+              { "startTime": 1748772000000, "endTime": 1748775600000, "dayName": "Day 1",
+                "entries": [ { "sets": [ { "weight": 80, "completedReps": 5 } ] } ] },
+              7,
+              { "dayName": "Missing timestamp",
+                "entries": [ { "sets": [ { "weight": 60, "completedReps": 8 } ] } ] },
+              "not a record"
+            ] }
+            """.trimIndent()
+
+        val r = LiftingImporter.parse(json.toByteArray())
+
+        assertEquals(listOf(1748772000L), r.sessions.map { it.startTs })
+        assertEquals(1, r.sessions.size)
+        val s = r.sessions[0]
+        assertEquals(1748775600L, s.endTs)
+        assertEquals(3600.0, s.durationS!!, 1e-9)
+        assertEquals(400.0, s.volumeLoadKg, 1e-6)
+        assertEquals(1, s.setCount)
+        assertEquals(1, s.exerciseCount)
+        assertEquals(5, s.totalReps)
+        assertEquals(80.0, s.topSetKg!!, 1e-9)
+        assertEquals("Day 1", s.title)
+        assertEquals("2025-06-01", r.firstDay)
+        assertEquals("2025-06-01", r.lastDay)
+        assertEquals(3, r.skipped)
+    }
+
     // MARK: - Auto-detection + note
 
     @Test
@@ -203,16 +235,15 @@ class LiftingImporterTest {
     }
 
     @Test
-    fun volumeLoadNoteIsHonestlyLabelled() {
-        val s = LiftingImporter.Session(
+    fun volumeLoadNoteMatchesSwiftForTitledAndUntitledSessions() {
+        fun session(title: String?) = LiftingImporter.Session(
             startTs = 0, endTs = 0, volumeLoadKg = 12400.0, setCount = 18,
-            exerciseCount = 5, totalReps = 120, topSetKg = 140.0, title = "Leg Day",
+            exerciseCount = 5, totalReps = 120, topSetKg = 140.0, title = title,
         )
-        val note = s.volumeLoadNote()
-        assertTrue(note, note.contains("volume load 12,400 kg"))
-        assertTrue(note, note.contains("Strength"))
-        assertTrue(note, note.contains("18 sets"))
-        assertTrue(note, note.contains("5 exercises"))
-        assertTrue(note, note.contains("Leg Day"))
+
+        val body = "Strength · volume load 12,400 kg · 18 sets · 5 exercises"
+        assertEquals(body, session(null).volumeLoadNote())
+        assertEquals(body, session("").volumeLoadNote())
+        assertEquals("Leg Day: $body", session("Leg Day").volumeLoadNote())
     }
 }

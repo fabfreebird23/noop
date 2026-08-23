@@ -21,7 +21,7 @@ struct UpdatesInboxView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-                .background(StrandPalette.surfaceRaised)
+                .background(NoopChromeSurface())
             Divider().overlay(StrandPalette.hairline)
             content
             if !updateStore.items.isEmpty {
@@ -89,6 +89,10 @@ struct UpdatesInboxView: View {
                 }
                 .padding(20)
             }
+            #if os(iOS)
+            // #697/#horizontal-swipe parity, see ScreenScaffold.
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            #endif
         }
     }
 

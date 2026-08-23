@@ -1,6 +1,8 @@
 package com.noop.ui
 
 import android.content.Context
+import androidx.annotation.StringRes
+import com.noop.R
 
 // MARK: - Reorderable Today sections (#today-layout)
 //
@@ -20,16 +22,22 @@ import android.content.Context
  * One reorderable Today section. The [raw] is the stable persisted identifier — keep it byte-identical to
  * the macOS `TodaySection` enum so a backup/restore reads the same layout on either OS.
  */
-enum class TodaySection(val raw: String, val title: String) {
-    HERO("hero", "Charge / Effort / Rest"),
-    LIVE_SESSION("liveSession", "Start session"),
-    SYNTHESIS("synthesis", "Synthesis"),
-    KEY_METRICS("keyMetrics", "Key Metrics"),
-    WORKOUTS("workouts", "Workouts"),
-    HEART_RATE("heartRate", "Heart Rate"),
-    RECOVERY_VITALS("recoveryVitals", "Recovery Vitals"),
-    YOUR_CARDS("yourCards", "Your Cards"),
-    JOURNAL("journal", "Journal");
+enum class TodaySection(val raw: String, @StringRes val titleRes: Int) {
+    HERO("hero", R.string.today_section_hero),
+    LIVE_SESSION("liveSession", R.string.today_section_live_session),
+    SYNTHESIS("synthesis", R.string.today_section_synthesis),
+    KEY_METRICS("keyMetrics", R.string.today_section_key_metrics),
+    WORKOUTS("workouts", R.string.today_section_workouts),
+    HEART_RATE("heartRate", R.string.today_section_heart_rate),
+    RECOVERY_VITALS("recoveryVitals", R.string.today_section_recovery_vitals),
+    YOUR_CARDS("yourCards", R.string.today_section_your_cards),
+    MENSTRUAL_CYCLE("menstrualCycle", R.string.today_section_menstrual_cycle),
+    JOURNAL("journal", R.string.today_section_journal),
+
+    /** Cards hosted from the Trends / Sleep tabs (#today-hosted-cards). Renders the [HostedCardPrefs]
+     *  selection in order; empty (and effectively invisible) until the user adds a card in Customise.
+     *  Appended LAST so [decodeOrder]'s back-fill lands it predictably for existing saved orders. */
+    ADDED_CARDS("addedCards", R.string.today_section_added_cards);
 
     companion object {
         fun fromRaw(raw: String?): TodaySection? = entries.firstOrNull { it.raw == raw }
@@ -38,7 +46,7 @@ enum class TodaySection(val raw: String, val title: String) {
          *  journal widget (#656) is last by default, where it was first added, above the data-sources card. */
         val defaultOrder: List<TodaySection> = listOf(
             HERO, LIVE_SESSION, SYNTHESIS, KEY_METRICS, WORKOUTS, HEART_RATE, RECOVERY_VITALS, YOUR_CARDS,
-            JOURNAL,
+            MENSTRUAL_CYCLE, JOURNAL, ADDED_CARDS,
         )
     }
 }

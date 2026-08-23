@@ -140,6 +140,10 @@ struct RhythmConsentGate: View {
                     .padding(.horizontal, 30)
                     .padding(.bottom, 18)
                 }
+                #if os(iOS)
+                // #697/#horizontal-swipe parity, see ScreenScaffold.
+                .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+                #endif
 
                 Rectangle()
                     .fill(StrandPalette.hairline)
@@ -247,14 +251,20 @@ struct RhythmView: View {
     /// The per-window results for the night, in time order. Their `poincare` clouds are
     /// pooled for the plot and their stats drive the descriptive tiles. May be empty.
     let windows: [RhythmScreener.WindowResult]
+    /// Why the night is empty (#1360) — picks WHICH honest empty-state copy shows when there is nothing
+    /// to plot. `.gatheringData` (the "try again" state) is the default for previews and any caller that
+    /// doesn't diagnose the reason.
+    let emptyReason: RhythmEmptyState
     /// Optional dismissal hook when presented as a sheet.
     var onClose: (() -> Void)? = nil
 
     init(night: RhythmScreener.NightRhythmSummary?,
          windows: [RhythmScreener.WindowResult],
+         emptyReason: RhythmEmptyState = .gatheringData,
          onClose: (() -> Void)? = nil) {
         self.night = night
         self.windows = windows
+        self.emptyReason = emptyReason
         self.onClose = onClose
     }
 
@@ -300,6 +310,20 @@ struct RhythmView: View {
         windows.flatMap { $0.poincare }
     }
 
+    /// #1298: the temp .csv URL for the share sheet, written ONCE by `.task` (below) — not in `body`,
+    /// so rendering never touches disk. nil until the write lands / when nothing is readable.
+    @State private var rhythmExportURL: URL?
+
+    /// Write the night's DESCRIPTIVE data to a temp .csv for the OS share sheet — the §11 "share with
+    /// my clinician" path. Neutral data ONLY (`RhythmExport` forbids any verdict / condition name); nil
+    /// when nothing readable. A tiny, atomic write, run off the render path from `.task`.
+    private func buildRhythmExportURL() -> URL? {
+        guard let night, !windows.isEmpty else { return nil }
+        let csv = RhythmExport.csv(summary: night, windows: windows)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("noop-rhythm.csv")
+        return (try? csv.write(to: url, atomically: true, encoding: .utf8)) != nil ? url : nil
+    }
+
     private var visualization: some View {
         ScreenScaffold(
             title: "Rhythm",
@@ -314,6 +338,7 @@ struct RhythmView: View {
             trailing: { closeButton }
         ) {
             SourceBadge("Experimental", tint: StrandPalette.restColor)
+                .task(id: windows.count) { rhythmExportURL = buildRhythmExportURL() }
 
             if allPoints.isEmpty {
                 emptyState
@@ -321,6 +346,14 @@ struct RhythmView: View {
                 summaryCard
                 plotCard
                 statsCard
+                if let rhythmExportURL {
+                    // #1298: hand the clinician the DATA, never a verdict. A neutral CSV export.
+                    ShareLink(item: rhythmExportURL) {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                            .font(StrandFont.subhead)
+                    }
+                    .tint(StrandPalette.restColor)
+                }
             }
 
             methodologyCard
@@ -342,6 +375,45 @@ struct RhythmView: View {
 
     // MARK: Summary card — the neutral, plain-language headline (NO verdict)
 
+    /// OpenStrap-style status chip: a compact pill with an icon + the neutral regularity label. Modelled
+    /// on `SourceBadge`, but in the calm Rest-blue palette — NEVER a warn/alarm colour (§11 forbids alarm
+    /// styling; OpenStrap tints its chip amber, NOOP does not). States differ by icon + wording only, and
+    /// the short `chipLabel` sits in the pill, the sentence `headlineDetail` reads below. Non-diagnostic.
+    private var statusChip: some View {
+        let label = night?.overall ?? headlineWindow?.label ?? .unreadable
+        return HStack(spacing: 6) {
+            Image(systemName: Self.statusIcon(label))
+            Text(chipLabel(label))
+        }
+        .font(StrandFont.subhead)
+        .foregroundStyle(StrandPalette.restBright)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(StrandPalette.restColor.opacity(0.16), in: Capsule(style: .continuous))
+        .overlay(Capsule(style: .continuous).strokeBorder(StrandPalette.restColor.opacity(0.34), lineWidth: 1))
+    }
+
+    /// The SHORT neutral status word inside the chip (the sentence-length `headlineDetail` reads below).
+    /// Compact so the chip renders like OpenStrap's, not a full-width banner. Non-diagnostic wording.
+    private func chipLabel(_ label: RhythmRegularity) -> String {
+        switch label {
+        case .steady:           return String(localized: "Steady")
+        case .occasionalEctopy: return String(localized: "Some variation")
+        case .varied:           return String(localized: "More varied")
+        case .unreadable:       return String(localized: "No clear reading")
+        }
+    }
+
+    /// A calm, non-alarm SF Symbol per neutral state — a check for steady, the ECG waveform for any
+    /// variation (never a warning triangle), a question mark when unread. No red, no alarm (§11).
+    private static func statusIcon(_ label: RhythmRegularity) -> String {
+        switch label {
+        case .steady:                    return "checkmark.circle.fill"
+        case .occasionalEctopy, .varied: return "waveform.path.ecg"
+        case .unreadable:                return "questionmark.circle"
+        }
+    }
+
     private var summaryCard: some View {
         StrandCard(padding: 18, tint: StrandPalette.restColor) {
             VStack(alignment: .leading, spacing: 10) {
@@ -350,10 +422,7 @@ struct RhythmView: View {
                     Spacer()
                     ScoreStatePill(confidenceState, text: confidenceText)
                 }
-                Text(headlineLabel)
-                    .font(StrandFont.title2)
-                    .foregroundStyle(StrandPalette.textPrimary)
-                    .fixedSize(horizontal: false, vertical: true)
+                statusChip
                 Text(headlineDetail)
                     .font(StrandFont.subhead)
                     .foregroundStyle(StrandPalette.textSecondary)
@@ -460,12 +529,25 @@ struct RhythmView: View {
 
     // MARK: Empty / thin-night state
 
+    /// #1360: a TRUTHFUL empty state. When every window was refused for a *capture* reason the device can
+    /// never satisfy — its beats arrive banked, or it records no stillness signal at all — say so, instead
+    /// of the "try again after a settled night" copy that is a lie when tomorrow is structurally identical.
+    /// `.gatheringData`/`.none` keep the original "no clear reading yet" wording (a genuine try-again).
     private var emptyState: some View {
-        DataPendingNote(
-            title: "No clear reading yet",
-            message: "Rhythm only looks during quiet, still, resting windows, so it needs a calm night's worth of steady beats. Once there's a clean window, the scatter and its description show here.",
-            symbol: "waveform.path"
-        )
+        let title: LocalizedStringKey
+        let message: LocalizedStringKey
+        switch emptyReason {
+        case .deviceBanksBeats:
+            title = "This device can't support a rhythm reading"
+            message = "Rhythm needs beat-to-beat timing measured one beat at a time. Your device stores its heartbeats in batches, so the exact spacing between them isn't recoverable. Nothing is wrong with your night."
+        case .deviceNoMotion:
+            title = "This device can't support a rhythm reading"
+            message = "Rhythm reads only during still, resting windows, and this device doesn't record the stillness signal it needs to find them. Nothing is wrong with your night."
+        case .none, .gatheringData:
+            title = "No clear reading yet"
+            message = "Rhythm only looks during quiet, still, resting windows, so it needs a calm night's worth of steady beats. Once there's a clean window, the scatter and its description show here."
+        }
+        return DataPendingNote(title: title, message: message, symbol: "waveform.path")
     }
 
     // MARK: Methodology
@@ -483,17 +565,6 @@ struct RhythmView: View {
     }
 
     // MARK: - Copy mapping (neutral, non-clinical — NO verdict, NO condition name)
-
-    /// The plain-language headline for the night's most-prominent label. Deliberately
-    /// descriptive and benign; no "consider a clinician", no condition, no alarm.
-    private var headlineLabel: String {
-        switch night?.overall ?? headlineWindow?.label ?? .unreadable {
-        case .steady:           return String(localized: "Your rhythm looked steady")
-        case .occasionalEctopy: return String(localized: "Some occasional extra or skipped beats")
-        case .varied:           return String(localized: "Your rhythm varied more than usual")
-        case .unreadable:       return String(localized: "Couldn't read clearly")
-        }
-    }
 
     private var headlineDetail: String {
         switch night?.overall ?? headlineWindow?.label ?? .unreadable {

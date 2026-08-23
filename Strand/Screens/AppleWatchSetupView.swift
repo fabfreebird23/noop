@@ -37,7 +37,7 @@ struct AppleWatchSetupView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-                .background(StrandPalette.surfaceRaised)
+                .background(NoopChromeSurface())
             Divider().overlay(StrandPalette.hairline)
             ScrollView {
                 VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
@@ -48,6 +48,10 @@ struct AppleWatchSetupView: View {
                 }
                 .padding(20)
             }
+            #if os(iOS)
+            // #697/#horizontal-swipe parity, see ScreenScaffold.
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            #endif
             Divider().overlay(StrandPalette.hairline)
             footerBar
         }

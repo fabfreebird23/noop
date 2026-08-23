@@ -52,6 +52,43 @@ object Baselines {
     /** Missing-night count after which a baseline is marked stale. */
     const val staleDays: Int = 14
 
+    /**
+     * How many days a nightly VITAL may be carried forward and still be presented as the "latest"
+     * reading. A carry exists so one missed night doesn't blank a tile — not so a months-old value
+     * reads as tonight's measurement. Past this age the tile must show "—": a silent stale number is
+     * worse than no number, because the reader takes it for a current measurement (which is exactly
+     * what a 14-day-old imported respiratory rate did, surfacing as "Respiratory 15.6" on the Sleep
+     * tab's Night detail with no date beside it). A week comfortably covers a missed night or a
+     * weekend off-strap while staying decisively short of [staleDays], past which the personal
+     * baseline that judges the value is itself stale. Byte-twin of the Swift `vitalCarryDays`.
+     */
+    const val vitalCarryDays: Int = 7
+
+    /**
+     * The freshest `(day, value)` pair still fresh enough to present as "latest", or null when the
+     * newest one is older than [carryDays] relative to [todayKey]. Both keys are `yyyy-MM-dd`, which
+     * compares chronologically as a string, so no calendar math (or time zone) is involved — [points]
+     * need only be sorted oldest→newest. Byte-twin of the Swift `freshestCarried`.
+     */
+    fun <T> freshestCarried(
+        points: List<Pair<String, T>>,
+        todayKey: String,
+        carryDays: Int = vitalCarryDays,
+    ): Pair<String, T>? {
+        val newest = points.lastOrNull() ?: return null
+        return if (newest.first >= cutoffKey(todayKey, carryDays)) newest else null
+    }
+
+    /**
+     * The oldest `yyyy-MM-dd` a carried vital may bear: [todayKey] − [carryDays] days. An unparseable
+     * key yields [todayKey], which admits only today — fail closed, never carry. Byte-twin of the
+     * Swift `cutoffKey`.
+     */
+    fun cutoffKey(todayKey: String, carryDays: Int = vitalCarryDays): String =
+        runCatching {
+            java.time.LocalDate.parse(todayKey).minusDays(carryDays.toLong()).toString()
+        }.getOrDefault(todayKey)
+
     // ─────────────────────────────────────────────────────────────────────────
     // Early-life anti-anchoring (Reddit HRV report) — mirrors Baselines.swift
     // ─────────────────────────────────────────────────────────────────────────
@@ -125,6 +162,44 @@ object Baselines {
             minVal = 0.0, maxVal = 100.0, floorSpread = 5.0,
             halfLifeB = 14.0, halfLifeS = 21.0,
         ),
+        // Readiness HRV baseline, folded in the LOG domain (ln ms) with hard-outlier rejection OFF
+        // (RD2 · the window-fold spine mode — see update's `rejectHardOutliers`). ReadinessEngine
+        // z-scores lnRMSSD (RD1: HRV is right-skewed), so these bounds/floor are in LN(ms) units — NOT
+        // the raw-ms "hrv" config above (which the RecoveryScorer folds linearly, untouched).
+        // minVal/maxVal = ln(8)/ln(250), the plausible HRV band in ln. floorSpread 0.08 (ln) sits just
+        // below a real wearer's own ln-HRV night-to-night spread (~0.10), so personal spread drives the
+        // z while an ultra-stable baseline is floored against saturation. Byte-identical to the Swift
+        // `readiness_hrv_ln` config.
+        "readiness_hrv_ln" to MetricCfg(
+            minVal = 2.079, maxVal = 5.521, floorSpread = 0.08,
+            halfLifeB = 14.0, halfLifeS = 21.0,
+        ),
+
+        // Daytime/waking-hours configs (DaytimeStress baseline-relative mode, added alongside
+        // the day-relative default). Distinct from "resting_hr"/"hrv" above, which each fold ONE
+        // NIGHTLY value (sleep). These fold ONE DAYTIME aggregate per day into a cross-day
+        // PERSONAL baseline, so a caller can hand the resulting BaselineState to
+        // DaytimeStress.analyze(mode = ScoringMode.BaselineRelative(hr, rmssd)) and z-score each
+        // waking hour against "how MY days usually run" rather than "how today's own calm hours ran".
+        //
+        // VALIDATED (26-day Oura-reference correlation, HR-only, r≈0.6): the per-day value to
+        // fold for "daytime_hr" is that day's 10th-percentile daytime HR (~65 bpm pooled across
+        // the reference set) — NOT the day-relative calmReference's 25th-percentile quartile.
+        // The "high stress" cutoff itself is a validated fixed bpm margin over this baseline,
+        // NOT this config's floorSpread — see DaytimeStress.baselineRelativeHighMarginBPM.
+        // TUNING SEAM: minVal/maxVal/half-life below (and all of "daytime_rmssd" — RMSSD wasn't
+        // part of the validated HR-only comparison) are a documented first pass, refinable once
+        // an HR+HRV comparison exists. floorSpread is wider than the nightly "hrv" config for
+        // RMSSD: daytime RMSSD carries more incidental noise (posture changes, talking, movement
+        // between "calm" hours) than overnight recumbent HRV.
+        "daytime_hr" to MetricCfg(
+            minVal = 35.0, maxVal = 160.0, floorSpread = 3.0,
+            halfLifeB = 14.0, halfLifeS = 21.0,
+        ),
+        "daytime_rmssd" to MetricCfg(
+            minVal = 5.0, maxVal = 250.0, floorSpread = 7.0,
+            halfLifeB = 14.0, halfLifeS = 21.0,
+        ),
     )
 
     /** Convenience accessor for the standard HRV config. */
@@ -133,11 +208,21 @@ object Baselines {
     /** Convenience accessor for the standard resting-HR config. */
     val restingHRCfg: MetricCfg get() = metricCfg.getValue("resting_hr")
 
+    /** Readiness HRV baseline config — folded in the LOG domain (ln ms) with hard-outlier rejection
+     *  OFF. See the `readiness_hrv_ln` comment above; distinct from the raw-ms [hrvCfg]. */
+    val readinessHRVLnCfg: MetricCfg get() = metricCfg.getValue("readiness_hrv_ln")
+
     /** Convenience accessor for the standard respiration config. */
     val respCfg: MetricCfg get() = metricCfg.getValue("resp")
 
     /** Baseline config for the RecoveryScorer Activity-Balance / previous-day-Effort term. */
     val strainCfg: MetricCfg get() = metricCfg.getValue("strain")
+
+    /** Personal daytime/waking HR baseline config — see the `daytime_hr` comment above. */
+    val daytimeHRCfg: MetricCfg get() = metricCfg.getValue("daytime_hr")
+
+    /** Personal daytime/waking RMSSD baseline config — see the `daytime_rmssd` comment above. */
+    val daytimeRMSSDCfg: MetricCfg get() = metricCfg.getValue("daytime_rmssd")
 
     /** Convert a half-life in nights to an EWMA smoothing factor. */
     internal fun lambda(halfLife: Double): Double = 1.0 - 0.5.pow(1.0 / halfLife)
@@ -160,7 +245,7 @@ object Baselines {
         for (i in 0 until minOf(dayKeys.size, nightlyHrv.size)) {
             if (nightlyHrv[i] == null) continue
             val k = dayKeys[i]
-            if (newest == null || k > newest!!) newest = k
+            if (newest == null || k > newest) newest = k
         }
         val n = newest ?: return null
         val a = isoEpochDay(n) ?: return null
@@ -197,8 +282,17 @@ object Baselines {
      * - `value == null` or out-of-range: skip-and-hold (carry forward).
      * - hard outlier (> HARD_OUTLIER_K × spread): seen but not folded.
      * - otherwise: Winsorized EWMA center + EWMA-abs-dev spread update.
+     *
+     * `rejectHardOutliers` (default true) can turn the hard-outlier gate OFF for a TRAILING-WINDOW
+     * re-fold — where the same window is re-folded every call and a *recent sustained* shift lands at
+     * the window's end (past the young grace period), so rejection would discard a real new normal as a
+     * string of "outliers" (Readiness's device-swap / supplement-onset failure mode). With it off the
+     * Winsorization below STILL damps a single freak night (clamped, not folded raw) but a sustained
+     * shift is followed instead of rejected — the incremental-fold (reject on, RecoveryScorer) vs
+     * window-fold (reject off, Readiness) distinction. Byte-identical to the Swift `rejectHardOutliers`.
      */
-    fun update(state: BaselineState?, value: Double?, cfg: MetricCfg): BaselineState {
+    fun update(state: BaselineState?, value: Double?, cfg: MetricCfg,
+               rejectHardOutliers: Boolean = true): BaselineState {
         val lb = lambda(cfg.halfLifeB)
         val ls = lambda(cfg.halfLifeS)
 
@@ -247,7 +341,7 @@ object Baselines {
         // Suspending this during early life is the core anti-anchoring fix — a high seed with a
         // floor-tight spread would otherwise reject the user's real, lower readings as "outliers"
         // (a true 54ms vs an anchored ~90ms baseline is >5× the floor spread).
-        if (state.nValid >= minNightsSeed && !isYoung) {
+        if (rejectHardOutliers && state.nValid >= minNightsSeed && !isYoung) {
             val dev = abs(value - state.baseline)
             if (dev > hardOutlierK * state.spread) {
                 return BaselineState(
@@ -293,9 +387,10 @@ object Baselines {
      * Replay an ordered sequence of nightly values (oldest first) to build state.
      * `null` entries are treated as missing nights (skip-and-hold).
      */
-    fun foldHistory(values: List<Double?>, cfg: MetricCfg): BaselineState {
+    fun foldHistory(values: List<Double?>, cfg: MetricCfg,
+                    rejectHardOutliers: Boolean = true): BaselineState {
         var state: BaselineState? = null
-        for (v in values) state = update(state, v, cfg)
+        for (v in values) state = update(state, v, cfg, rejectHardOutliers)
         state?.let { return it }
         val seed = (cfg.minVal + cfg.maxVal) / 2.0
         return BaselineState(
@@ -423,12 +518,20 @@ object Baselines {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
+     * Convert a state's EWMA-abs-dev spread to an approximate Gaussian σ: 1.253 × spread,
+     * floored so a caller never divides by ~0. 1.253 is E[|X−μ|] = σ·√(2/π) inverted
+     * (E[|X−μ|] ≈ σ/1.253 for a Gaussian). Shared by [deviation] below and by any other
+     * z-scoring caller (e.g. [DaytimeStress]'s baseline-relative mode) so the conversion has
+     * exactly one definition.
+     */
+    fun sigma(state: BaselineState): Double = max(1.253 * state.spread, 1e-9)
+
+    /**
      * Compute z / delta / ratio / in-normal-range for a value vs a baseline.
-     * z uses (value − baseline) / (1.253 × spread); 1.253 converts EWMA-abs-dev
-     * to an approximate Gaussian σ (E[|X−μ|] = σ·√(2/π) ≈ σ/1.253).
+     * z uses (value − baseline) / sigma(state); see [sigma] for the 1.253 conversion.
      */
     fun deviation(value: Double, state: BaselineState): Deviation {
-        val sigma = max(1.253 * state.spread, 1e-9)
+        val sigma = sigma(state)
         val z = (value - state.baseline) / sigma
         val delta = value - state.baseline
         val ratio = if (state.baseline != 0.0) (value / state.baseline - 1.0) else 0.0

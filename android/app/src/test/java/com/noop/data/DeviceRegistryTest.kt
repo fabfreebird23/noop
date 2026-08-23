@@ -2,8 +2,10 @@ package com.noop.data
 
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -60,6 +62,12 @@ class DeviceRegistryTest {
         override suspend fun renameDevice(id: String, nickname: String?) {
             devices[id]?.let { devices[id] = it.copy(nickname = nickname) }
         }
+        override suspend fun touchLastSeen(id: String, now: Long) {
+            // #1527, mirrors the query's `AND status != 'archived'`.
+            devices[id]?.let {
+                if (it.status != DeviceStatus.archived.name) devices[id] = it.copy(lastSeenAt = now)
+            }
+        }
 
         override suspend fun setPeripheralId(id: String, peripheralId: String?) {
             devices[id]?.let { devices[id] = it.copy(peripheralId = peripheralId) }
@@ -98,6 +106,7 @@ class DeviceRegistryTest {
         override suspend fun deleteJournalFor(deviceId: String) { deletedTables += "journal" to deviceId }
         override suspend fun deleteWorkoutsFor(deviceId: String) { deletedTables += "workout" to deviceId }
         override suspend fun deleteAppleDailyFor(deviceId: String) { deletedTables += "appleDaily" to deviceId }
+        override suspend fun deleteAppleStepHoursFor(deviceId: String) { deletedTables += "appleStepHour" to deviceId }
         override suspend fun deleteMetricSeriesFor(deviceId: String) { deletedTables += "metricSeries" to deviceId }
         override suspend fun deleteDayOwnershipFor(deviceId: String) {
             deletedTables += "dayOwnership" to deviceId
@@ -134,6 +143,7 @@ class DeviceRegistryTest {
         override suspend fun reKeyJournal(from: String, to: String) {}
         override suspend fun reKeyWorkouts(from: String, to: String) {}
         override suspend fun reKeyAppleDaily(from: String, to: String) {}
+        override suspend fun reKeyAppleStepHour(from: String, to: String) {}
         override suspend fun reKeyMetricSeries(from: String, to: String) {}
         override suspend fun reKeyDayOwnership(from: String, to: String) {
             for ((day, row) in owners) if (row.deviceId == from) owners[day] = row.copy(deviceId = to)
@@ -179,6 +189,16 @@ class DeviceRegistryTest {
         assertEquals("my-whoop", reg.activeDeviceId())
     }
 
+    /** #548: stale registry bits listing calibrated SpO₂ must not surface for a live WHOOP. */
+    @Test
+    fun allStripsSpo2FromWhoopCapabilities() = runBlocking {
+        val reg = registryWith(seededDao())
+        val caps = reg.all().first().capabilities
+        assertFalse(caps.split(',').contains("spo2"))
+        assertTrue(caps.contains("hr"))
+        assertTrue(caps.contains("skinTemp"))
+    }
+
     @Test
     fun setActiveDemotesPreviousAndKeepsExactlyOneActive() = runBlocking {
         val dao = seededDao()
@@ -210,6 +230,17 @@ class DeviceRegistryTest {
         assertEquals(1, reg.all().size)
         assertEquals(DeviceStatus.archived.name, reg.all().first().status)
         assertNull(reg.activeDeviceId())
+    }
+
+    @Test
+    fun forgetRemovesRegistryRowAndWipesData() = runBlocking {
+        // #1193: unlike archive (row kept, I4) and deleteDeviceData (row kept), forget PURGES the registry
+        // entry so a duplicate/stale strap disappears from the list entirely — after wiping its recordings.
+        val dao = seededDao()
+        val reg = registryWith(dao)
+        reg.forget("my-whoop")
+        assertTrue(reg.all().isEmpty())                               // registry row purged, not just archived
+        assertTrue(dao.deletedTables.any { it.second == "my-whoop" }) // its recorded data was wiped first
     }
 
     @Test
@@ -286,6 +317,10 @@ class DeviceRegistryTest {
             "journal", "workout", "appleDaily", "metricSeries", "dayOwnership",
             "scoreInputProvenance",
             "sleepStateSample", "labMarker", "liveSession", "dismissedWorkout", "dismissedSleep",
+            // v38-apple-step-hour: hourly Apple-Health steps. No Android importer writes this table, but a
+            // `.noopbak` restored from iOS carries its rows — and THIS path is "Remove Apple Health
+            // imported data", so leaving them behind would be the plainest form of the defect.
+            "appleStepHour",
         )
         assertEquals(expectedTables, dao.deletedTables.map { it.first }.toSet())
         // Every delete was scoped to the requested device, not the seeded my-whoop.

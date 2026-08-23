@@ -16,6 +16,9 @@ struct AutomationsView: View {
 
     /// v5 cycle-awareness opt-in (default OFF — the most sensitive health category, manual-first).
     @AppStorage(AppModel.cycleAwarenessKey) private var cycleAwareness = false
+    /// #hide-cycle: the user's "not for me" opt-out (never age-based). Master visibility control lives here
+    /// so it stays reachable to un-hide even after the offer is gone from Today + Health.
+    @AppStorage(AppModel.cycleAwarenessHiddenKey) private var cycleHidden = false
 
     /// Whether the cycle-awareness opt-in is offered for this profile (#801). Delegates to the shared
     /// ``ProfileStore/cycleAwarenessApplies`` gate (mirrors HealthView's opt-in gate) so a male profile
@@ -35,6 +38,15 @@ struct AutomationsView: View {
     @AppStorage("notif.masterEnabled") private var wristAlertsMaster = false
     #endif
 
+    // #haptics (#1115): per-event toggles for NOOP's IN-SESSION strap buzzes. Default ON (opt-out) — these
+    // are feedback to a feature you started, so a fresh install buzzes as before and a user turns off any
+    // cue. Ambient cues (inactivity / stress / coaching) keep their own opt-in cards; double-tap is gated by
+    // its action picker. Same keys the buzz sites read via HapticPrefs (which also defaults an unset key on).
+    @AppStorage(HapticPrefs.breathing) private var breathingHaptic = true
+    @AppStorage(HapticPrefs.intervals) private var intervalsHaptic = true
+    @AppStorage(HapticPrefs.liveSession) private var liveSessionHaptic = true
+    @AppStorage(HapticPrefs.workout) private var workoutHaptic = true
+
     var body: some View {
         ScreenScaffold(title: "Automations",
                        subtitle: "Make the strap do things: tap to act, walk away to lock, train by feel.",
@@ -46,6 +58,7 @@ struct AutomationsView: View {
             wristAlertsCard
             #endif
             doubleTapCard
+            hapticsCard
             wearCard
             coachingCard
             // #766: the strap's silent wake-alarm card used to sit here, which let users conflate it with
@@ -78,6 +91,35 @@ struct AutomationsView: View {
         }
     }
     #endif
+
+    // MARK: - Haptics (#1115)
+
+    /// Per-event opt-in toggles for NOOP's in-session strap buzzes (all default OFF, existing installs
+    /// migrated on). Parity with the Android Automations "Haptics" section. Ambient cues and the
+    /// Android-only call/notification buzzes are not shown here (the latter can't exist on Apple).
+    private var hapticsCard: some View {
+        Section2(icon: "waveform.path", title: String(localized: "Haptics"),
+                 blurb: String(localized: "Choose which in-session cues buzz your wrist during a breathing session, timer, or workout."),
+                 active: breathingHaptic || intervalsHaptic || liveSessionHaptic || workoutHaptic) {
+            VStack(spacing: 0) {
+                ToggleRow(label: String(localized: "Breathing pacer"),
+                          help: String(localized: "Buzz each inhale and exhale during a breathing or resonance session."),
+                          isOn: $breathingHaptic)
+                rowDivider
+                ToggleRow(label: String(localized: "Interval timer"),
+                          help: String(localized: "Buzz on each interval change."),
+                          isOn: $intervalsHaptic)
+                rowDivider
+                ToggleRow(label: String(localized: "Live Session cues"),
+                          help: String(localized: "Coaching buzzes during a live workout session."),
+                          isOn: $liveSessionHaptic)
+                rowDivider
+                ToggleRow(label: String(localized: "Workout start & end"),
+                          help: String(localized: "A buzz confirms a workout starting and saving."),
+                          isOn: $workoutHaptic)
+            }
+        }
+    }
 
     // MARK: - Double tap
 
@@ -136,10 +178,10 @@ struct AutomationsView: View {
     }
     private static let momentFormatter: DateFormatter = {
         let f = DateFormatter()
-        f.locale = Locale.current
+        f.locale = AppLanguage.activeLocale
         // Keep the "EEE d MMM ·" layout but honor the device's 12-/24-hour clock (#337): the "j"
         // template resolves to a 12-hour pattern (contains "a") only where the user prefers it.
-        let uses24h = !(DateFormatter.dateFormat(fromTemplate: "j", options: 0, locale: .current) ?? "H").contains("a")
+        let uses24h = !(DateFormatter.dateFormat(fromTemplate: "j", options: 0, locale: AppLanguage.activeLocale) ?? "H").contains("a")
         f.dateFormat = "EEE d MMM · " + (uses24h ? "HH:mm" : "h:mm a")
         return f
     }()
@@ -313,14 +355,31 @@ struct AutomationsView: View {
                 // not shown for male profiles). Keeps the two surfaces consistent: a profile that can't
                 // see the Health card can't enable the feature from here either.
                 if cycleOptInApplies {
-                    ToggleRow(label: String(localized: "Cycle awareness"),
-                              help: String(localized: "Reads a coarse menstrual-cycle phase from your nightly skin temperature, entirely on \(Platform.deviceNounPhrase). Awareness only: not contraception, not a fertility predictor, not a medical service. The card appears in Health."),
-                              isOn: $cycleAwareness)
-                        .onChangeCompat(of: cycleAwareness) { on in
-                            model.cycleAwarenessEnabled = on
-                            Task { await model.refreshV5Signals() }
-                        }
+                    // #hide-cycle: the master visibility control — a USER opt-out, never age-based. Turning
+                    // it off hides the cycle-awareness offer on Today + Health AND stops active tracking;
+                    // turning it back on re-offers it. Reversible, so it is never a one-way door.
+                    ToggleRow(label: String(localized: "Show cycle awareness"),
+                              help: String(localized: "Shows the cycle-awareness card on Today and in Health. Turn off to hide it entirely — a private choice, never based on your age. You can turn it back on here any time."),
+                              isOn: Binding(get: { !cycleHidden },
+                                            set: { show in
+                                                cycleHidden = !show
+                                                if !show {
+                                                    cycleAwareness = false
+                                                    model.cycleAwarenessEnabled = false
+                                                    Task { await model.refreshV5Signals() }
+                                                }
+                                            }))
                     rowDivider
+                    if !cycleHidden {
+                        ToggleRow(label: String(localized: "Cycle awareness"),
+                                  help: String(localized: "Reads a coarse menstrual-cycle phase from your nightly skin temperature, entirely on \(Platform.deviceNounPhrase). Awareness only: not contraception, not a fertility predictor, not a medical service. The card appears in Health."),
+                                  isOn: $cycleAwareness)
+                            .onChangeCompat(of: cycleAwareness) { on in
+                                model.cycleAwarenessEnabled = on
+                                Task { await model.refreshV5Signals() }
+                            }
+                        rowDivider
+                    }
                 }
                 ToggleRow(label: String(localized: "Rhythm visualization (experimental)"),
                           help: String(localized: "An experimental picture of your beat-to-beat heart timing. Not an ECG and not a diagnosis. You'll read and accept an experimental note before it shows anything."),

@@ -8,6 +8,12 @@ import Foundation
 /// Keep in lockstep with the Android `EXPECTED_UNHANDLED_HISTORICAL_TYPES`.
 let expectedUnhandledHistoricalTypes: Set<String> = ["METADATA", "CONSOLE_LOGS"]
 
+/// How stale the strap RTC must be before the `(wall - device)` offset is applied to a historical
+/// record's own unix second. BELOW this the offset is discarded and the raw stamp is kept verbatim, so
+/// an everyday drift of seconds-to-minutes never reaches stored timestamps. Shared with `ChunkClockDiag`
+/// so the strap log's `corr=on|off` cannot disagree with what the decoder actually did.
+public let histStaleClockThresholdSec = 86_400   // 1 day
+
 /// Shared plausibility bounds for a type-47 record's own unix timestamp (#547). A WHOOP strap with a
 /// bad clock/flash (repeated trim=0xFFFFFFFF no-cursor) emits records whose decoded unix is scattered
 /// garbage — far-past (2024/2029), a bogus 2027=1827642881, and even FUTURE dates. NOOP used to trust
@@ -65,10 +71,11 @@ public func isPlausibleHistoricalUnix(_ ts: Int, wallNow: Int,
     return ts >= oldest - SESSION_RANGE_MARGIN && ts <= newest + SESSION_RANGE_MARGIN
 }
 
-/// The HISTORICAL_DATA record frames in `rawFrames` that FAIL decode — a genuine CRC failure, or an
-/// unmapped firmware layout whose envelope parsed but yielded no usable biometrics. These are the
-/// records the strap is about to free once we ack the trim, so without an archive they are lost
-/// forever while the UI reports a clean sync (#77 / #91).
+/// The HISTORICAL_DATA record frames in `rawFrames` that NOOP cannot turn into rows — a genuine CRC
+/// failure, an unmapped firmware layout (5/MG: any `hist_version` outside
+/// `mappedWhoop5HistoricalVersions`), or a mapped layout whose envelope parsed but yielded no usable
+/// biometrics. These are the records the strap is about to free once we ack the trim, so without an
+/// archive they are lost forever while the UI reports a clean sync (#77 / #91).
 ///
 /// Console (type-50, `frame[typeIndex] == 0x32`) frames are strap-side debug-log text that decode to
 /// zero rows BY DESIGN and are never returned. 5/MG v26 (raw PPG block, hist_version 26) is also
@@ -91,6 +98,20 @@ public func rejectedHistoricalRecords(_ rawFrames: [[UInt8]], family: DeviceFami
         // different type byte, so they never pass this gate — they are excluded by construction.
         guard f.count > typeIndex, Int(f[typeIndex]) == 47 else { return false }
         if family == .whoop5, f.count > versionIndex, Int(f[versionIndex]) == 26 { return false }  // v26 PPG: has its own durable stream (ppgWaveform), not this reject archive
+        // UNMAPPED LAYOUT (5/MG) — archive UNCONDITIONALLY, whatever it decoded.
+        //
+        // The decode-outcome test below is the wrong question for a layout NOOP has no field map for.
+        // `decodeWhoop5Historical`'s unmapped branch reads no offsets, so anything that DOES appear in
+        // `parsed` for such a record came from the envelope, not from a mapped biometric — and a record
+        // that happened to yield a plausible `unix` plus a `gravity_x`/`heart_rate` used to pass the
+        // screen and be kept NOWHERE, its bytes freed by the very next trim ack. That is exactly the
+        // shape a novel record type (a new firmware's rollup, an on-demand capture) can take.
+        //
+        // This cannot flood the archive with records we already understand: v18/v20/v21/v26 are in
+        // `mappedWhoop5HistoricalVersions` and never reach here. Retention for the records that DO
+        // (`RawHistoryArchive.evictLines`) evicts entirely-zero-payload frames first, so a firmware that
+        // banks empty placeholder records at 1 Hz cannot push out the one informative frame either.
+        if family == .whoop5, isUnmappedWhoop5HistoricalRecord(f) { return true }
         let p = parseFrame(f, family: family)
         // Envelope/CRC reject: parse failed outright or the CRC32 trailer mismatched.
         if !p.ok || p.crcOK == false { return true }
@@ -101,6 +122,16 @@ public func rejectedHistoricalRecords(_ rawFrames: [[UInt8]], family: DeviceFami
         return p.parsed["unix"]?.intValue == nil
             || (p.parsed["heart_rate"]?.intValue == nil && p.parsed["gravity_x"]?.doubleValue == nil)
     }
+}
+
+/// A rejected history frame whose entire record PAYLOAD is zero — a valid header + trailing CRC wrapping
+/// nothing. Such a frame carries no field layout to reverse-engineer, so the Backfiller skips its (large)
+/// hex dump (#1007: a strap emitting these produced ~4 MB of all-`00` in the strap log, ~8 dumps/chunk).
+/// Only the payload between the ~21-byte header and the 4-byte trailing CRC is examined; the size guard
+/// keeps a runt frame from ever reading as "empty". Mirrors the Android `isEmptyRecordFrame`.
+public func isEmptyRecordFrame(_ frame: [UInt8]) -> Bool {
+    guard frame.count > 25 else { return false }
+    return frame[21..<(frame.count - 4)].allSatisfy { $0 == 0 }
 }
 
 /// Turn historical (offload) parsed frames into datastore rows. Port of
@@ -122,7 +153,16 @@ public func extractHistoricalStreams(_ parsed: [ParsedFrame],
                                      // The pure package can't read prefs, so the app-layer caller (Backfiller /
                                      // archive replay) reads PuffinExperiment.ppgHrSubLagInterpEnabled and passes
                                      // it. Default false = byte-identical to today. Mirrors the Android arg.
-                                     subLagInterp: Bool = false) -> Streams {
+                                     subLagInterp: Bool = false,
+                                     // TEST SEAM (#547 gate's "now"): overrides the live-clock upper bound
+                                     // resolved just below. nil everywhere in production — every caller keeps
+                                     // the live clock and today's behaviour is byte-identical. It exists so a
+                                     // fixture can pin a record whose own timestamp is in the future relative
+                                     // to the machine running the test, which is the only way to cover the
+                                     // post-2038 (bit-31-set) unix domain at all. Android's
+                                     // `extractHistoricalStreams` already had this parameter; this is Swift
+                                     // catching up, so the two oracle harnesses can drive the gate identically.
+                                     wallNow wallNowOverride: Int? = nil) -> Streams {
     func wall(_ deviceTs: Int?) -> Int? {
         guard let d = deviceTs else { return nil }
         return wallClockRef + (d - deviceClockRef)
@@ -134,7 +174,7 @@ public func extractHistoricalStreams(_ parsed: [ParsedFrame],
     // grid so the same record re-syncs to the SAME corrected ts (offloaded rows dedupe by (deviceId, ts);
     // an un-snapped, slightly-different offset on re-sync would duplicate every row). For a normal or
     // identity clockRef the offset is ~0 (< threshold) → rawTs is returned unchanged (current behavior).
-    let staleThreshold = 86_400          // 1 day
+    let staleThreshold = histStaleClockThresholdSec
     let snapGranularity = 300            // 5 min
     let clockOffset = wallClockRef - deviceClockRef
     // The wall "now" the plausibility gate's FUTURE bound measures against. A record genuinely can't
@@ -144,7 +184,7 @@ public func extractHistoricalStreams(_ parsed: [ParsedFrame],
     // nor a paused live clock wrongly rejects a real record. The MIN_PLAUSIBLE_UNIX floor is unconditional
     // and still catches the far-past garbage in every caller. Genuine future garbage (pikapik's records
     // dated beyond now, the field's year-2081 overshoot) is still > now + FUTURE_MARGIN → dropped. (#547)
-    let wallNow = max(wallClockRef, Int(Date().timeIntervalSince1970))
+    let wallNow = wallNowOverride ?? max(wallClockRef, Int(Date().timeIntervalSince1970))
     // PRIMARY FIX (#547): a record's own decoded ts must be near "now". A bad-clock strap emits records
     // whose unix is scattered garbage (far-past, a bogus 2027, even future dates); trusted verbatim, one
     // polluted block was re-attributed to every day and a future row surfaced as "last night". Returns

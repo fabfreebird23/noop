@@ -148,4 +148,39 @@ class ConnectionPriorityTest {
         // threshold 0 → normal cadence always
         assertEquals(base, WhoopBleClient.offloadIntervalMsFor(base, low, batteryPct = 3, charging = false, thresholdPct = 0))
     }
+
+    // #battery: a 5/MG whose history offload is known-empty (experimental on 5.0) stretches to the 45-min
+    // floor regardless of battery % — it banks nothing per pass, so a 15-min kick just holds the link ~60 s
+    // for zero data. Twin of iOS BLEManager.whoop5EmptyHistoryBackfillInterval.
+    @Test fun whoop5EmptyHistoryStretchesToLowFloor() {
+        assertEquals(low, WhoopBleClient.whoop5EmptyHistoryBackfillIntervalMs(base, low, historyEmpty = true))
+    }
+
+    @Test fun whoop5NonEmptyStaysAtBase() {
+        assertEquals(base, WhoopBleClient.whoop5EmptyHistoryBackfillIntervalMs(base, low, historyEmpty = false))
+    }
+
+    // Defensive: a misconfigured low floor below the base never SHORTENS the cadence (max, not min).
+    @Test fun whoop5EmptyHistoryNeverShortensBelowBase() {
+        assertEquals(base, WhoopBleClient.whoop5EmptyHistoryBackfillIntervalMs(base, lowBatteryMs = 300_000L, historyEmpty = true))
+    }
+
+    // #battery: charging cadence. Twins of the Swift Whoop5BatteryBackfillThrottleTests cases.
+
+    /** A discharging strap keeps the ~60 s cadence: only every SECOND 30 s tick polls. */
+    @Test fun batteryPollDischargingPollsEveryOtherTick() {
+        assertFalse(WhoopBleClient.batteryPollDue(1, charging = false))
+        assertTrue(WhoopBleClient.batteryPollDue(2, charging = false))
+        assertFalse(WhoopBleClient.batteryPollDue(3, charging = false))
+    }
+
+    /**
+     * A charging strap polls on EVERY tick (~30 s): the value is climbing and the user is watching it on
+     * the puck. Bounded to the charging window, so it costs nothing the rest of the time.
+     */
+    @Test fun batteryPollChargingPollsEveryTick() {
+        assertTrue(WhoopBleClient.batteryPollDue(1, charging = true))
+        assertTrue(WhoopBleClient.batteryPollDue(2, charging = true))
+        assertTrue(WhoopBleClient.batteryPollDue(3, charging = true))
+    }
 }

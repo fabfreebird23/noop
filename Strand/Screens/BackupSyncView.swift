@@ -139,6 +139,24 @@ struct BackupSyncView: View {
                 }
                 Text(lastMs > 0 ? "Last backup: \(relativeTime(lastMs))" : "No backup yet.")
                     .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                // Auto is ON but the last SUCCESSFUL backup is stale — the on-launch catch-up isn't landing
+                // (a moved/disconnected cloud folder stops backups silently, or NOOP hasn't been opened).
+                // Surface it so a silently-failing auto-backup is visible, not discovered only at restore.
+                // `lastMs > 0` excludes the never-backed-up state (the "No backup yet." line above owns that,
+                // and it would otherwise false-fire the moment auto is switched on, before the first backup).
+                if auto, folderLabel != nil, lastMs > 0,
+                   BackupSync.isBackupStale(lastBackupMs: lastMs,
+                                            nowMs: Int(Date().timeIntervalSince1970 * 1000.0)) {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(StrandPalette.statusWarning)
+                            .font(.system(size: 12))
+                            .accessibilityHidden(true)
+                        Text("Auto-backup hasn't run in a few days. Check the backup folder is still available — a moved or disconnected cloud folder stops backups silently.")
+                            .font(StrandFont.caption).foregroundStyle(StrandPalette.statusWarning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 NoopButton(busy ? "Working…" : "Back up now",
                            systemImage: "icloud.and.arrow.up", kind: .primary, fullWidth: true) { backupNow() }
                     .disabled(folderLabel == nil || busy)
@@ -176,8 +194,12 @@ struct BackupSyncView: View {
         // `busy` guards against a double-tap stacking a second picker presentation on top of the first.
         busy = true
         Task {
+            // Clear in a `defer` so it clears on ANY exit. It matters more here than elsewhere: every
+            // control on this screen is `.disabled(busy)`, so a pick that never returned wedged the whole
+            // screen — including the "Use NOOP's own folder" escape hatch. DocumentPicker now guarantees
+            // the continuation resumes, but the flag must not depend on that promise holding.
+            defer { busy = false }
             let picked = await FolderBackup.pickFolder()
-            busy = false
             if picked != nil {
                 folderLabel = FolderBackup.folderLabel()
             } else if !FolderBackup.useInternalFolder {
@@ -207,10 +229,10 @@ struct BackupSyncView: View {
     private func backupNow() {
         busy = true
         Task {
+            defer { busy = false }   // any exit, incl. cancellation — see chooseFolder
             let ok = await FolderBackup.backupNow(checkpoint: { await model.repo.checkpointForBackup() })
             await MainActor.run {
                 lastMs = FolderBackup.lastBackupMs
-                busy = false
                 alertTitle = ok ? String(localized: "Backed up") : String(localized: "Backup problem")
                 alertMessage = ok
                     ? String(localized: "Saved a backup to your folder.")
@@ -235,13 +257,13 @@ struct BackupSyncView: View {
         pendingRestore = nil
         busy = true
         Task {
+            defer { busy = false }   // any exit, incl. cancellation — see chooseFolder
             // The restore is synchronous file I/O; run it off the main actor so the UI stays responsive
             // for a large store, then report on the main actor.
             let result = await Task.detached(priority: .userInitiated) {
                 FolderBackup.restore(snapshotNamed: snap.name)
             }.value
             await MainActor.run {
-                busy = false
                 switch result {
                 case .imported:
                     alertTitle = String(localized: "Restored")
@@ -308,6 +330,16 @@ private struct RestorePickerSheet: View {
                 }
             }
         }
+        // A macOS `.sheet` sizes to its content's ideal height, and a `List` inside a `NavigationStack`
+        // reports a near-zero intrinsic height there — so without an explicit frame the sheet collapses
+        // to just the title + Cancel and clips every row, leaving the user an empty "Choose a backup"
+        // with backups that ARE in the folder (the caller only opens this sheet when the list is
+        // non-empty). Give it a real size, the same way `AddDeviceWizard`/`HealthView` frame their macOS
+        // sheets with a fixed size. iOS/iPadOS sheets already take a sensible height, so the frame is
+        // macOS-only. A longer backup list scrolls within the List; a short one leaves trailing space. (#1093)
+        #if os(macOS)
+        .frame(width: 460, height: 420)
+        #endif
     }
 
     /// The row's headline: a friendly date when we resolved one, else the filename (never the epoch date).

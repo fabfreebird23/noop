@@ -14,6 +14,10 @@ struct StrandApp: App {
         // here, before the first Today render. No-op (active stays nil) when the arg is absent, so
         // Release is unaffected (whole harness is `#if DEBUG`). See DemoDayHarness.swift.
         DemoDayHarness.applyLaunchArgsIfNeeded()
+        // DEBUG-only sync harness: `--demo-sync` drives the Today header's charge→sync control with a
+        // synthetic battery + a looping sync signal, so the morph is watchable with no strap paired.
+        // No-op (active stays false) when the arg is absent. See DemoSyncHarness.swift.
+        DemoSyncHarness.applyLaunchArgsIfNeeded()
         #endif
         // Foreground presentation: without a delegate, macOS suppresses a notification's banner while the
         // app is frontmost, so a reminder tested with NOOP open would show nothing. Mirrors iOS.
@@ -31,6 +35,9 @@ struct StrandApp: App {
     @AppStorage(AppearanceMode.storageKey) private var appearanceRaw = AppearanceMode.system.rawValue
     /// Chart data-colour style (Titanium / Classic throwback). Re-colours gauges + charts.
     @AppStorage(ChartStyle.storageKey) private var chartStyleRaw = ChartStyle.titanium.rawValue
+    /// Chrome accent colour (mint / WHOOP blue / custom). Chrome only — never the data colour worlds.
+    @AppStorage(AccentColor.storageKey) private var accentRaw = AccentColor.mint.rawValue
+    @AppStorage(AccentColor.customHexKey) private var accentCustomHex = AccentColor.defaultCustomHex
 
     var body: some Scene {
         WindowGroup {
@@ -50,7 +57,11 @@ struct StrandApp: App {
                 .environment(\.stressNudgeCenter, model.stressNudgeCenter)
                 .frame(minWidth: 1000, minHeight: 700)
                 .preferredColorScheme(AppearanceMode.resolve(appearanceRaw).colorScheme)
+                // Keep date/number words on the same bundle language as every localized string. A pending
+                // Settings change intentionally becomes active only after the documented reopen.
+                .environment(\.locale, AppLanguage.activeLocale)
                 .chartStyle(chartStyleRaw)
+                .noopAccent(accentRaw, customHex: accentCustomHex)
                 // Dynamic Type now scales the prose/label roles (StrandFont). Cap the upper end so the
                 // fixed-geometry tiles/gauges stay legible at the largest accessibility sizes rather than
                 // clipping; the common Larger-Text range still scales fully.
@@ -74,11 +85,13 @@ struct StrandApp: App {
                 .environmentObject(model)
                 .environmentObject(model.repo)
                 .environmentObject(model.live)
+                .environment(\.locale, AppLanguage.activeLocale)
         } label: {
             MenuBarLabel()
                 .environmentObject(model)
                 .environmentObject(model.repo)
                 .environmentObject(model.live)
+                .environment(\.locale, AppLanguage.activeLocale)
         }
         .menuBarExtraStyle(.window)
     }

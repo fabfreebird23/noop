@@ -80,6 +80,25 @@ extension WhoopStore {
         }
     }
 
+    /// Cross-device raw-HR fingerprint: `(count, maxTs)` over EVERY `hrSample` row, no `deviceId` filter.
+    /// The `analyzeRecent` re-score gate (#1392) only needs to answer "did the raw stream change AT ALL",
+    /// so it must see HR that lands under ANY id — an Oura ring, an Apple Watch, or a WHOOP re-added under a
+    /// fresh `whoop-<uuid>` — not only the literal "my-whoop" the engine is constructed with. The per-device
+    /// `hrFingerprint(deviceId:from:to:)` above stayed pinned to that literal (there is no setter to
+    /// re-point it when the active strap changes), so on a non-WHOOP install the fingerprint read 0 rows,
+    /// the watermark never advanced, and the idle-tick / post-offload gates always skipped. This mirrors the
+    /// Kotlin twin `WhoopRepository.hrFingerprint()`, which already has no device filter.
+    public func hrFingerprint() async throws -> (count: Int, maxTs: Int) {
+        try syncRead { db in
+            guard let row = try Row.fetchOne(db, sql: """
+                SELECT COUNT(*) AS c, COALESCE(MAX(ts), 0) AS m FROM hrSample
+                """) else { return (0, 0) }
+            let c: Int = row["c"]
+            let m: Int = row["m"]
+            return (c, m)
+        }
+    }
+
     /// Aggregate HR over a window: `(n, avg, max)` computed in SQLite over the same measured-∪-PPG rows
     /// [hrSamples] returns, WITHOUT materialising them and WITHOUT a row limit.
     ///
@@ -172,14 +191,42 @@ extension WhoopStore {
     /// RMSSD — all successive differences — downward. Pre-v30 rows have `ord` NULL and SQLite sorts NULL
     /// first in ASC, so an all-NULL second ties and falls through to the old (rrMs, seq) order unchanged.
     /// Byte-parity twin of Kotlin `WhoopDao.rrIntervals`; both are SQLite, so NULL ordering matches.
+    ///
+    /// ONE optical channel (#1071). An Oura ring measures the same heartbeats on more than one tag, and
+    /// every one of them is stored, so an unfiltered read returned roughly TWO complete copies of a night
+    /// — 2.06x the beats the measured HR curve allows. That leaves `meanNN` (and resting HR) correct and
+    /// destroys every statistic built on successive differences: RMSSD and a ~200 ms nocturnal SDNN where
+    /// a healthy adult asleep is 40-100 ms.
+    ///
+    /// The predicate EXCLUDES the one channel proven redundant (`spo2Ibi`, 0x6E) rather than whitelisting
+    /// the one preferred (`greenQuality`, 0x80), which matters for what it does NOT drop:
+    ///   - NULL is kept. Every WHOOP row is NULL by construction (one beat source), as is every row
+    ///     written before v32. A whitelist would delete every WHOOP night from scoring.
+    ///   - `ibiAmplitude` (0x60/0x44) is kept. It does not fire on the Gen-3 hardware this was measured
+    ///     on, so there is no evidence it duplicates green — and dropping a ring's ONLY beat source on an
+    ///     untested assumption is the more expensive mistake. If a capture ever shows 0x60 and 0x80 firing
+    ///     together, that is a second exclusion here, decided on that evidence.
+    /// 0x6E is the one excluded because it is the demonstrated duplicate AND the worse measurement of the
+    /// two: it is quantised to an 8 ms grid, applies no quality gate, and runs only while an SpO2
+    /// measurement is on — so scoring off it would make HRV coverage a function of the SpO2 duty cycle.
+    ///
+    /// Rows are FILTERED, never deleted: the 0x6E stream stays on disk as the cross-check on green.
+    /// Every R-R consumer reads through this one function, so the `hrv diag` trace moves with the scores
+    /// rather than reporting a coverage nobody can reproduce.
     public func rrIntervals(deviceId: String, from: Int, to: Int, limit: Int) async throws -> [RRInterval] {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
-                SELECT ts, rrMs FROM rrInterval
+                SELECT ts, rrMs, srcChannel, ord FROM rrInterval
                 WHERE deviceId = ? AND ts >= ? AND ts <= ?
+                AND (srcChannel IS NULL OR srcChannel <> ?)
+                AND (tsSuspect IS NULL OR tsSuspect <> 1)   -- #1073: exclude future-stamped beats
                 ORDER BY ts ASC, ord ASC, rrMs ASC, seq ASC LIMIT ?
-                """, arguments: [deviceId, from, to, limit])
-                .map { RRInterval(ts: $0["ts"], rrMs: $0["rrMs"]) }
+                """, arguments: [deviceId, from, to, RRSourceChannel.spo2Ibi.rawValue, limit])
+                .map { row in
+                    RRInterval(ts: row["ts"], rrMs: row["rrMs"],
+                               srcChannel: (row["srcChannel"] as Int?).flatMap(RRSourceChannel.init(rawValue:)),
+                               ord: row["ord"] as Int?)
+                }
         }
     }
 
@@ -302,18 +349,25 @@ extension WhoopStore {
     /// Aggregate storage footprint: total decoded rows, raw batch count, total raw byteSize.
     public func storageStats() async throws -> (decodedRows: Int, rawBatches: Int, rawBytes: Int) {
         try syncRead { db in
-            let hr   = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM hrSample") ?? 0
-            let rr   = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM rrInterval") ?? 0
-            let ev   = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM event") ?? 0
-            let bat  = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM battery") ?? 0
-            let spo2 = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM spo2Sample") ?? 0
-            let skin = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM skinTempSample") ?? 0
-            let resp = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM respSample") ?? 0
-            let grav = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM gravitySample") ?? 0
+            // The COMPLETE set of accumulating decoded raw streams — KEEP IN SYNC with
+            // `TimestampHeal.rawTables` (its per-timestamp purge is the canonical list) and the Android
+            // `WhoopRepository.storageRowCounts`. Summed by iterating the list rather than a hand-written
+            // expression, because the old fixed sum silently under-reported: it omitted stepSample,
+            // ppgHrSample, sleepStateSample, ppgWaveformSample, rawImuSample and v18AuxSample — and a 4.0
+            // with PPG (ppgHrSample/ppgWaveformSample) or IMU capture (rawImuSample) banks millions of rows.
+            // Table names are compile-time constants (never user input), so the interpolation is safe.
+            let rawTables = ["hrSample", "rrInterval", "event", "battery",
+                             "spo2Sample", "skinTempSample", "respSample", "gravitySample",
+                             "stepSample", "ppgHrSample", "sleepStateSample", "ppgWaveformSample",
+                             "rawImuSample", "v18AuxSample"]
+            var decoded = 0
+            for t in rawTables {
+                decoded += try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(t)") ?? 0
+            }
             let batches = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM rawBatch") ?? 0
             let bytes   = try Int.fetchOne(db,
                 sql: "SELECT COALESCE(SUM(byteSize), 0) FROM rawBatch") ?? 0
-            return (hr + rr + ev + bat + spo2 + skin + resp + grav, batches, bytes)
+            return (decoded, batches, bytes)
         }
     }
 }

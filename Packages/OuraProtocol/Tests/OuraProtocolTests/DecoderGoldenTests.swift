@@ -59,21 +59,79 @@ final class DecoderGoldenTests: XCTestCase {
         let rec = record("6e0a02000100000a141e2832")
         let ibis = OuraDecoders.decodeSpO2IBI(rec)
         XCTAssertEqual(ibis, [
-            OuraIBI(ringTimestamp: rt, ibiMs: 400),
-            OuraIBI(ringTimestamp: rt, ibiMs: 320),
-            OuraIBI(ringTimestamp: rt, ibiMs: 240),
-            OuraIBI(ringTimestamp: rt, ibiMs: 160),
-            OuraIBI(ringTimestamp: rt, ibiMs: 80),
+            OuraIBI(ringTimestamp: rt, ibiMs: 400, channel: .spo2Ibi),
+            OuraIBI(ringTimestamp: rt, ibiMs: 320, channel: .spo2Ibi),
+            OuraIBI(ringTimestamp: rt, ibiMs: 240, channel: .spo2Ibi),
+            OuraIBI(ringTimestamp: rt, ibiMs: 160, channel: .spo2Ibi),
+            OuraIBI(ringTimestamp: rt, ibiMs: 80, channel: .spo2Ibi),
         ])
     }
 
     // MARK: - 0x5D HRV / RMSSD
 
     func testHRV0x5D() {
-        // time 5000, b1=10, b2=-5
-        let rec = record("5d080200010088130afb")
+        // (u8 hr, u8 rmssd) pairs — real overnight bytes: 32 84 32 83 -> (50,132),(50,131).
+        // hr=50 bpm is sleeping HR (validates the layout; matches the #511 IBI-derived median).
+        let rec = record("5d080200010032843283")
         let hrv = OuraDecoders.decodeHRV(rec)
-        XCTAssertEqual(hrv, [OuraHRV(ringTimestamp: rt, timeMs: 5000, b1: 10, b2: -5)])
+        XCTAssertEqual(hrv, [
+            OuraHRV(ringTimestamp: rt, index: 0, hrBpm: 50, rmssdMs: 132, count: 2),
+            OuraHRV(ringTimestamp: rt, index: 1, hrBpm: 50, rmssdMs: 131, count: 2),
+        ])
+    }
+
+    func testHRV0x5DOddLengthIsNil() {
+        // A partial trailing pair (odd body length) must decode to nil, never a half-sample.
+        XCTAssertNil(OuraDecoders.decodeHRV(record("5d0702000100328432")))
+    }
+
+    // MARK: - 0x5D `00 00` tail padding (#1128)
+
+    /// A record that closes early pads its tail with `00 00`. That pair is not a reading, and a stored
+    /// `hr_bpm: 0` is a fabricated value nothing downstream can tell from a measurement. Real shape,
+    /// from the 2026-08-07 overnight: `... 48/128 47/137 ... 0/0`.
+    func testHRV0x5DDropsTailPadding() {
+        // (50,132), (50,131), then a 00 00 pad.
+        let hrv = OuraDecoders.decodeHRV(record("5d0a02000100328432830000"))
+        XCTAssertEqual(hrv, [
+            // count is 3, not 2: the dropped pad still counts, or the survivors slide (#1167).
+            OuraHRV(ringTimestamp: rt, index: 0, hrBpm: 50, rmssdMs: 132, count: 3),
+            OuraHRV(ringTimestamp: rt, index: 1, hrBpm: 50, rmssdMs: 131, count: 3),
+        ])
+    }
+
+    /// A body that is ENTIRELY padding carries no bucket at all, so it decodes to nil (honest no-data)
+    /// rather than to an empty array a caller might treat as "decoded fine, zero readings".
+    func testHRV0x5DAllPaddingIsNil() {
+        XCTAssertNil(OuraDecoders.decodeHRV(record("5d06020001000000")))
+    }
+
+    /// THE ONE THAT MATTERS: a skipped pair must still CONSUME its index. `index` is not a label —
+    /// `OuraStreamMapping` derives the bucket's wall-clock from it (`bucketTs = ts - index * 300`), so
+    /// renumbering the survivors would slide every later bucket 5 minutes into the past.
+    ///
+    /// Tail padding cannot detect that mistake (nothing follows the pad), which is why this plants the
+    /// zero pair in the MIDDLE: the bucket after it must keep index 2, not collapse to index 1. Only
+    /// tail padding has been observed in the wild; this guards the shape we have not seen yet.
+    func testHRV0x5DZeroPairConsumesItsIndex() {
+        // (50,132), 00 00, (49,130) — the survivor after the pad must stay at index 2.
+        let hrv = OuraDecoders.decodeHRV(record("5d0a02000100328400003182"))
+        XCTAssertEqual(hrv, [
+            OuraHRV(ringTimestamp: rt, index: 0, hrBpm: 50, rmssdMs: 132, count: 3),
+            OuraHRV(ringTimestamp: rt, index: 2, hrBpm: 49, rmssdMs: 130, count: 3),
+        ])
+    }
+
+    /// A genuine bucket whose RMSSD byte happens to be 0 is NOT padding and must survive: the rule keys
+    /// on both bytes being zero, so a real reading with one zero byte stays visible as the anomaly it
+    /// would be, instead of being swallowed by the padding rule.
+    func testHRV0x5DLoneZeroByteIsNotTreatedAsPadding() {
+        // (50,0) and (0,131): one zero byte each, neither is the 00 00 signature.
+        let hrv = OuraDecoders.decodeHRV(record("5d080200010032000083"))
+        XCTAssertEqual(hrv, [
+            OuraHRV(ringTimestamp: rt, index: 0, hrBpm: 50, rmssdMs: 0, count: 2),
+            OuraHRV(ringTimestamp: rt, index: 1, hrBpm: 0, rmssdMs: 131, count: 2),
+        ])
     }
 
     // MARK: - 0x6F SpO2 per-sample (byte6 high nibble is a base/status field, DISCARDED; samples are
@@ -83,10 +141,34 @@ final class DecoderGoldenTests: XCTestCase {
         // byte6 high nibble 1 (base/status, discarded) ; samples 95,96 ; FF terminator.
         let rec = record("6f0802000100105f60ff")
         let s = OuraDecoders.decodeSpO2PerSample(rec)
+        // Every sample keeps the RECORD's ringTimestamp and carries its own position, so the consumer can
+        // give each one its own second instead of collapsing the record onto one (#1070).
         XCTAssertEqual(s, [
-            OuraSpO2(ringTimestamp: rt, value: 95),
-            OuraSpO2(ringTimestamp: rt, value: 96),
+            OuraSpO2(ringTimestamp: rt, value: 95, index: 0, count: 2),
+            OuraSpO2(ringTimestamp: rt, value: 96, index: 1, count: 2),
         ])
+    }
+
+    func testSpO2PerSample0x6FStampsPositionForEverySample() {
+        // A full 13-value record, the real Gen 3 shape: indices 0..12, count 13 on every sample, and the
+        // record's own ringTimestamp untouched. Terminator absent.
+        let body = (0..<13).map { String(format: "%02x", 90 + $0) }.joined()
+        let rec = record("6f120200010000" + body)   // len 0x12 = 4 rt + 1 status + 13 values
+        let s = OuraDecoders.decodeSpO2PerSample(rec)
+        XCTAssertEqual(s?.count, 13)
+        XCTAssertEqual(s?.map { $0.index }, Array(0..<13))
+        XCTAssertEqual(s?.map { $0.count }, Array(repeating: 13, count: 13))
+        XCTAssertTrue(s?.allSatisfy { $0.ringTimestamp == rt } ?? false)
+    }
+
+    func testSpO2DC0x77StampsPositionForEverySample() {
+        // 0x77 shares the multi-sample shape, so it stamps the same way (it is filtered before the store
+        // today, but the two decoders must stay consistent).
+        // len 0x0b = 4 rt + 1 header + 3 base + 3 deltas ; hasBase -> base is sample 0, then 3 deltas.
+        let rec = record("770b02000100400a0000" + "01ff02")
+        let s = OuraDecoders.decodeSpO2DC(rec)
+        XCTAssertEqual(s?.map { $0.index }, [0, 1, 2, 3])
+        XCTAssertEqual(s?.map { $0.count }, [4, 4, 4, 4])
     }
 
     // MARK: - 0x7B SpO2 stable (BIG-endian footgun)
@@ -134,17 +216,123 @@ final class DecoderGoldenTests: XCTestCase {
         ])
     }
 
-    // MARK: - 0x6B motion period (2-bit MOTION_STATE codes; 2 header bytes skipped)
+    func testSleepPhase0x4EWholeFFRecordIsUnwritten() {
+        // #1246: two code bytes of 0xFF (an erased/unwritten flash page). The 2-bit unpack still reads
+        // four awake each, but because the WHOLE record's code bytes are 0xFF the epochs are flagged
+        // `unwritten` — the assembler drops them as a GAP instead of manufacturing 8 awake epochs.
+        let rec = record("4e070200010000ffff")   // len 07 = rt(4) + payload(00 ff ff): header + two 0xFF bytes
+        let phases = OuraDecoders.decodeSleepPhase(rec)
+        XCTAssertEqual(phases?.count, 8)
+        XCTAssertEqual(phases?.allSatisfy { $0.unwritten && $0.stage == .awake }, true)
+    }
+
+    func testSleepPhase0x4ELoneFFByteIsGenuineAwake() {
+        // #1246 caution: a SINGLE 0xFF code byte is four genuine `awake` epochs, NOT an erased page — it
+        // must stay written (only a run of >=2 all-0xFF code bytes reads as unwritten).
+        let rec = record("4e060200010000ff")   // header + one 0xFF code byte
+        let phases = OuraDecoders.decodeSleepPhase(rec)
+        XCTAssertEqual(phases?.count, 4)
+        XCTAssertEqual(phases?.contains { $0.unwritten }, false)
+        XCTAssertEqual(phases?.allSatisfy { $0.stage == .awake }, true)
+    }
+
+    func testSleepPhase0x4EMixedFFIsWritten() {
+        // A record that is NOT entirely 0xFF (real codes 0x6C + one 0xFF byte) is genuine data — its 0xFF
+        // byte is four REAL awake epochs, so NONE of the record is flagged unwritten. Guards against a
+        // byte-level filter eating genuine wake.
+        let rec = record("4e0702000100006cff")
+        let phases = OuraDecoders.decodeSleepPhase(rec)
+        XCTAssertEqual(phases?.count, 8)
+        XCTAssertEqual(phases?.contains { $0.unwritten }, false)
+        // The trailing 0xFF byte still decodes to four awake epochs (real wake, kept).
+        XCTAssertEqual(phases?.suffix(4).allSatisfy { $0.stage == .awake }, true)
+    }
+
+    func testSleepPhase0x4ETrailingFFRunIsUnwritten() {
+        // #1284: a PARTLY-written page — real codes then a trailing 0xFF pad. The reporter's `hdr=01`
+        // record: `ff ff f3 c0` then nine straight 0xFF (13 code bytes). The whole-record rule missed it;
+        // the trailing-run rule flags the 9-byte tail (36 epochs) as unwritten while the leading `ff ff`
+        // stays real wake.
+        let rec = record("4e120200010000fffff3c0ffffffffffffffffff")
+        let phases = OuraDecoders.decodeSleepPhase(rec)
+        XCTAssertEqual(phases?.count, 52)                                  // 13 code bytes * 4
+        XCTAssertEqual(phases?.filter { $0.unwritten }.count, 36)          // trailing 9 bytes * 4
+        XCTAssertEqual(phases?.prefix(16).allSatisfy { !$0.unwritten }, true)   // leading ff ff f3 c0 kept
+        XCTAssertEqual(phases?.suffix(36).allSatisfy { $0.unwritten }, true)    // the pad, dropped as a gap
+    }
+
+    func testSleepPhase0x4ETrailingRunFloorIsExclusive() {
+        // Exactly `minTrailingUnwritten` trailing 0xFF flags; one fewer is spared as possible real wake.
+        // 7 real codes + 6 trailing 0xFF (== floor): the 6-byte tail is unwritten.
+        let atFloor = record("4e12020001000055555555555555ffffffffffff")
+        XCTAssertEqual(OuraDecoders.decodeSleepPhase(atFloor)?.filter { $0.unwritten }.count,
+                       OuraDecoders.minTrailingUnwritten * 4)
+        // 8 real codes + 5 trailing 0xFF (floor - 1): nothing flagged.
+        let belowFloor = record("4e1202000100005555555555555555ffffffffff")
+        XCTAssertEqual(OuraDecoders.decodeSleepPhase(belowFloor)?.contains { $0.unwritten }, false)
+    }
+
+    func testSleepPhase0x4ETrailingSingleFFIsGenuineAwake() {
+        // #1284/#1246 boundary: a written record ending in a SINGLE trailing 0xFF is four genuine awake epochs,
+        // never pad. The trailing floor is clamped to >= 2, so this holds even if `minTrailingUnwritten` is
+        // lowered — a lone trailing byte can never be eaten (the case #1246 was careful to protect). Kotlin twin.
+        XCTAssertGreaterThanOrEqual(OuraDecoders.minTrailingUnwritten, 2,
+                                    "floor < 2 would eat a lone trailing 0xFF (#1246); the decode clamps to 2 as a backstop")
+        let rec = record("4e120200010000555555555555555555555555ff")   // 12 real codes + 1 trailing 0xFF
+        let phases = OuraDecoders.decodeSleepPhase(rec)
+        XCTAssertEqual(phases?.count, 52)
+        XCTAssertEqual(phases?.contains { $0.unwritten }, false)                    // nothing flagged unwritten
+        XCTAssertEqual(phases?.suffix(4).allSatisfy { $0.stage == .awake }, true)   // the lone 0xFF stays real wake
+    }
+
+    func testSleepPhase0x4ELeadingFFRunIsRealWake() {
+        // Trailing-only, by design: a LONG leading/interior 0xFF run (nine here) that does NOT reach the
+        // record's end is left as genuine wake — the ring wrote it, and a pre-onset run is dropped by the
+        // assembler's onset clip, not here. Guards against eating real wake at the start of a page.
+        let rec = record("4e120200010000ffffffffffffffffff55555555")
+        let phases = OuraDecoders.decodeSleepPhase(rec)
+        XCTAssertEqual(phases?.count, 52)
+        XCTAssertEqual(phases?.contains { $0.unwritten }, false)
+    }
+
+    // MARK: - 0x6B motion period (2-bit MOTION_STATE codes; 1 header byte, codes from byte1)
 
     func testMotionPeriod0x6B() {
-        // 2 header bytes 0x00 0x00, code byte 0x1B = 00 01 10 11 -> noMotion, restless, tossing, active.
-        let rec = record("6b070200010000001b")
+        // header 0x13 = 0001_0011: period_type 0, count(bits[5:4]) = 1 code in the FINAL byte, seq 0x3.
+        // byte1 0x1B = 00 01 10 11 -> noMotion, restless, tossing, active (a full middle byte, 4 codes).
+        // byte2 0xC0 = 11 00 00 00 -> LAST byte, truncated to count=1 -> just active. The 0.. padding is
+        // NOT read (the earlier decoder would have emitted 3 phantom noMotion codes here).
+        let rec = record("6b0702000100131bc0")
         let m = OuraDecoders.decodeMotionPeriod(rec)
         XCTAssertEqual(m, [
             OuraMotion(ringTimestamp: rt, index: 0, state: .noMotion),
             OuraMotion(ringTimestamp: rt, index: 1, state: .restless),
             OuraMotion(ringTimestamp: rt, index: 2, state: .tossing),
             OuraMotion(ringTimestamp: rt, index: 3, state: .active),
+            OuraMotion(ringTimestamp: rt, index: 4, state: .active),
+        ])
+    }
+
+    func testMotionPeriod0x6BShortSingleCodeRecord() {
+        // Real short capture `1ea0`: header 0x1E = 0001_1110 -> count = 1, seq 0xE; byte1 0xA0 = 10 00 00 00
+        // truncated to count=1 -> a single TOSSING code. The earlier decoder (codes from byte2) produced
+        // NOTHING for this 2-byte payload; the corrected one recovers the one real code.
+        let rec = record("6b06020001001ea0")
+        XCTAssertEqual(OuraDecoders.decodeMotionPeriod(rec),
+                       [OuraMotion(ringTimestamp: rt, index: 0, state: .tossing)])
+    }
+
+    func testMotionPeriod0x6BCountZeroMeansFullFinalByte() {
+        // Real short capture `05c0`: header 0x05 -> count FIELD 0, which encodes a FULL final byte (4 codes),
+        // NOT 0 — the 2-bit field can't hold 4, so 4 wraps to 0 (all 81 count==0 records in the capture have
+        // a non-zero final byte, never 0x00). byte1 0xC0 = 11 00 00 00 -> active, noMotion, noMotion,
+        // noMotion. The `count==0 ? 0` reading returned NIL for this record; `count==0 ? 4` recovers 4 codes.
+        let rec = record("6b06020001000dc0")   // header 0x0D: count field 0 (0x0D>>4 & 3 == 0), seq 0xD
+        XCTAssertEqual(OuraDecoders.decodeMotionPeriod(rec), [
+            OuraMotion(ringTimestamp: rt, index: 0, state: .active),
+            OuraMotion(ringTimestamp: rt, index: 1, state: .noMotion),
+            OuraMotion(ringTimestamp: rt, index: 2, state: .noMotion),
+            OuraMotion(ringTimestamp: rt, index: 3, state: .noMotion),
         ])
     }
 
@@ -208,11 +396,40 @@ final class DecoderGoldenTests: XCTestCase {
         XCTAssertNil(s?.text)               // body too short for a trailing string
     }
 
+    func testStateMalformedUTF8IsNotReplacementDecoded() {
+        let malformed = OuraRecord(
+            type: OuraEventTag.stateChange.rawValue, ringTimestamp: rt,
+            payload: [0x08, 0x63, 0x68, 0x67, 0x2e, 0x20, 0x64, 0x65,
+                      0x74, 0x65, 0x63, 0x74, 0x65, 0x64, 0xff])
+        let decoded = OuraDecoders.decodeState(malformed)
+        XCTAssertEqual(decoded?.stateCode, 8)
+        XCTAssertNil(decoded?.text)
+
+        // Valid UTF-8 remains decoded and only surrounding NULs are trimmed.
+        let valid = OuraRecord(
+            type: OuraEventTag.stateChange.rawValue, ringTimestamp: rt,
+            payload: [0x04, 0x00, 0x63, 0x61, 0x66, 0xc3, 0xa9, 0x00])
+        XCTAssertEqual(OuraDecoders.decodeState(valid)?.text, "café")
+    }
+
     // MARK: - 0x43 debug text
 
     func testDebugText0x43() {
         let rec = record("4306020001004142")
         XCTAssertEqual(OuraDecoders.decodeDebugText(rec), "AB")
+    }
+
+    func testDebugTextMalformedUTF8IsRejected() {
+        let malformed = OuraRecord(
+            type: OuraEventTag.debugText.rawValue, ringTimestamp: rt,
+            payload: [0x41, 0xff, 0x42])
+        XCTAssertNil(OuraDecoders.decodeDebugText(malformed))
+
+        // The valid ASCII control remains unchanged.
+        let ascii = OuraRecord(
+            type: OuraEventTag.debugText.rawValue, ringTimestamp: rt,
+            payload: [0x41, 0x42])
+        XCTAssertEqual(OuraDecoders.decodeDebugText(ascii), "AB")
     }
 
     // MARK: - 0x0D battery (outer response body; percent at [0], voltage at [4..6] LE)

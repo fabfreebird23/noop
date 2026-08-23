@@ -144,6 +144,11 @@ data class ExerciseSession(
     val hrmaxSource: String,
     val caloriesKcal: Double?,
     val caloriesKJ: Double?,
+    /** #1545: how much of the bout the HR sensor actually saw, as a percentage of 60-second buckets that
+     *  contain at least one reading. null when not measured. A WHOOP 4.0's optical sensor is weak under
+     *  gripping — exactly what lifting is — so a low Effort has two very different causes: the metric not
+     *  rating the work, or the strap not having seen it. Those deserve opposite advice. */
+    val hrCoveragePct: Double? = null,
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,7 +259,7 @@ data class DayResult(
     /** Effort (strain) score [0,100] or null (insufficient HR samples / invalid HRR). */
     val strain: Double?,
     /**
-     * Rest (sleep_performance) composite [0,100] or null (no in-bed session). The persistence /
+     * Rest (sleep_performance) composite [0,100] or null (no asleep time). The persistence /
      * series layer stores this under the `sleep_performance` key. Replaces the bare efficiency
      * proxy (duration-vs-need 0.50 + efficiency 0.20 + restorative 0.20 + consistency 0.10).
      */
@@ -289,4 +294,12 @@ data class DayResult(
      * hypnogram. Empty on a WHOOP 4.0. Mirrors Swift `DayResult.sessionSleepStateByStart`. (#175)
      */
     val sessionSleepStateByStart: Map<Long, List<Int>> = emptyMap(),
+    /**
+     * Whether this day's on-device sleep staging ran on SPARSE motion coverage
+     * ([SleepStager.isGravitySparse], #345) — the same signal that downgrades Rest confidence. The caller
+     * stamps it onto each persisted `SleepSession.stagingSparse` so the Sleep tab can caption a possibly
+     * under-detected night ("slept 8h, shows 1h"). Transient (not persisted on DayResult itself). Mirrors
+     * the value Swift's `analyzeDay` writes directly onto its `CachedSleepSession.stagingSparse`.
+     */
+    val gravitySparse: Boolean = false,
 )

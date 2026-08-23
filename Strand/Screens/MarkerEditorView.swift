@@ -102,20 +102,9 @@ struct MarkerEditorView: View {
     }
 
     private var searchField: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 13))
-                .foregroundStyle(StrandPalette.textTertiary)
-                .accessibilityHidden(true)
-            TextField("Search markers (e.g. LDL, ferritin)", text: $search)
-                .textFieldStyle(.plain)
-                .font(StrandFont.body)
-                .foregroundStyle(StrandPalette.textPrimary)
-                .accessibilityLabel("Search markers")
-        }
-        .padding(.horizontal, 12).padding(.vertical, 9)
-        .background(StrandPalette.surfaceInset, in: inputShape)
-        .overlay(inputShape.strokeBorder(StrandPalette.hairline, lineWidth: 1))
+        NoopLiquidGlassSearchField(text: $search,
+                                   prompt: String(localized: "Search markers (e.g. LDL, ferritin)"),
+                                   accessibilityLabel: String(localized: "Search markers"))
     }
 
     private var filteredCatalog: [MarkerDefinition] {
@@ -167,6 +156,9 @@ struct MarkerEditorView: View {
                 }
             }
         }
+        #if os(iOS)
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        #endif
         .frame(maxHeight: 280)
     }
 
@@ -524,7 +516,8 @@ enum MarkerUnits {
 
     /// A lower-cased, underscored slug for a custom marker name → its stable key.
     static func slug(_ name: String) -> String {
-        let lowered = name.trimmingCharacters(in: .whitespaces).lowercased()
+        let lowered = name.precomposedStringWithCanonicalMapping
+            .trimmingCharacters(in: .whitespaces).lowercased()
         let mapped = lowered.map { ch -> Character in
             (ch.isLetter || ch.isNumber) ? ch : "_"
         }

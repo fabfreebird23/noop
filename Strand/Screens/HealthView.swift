@@ -643,7 +643,7 @@ private struct ContributorBar: View {
 ///   • no value yet → the checklist card directly, with required-missing inputs deep-linking to Settings.
 ///
 /// The checklist groups inputs by ROLE exactly as the engine reports them: "Drives your Fitness Age"
-/// (age/sex/resting-HR/activity) vs "Unlocks your VO₂max" (height+weight/waist) — never implying the body
+/// (age/sex/resting-HR/activity) vs "Sharpens your VO₂max" (height+weight/waist) — never implying the body
 /// measurements sharpen the age (the body term cancels in the model).
 private struct FitnessAgeSection: View {
     @EnvironmentObject var repo: Repository
@@ -653,7 +653,8 @@ private struct FitnessAgeSection: View {
 
     /// Latest weekly Fitness Age (years) read from the "fitness_age" metricSeries, nil until loaded/computed.
     @State private var fitnessAge: Double?
-    /// Latest estimated VO₂max (ml/kg/min) from "vo2max_est" — only present once a waist is set.
+    /// Latest estimated VO₂max (ml/kg/min) from "vo2max_est" — present even without a waist (the Uth
+    /// HR-ratio fallback, #1391); a waist upgrades it to the more accurate Nes waist-based estimate.
     @State private var vo2max: Double?
     @State private var loaded = false
     /// True while a manual "refresh Fitness Age" recompute is running (spinner in the readiness card).
@@ -725,6 +726,9 @@ private struct FitnessAgeSection: View {
     @ViewBuilder private var content: some View {
         if let age = fitnessAge {
             heroCard(age: age)
+            // Nudge on WAIST being unset (the sole gate). VO₂max is already shown (the Uth fallback), so
+            // the prompt offers to sharpen it to the Nes waist-based estimate, not to reveal a missing number.
+            if profile.waistCm <= 0 { vo2maxSharpenPrompt }
             if showReadiness {
                 ReadinessChecklistCard(readiness: readiness,
                                        lead: nil,
@@ -777,6 +781,29 @@ private struct FitnessAgeSection: View {
     /// The shown-value hero: a scenic Charge-world backdrop, the big Fitness Age number, a
     /// younger/older-than-your-age subtitle, the optional VO₂max, the ±band disclaimer, and the two
     /// affordances (tap-through to the trend + the "How accurate is this?" disclosure).
+    /// VO₂max is already shown from heart rate alone (the Uth fallback), so this nudges the user to add a
+    /// waist to upgrade it to the more accurate Nes waist-based estimate. Tapping opens Settings — a
+    /// one-step sharpen, shown only while no waist is set.
+    private var vo2maxSharpenPrompt: some View {
+        Button { fitnessSheet = .settings } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "lungs.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(StrandPalette.metricCyan)
+                Text("Add your waist for a more accurate VO₂max")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textSecondary)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(StrandPalette.textTertiary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens Settings to add your waist measurement")
+    }
+
     private func heroCard(age: Double) -> some View {
         let shown = Int(age.rounded())
         let delta = Double(profile.age) - age        // +ve = fitness age younger than chronological
@@ -899,7 +926,7 @@ func fitnessReadyLeadCopy(rhrDays: Int, hasAge: Bool, hasSex: Bool) -> String {
 }
 
 /// The readiness checklist card: an optional lead line, then the engine's `items` as ✓/⚠/○ rows with
-/// their `detail` text, GROUPED by `.role` into "Drives your Fitness Age" and "Unlocks your VO₂max".
+/// their `detail` text, GROUPED by `.role` into "Drives your Fitness Age" and "Sharpens your VO₂max".
 /// A required-but-missing input shows a "Fix in Settings" affordance (the engine's required+missing
 /// rows are age/sex; resting-HR can only be earned by wearing the strap, so it gets no fix button).
 private struct ReadinessChecklistCard: View {
@@ -947,7 +974,7 @@ private struct ReadinessChecklistCard: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 group(title: "Drives your Fitness Age", items: drivesAge)
-                group(title: "Unlocks your VO₂max", items: unlocksVO2)
+                group(title: "Sharpens your VO₂max", items: unlocksVO2)
                 Text("Built from published methods (Nes/HUNT) on \(Platform.deviceNounPhrase). It's a fitness comparison against an average peer your age, not a biological or medical age.")
                     .font(StrandFont.footnote)
                     .foregroundStyle(StrandPalette.textTertiary)
@@ -1192,10 +1219,17 @@ private struct VitalsSection: View {
         return UnitPrefs.resolveTemperature(system: system, override: temperatureRaw)
     }
 
+    // #103: SpO₂ candidate @82 nightly means from metricSeries, loaded when the experimental toggle is ON.
+    // Empty when the toggle is OFF or no candidate data exists (WHOOP 4.0 has no v18 aux stream).
+    @State private var spo2CandidateByDay: [String: Double] = [:]
+    @State private var hrvOverCountByDay: [String: Double] = [:]   // #1118
+
     var body: some View {
         let readings = BodyVitalSigns.readings(
             sourceRows: repo.vitalMetricRows,
-            temperatureUnit: temperatureUnit
+            temperatureUnit: temperatureUnit,
+            spo2CandidateByDay: spo2CandidateByDay,
+            hrvOverCountByDay: hrvOverCountByDay
         )
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("Vital Signs", overline: "Latest", trailing: BodyVitalSigns.latestDayLabel(readings))
@@ -1218,6 +1252,24 @@ private struct VitalsSection: View {
                 .font(StrandFont.footnote)
                 .foregroundStyle(StrandPalette.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+        .task(id: PuffinExperiment.spo2CandidateDisplayEnabled) {
+            // #1118: load the per-night HRV over-count flags (always — no toggle) so the HRV tile can
+            // caption an over-counted 4.0 night's reading "unverified". The engine writes "hrv_rr_overcount"
+            // (1/0) under the "-noop" computed device ID; `exploreSeries` with source "my-whoop" reads it
+            // from the computed metricSeries. Absent/0 on a clean or imported night → no caveat.
+            let ocPts = await repo.exploreSeries(key: "hrv_rr_overcount", source: "my-whoop", days: 14)
+            hrvOverCountByDay = Dictionary(ocPts.map { ($0.day, $0.value) }, uniquingKeysWith: { a, _ in a })
+            // #103: load the SpO₂ candidate @82 nightly means from metricSeries when the toggle is ON.
+            // The engine writes "spo2_candidate" under the "-noop" computed device ID; `exploreSeries`
+            // with source "my-whoop" reads it from Layer 2 (computed metricSeries). Empty when the toggle
+            // is OFF (the engine writes nothing) or on a WHOOP 4.0 (no v18 aux stream).
+            guard PuffinExperiment.spo2CandidateDisplayEnabled else {
+                spo2CandidateByDay = [:]
+                return
+            }
+            let pts = await repo.exploreSeries(key: "spo2_candidate", source: "my-whoop", days: 14)
+            spo2CandidateByDay = Dictionary(pts.map { ($0.day, $0.value) }, uniquingKeysWith: { a, _ in a })
         }
     }
 }
@@ -1308,11 +1360,15 @@ private struct SkinTempSection: View {
 
     /// The cycle-awareness opt-in (default OFF). The same key AppModel reads, so a flip is consistent.
     @AppStorage(AppModel.cycleAwarenessKey) private var cycleEnabled = false
+    /// #hide-cycle: the user's "not for me" opt-out. When set, the cycle opt-in invitation is suppressed
+    /// here (the section falls back to the generic skin-temp state); reversible from Automations.
+    @AppStorage(AppModel.cycleAwarenessHiddenKey) private var cycleHidden = false
+    @State private var cycleTrackerPresented = false
 
     /// Whether the cycle-awareness opt-in is offered for this profile (#801). Delegates to the shared
     /// ``ProfileStore/cycleAwarenessApplies`` gate so Health + Automations stay in lockstep: cycle phase
     /// is read from the menstrual skin-temperature shift, so the opt-in is NOT shown for male profiles.
-    private var cycleOptInApplies: Bool { model.profile.cycleAwarenessApplies }
+    private var cycleOptInApplies: Bool { model.profile.cycleAwarenessApplies && !cycleHidden }
 
     var body: some View {
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
@@ -1335,6 +1391,13 @@ private struct SkinTempSection: View {
             // rather than silently hiding their data; only the OPT-IN invitation is gated.
             if cycleEnabled, let cycle = model.cyclePhase {
                 CycleAwarenessCard(result: cycle, curve: model.cycleCurve,
+                                   onLogPeriod: {
+                                       Task {
+                                           await repo.logPeriodStart(day: Repository.localDayKey(Date()))
+                                           await model.refreshV5Signals()
+                                       }
+                                   },
+                                   onOpenDetail: { cycleTrackerPresented = true },
                                    // Symmetric off (#801): turn it off in-place, here in Health, where
                                    // it was turned on, not only from Automations.
                                    onTurnOff: {
@@ -1358,6 +1421,13 @@ private struct SkinTempSection: View {
                 && model.illnessSignal == nil && model.circadianPhase == nil && model.cyclePhase == nil {
                 ComingSoon(what: "Wear the strap overnight and these read from your nightly skin temperature.",
                            symbol: "thermometer.medium")
+            }
+        }
+        .sheet(isPresented: $cycleTrackerPresented) {
+            if let cycle = model.cyclePhase {
+                CycleTrackerView(result: cycle, curve: model.cycleCurve)
+                    .environmentObject(repo)
+                    .environmentObject(model)
             }
         }
     }
