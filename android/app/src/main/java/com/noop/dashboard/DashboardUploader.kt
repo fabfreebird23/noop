@@ -97,7 +97,7 @@ object DashboardUploader {
     // reading ever sent -- 0 of 1,221. With the bound corrected the server
     // reads the same payload differently, so the history has to go up again;
     // a routine 21-day window would never reach it.
-    private const val SYNC_EPOCH = 6
+    private const val SYNC_EPOCH = 7
 
     /** Room requires an explicit LIMIT on the sleep read. Sized for a full
      *  backfill (a multi-year imported history), not just three weeks — a
@@ -305,6 +305,7 @@ object DashboardUploader {
         m.totalSleepMin, m.efficiency, m.deepMin, m.remMin, m.lightMin,
         m.disturbances, m.restingHr, m.avgHrv, m.recovery, m.strain,
         m.respRateBpm, m.spo2Pct, m.skinTempDevC, m.steps, m.activeKcalEst,
+        m.avgSdnn,
     ).count { it != null }
 
 
@@ -403,6 +404,13 @@ object DashboardUploader {
                 putOrNull("disturbances", m.disturbances)
                 putOrNull("restingHr", m.restingHr)
                 putOrNull("avgHrv", m.avgHrv)
+                // SDNN beside RMSSD, not instead of it. They are different
+                // views of the same beats — RMSSD weights beat-to-beat
+                // (parasympathetic) change, SDNN the whole 5-minute spread —
+                // so a night where they disagree says something a single HRV
+                // number cannot. Null on every row banked before upstream
+                // v10.1.0 added the column, which is why the epoch bumps.
+                putOrNull("avgSdnn", m.avgSdnn)
                 putOrNull("recovery", m.recovery)
                 // A stored Effort of null OR 0.0 on a strap-captured day means
                 // "never scored", not "you did nothing" — NOOP only writes this
