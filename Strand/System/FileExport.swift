@@ -55,7 +55,7 @@ enum FileExport {
         // The previous `try?` swallowed write failures, then handed an empty/missing path to the
         // share sheet — the user saw a broken export with no error. Clean up the temp file after the
         // share sheet closes so the temporaryDirectory doesn't accumulate dead exports across runs.
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(suggestedName)
+        let url = NoopScratch.file(suggestedName)
         do {
             try text.write(to: url, atomically: true, encoding: .utf8)
         } catch {
@@ -131,8 +131,10 @@ enum FileExport {
         let vc = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
         if !cleanup.isEmpty || completion != nil {
             // Fires after the share sheet is dismissed (saved or cancelled). We clean up staged files and
-            // then run `completion` (M1/#812: the Test Centre report opens its prefilled issue here, once
-            // the share sheet is gone, so the in-app SafariVC presents with nothing else on screen).
+            // then run `completion`. That hook existed for the Test Centre report, which opened a prefilled
+            // GitHub issue once the sheet was gone; that step has been removed and nothing passes a
+            // completion today. Kept because it is the only point at which "the sheet has closed" is
+            // observable, which any future caller needing to follow a share will want.
             vc.completionWithItemsHandler = { _, _, _, _ in
                 let fm = FileManager.default
                 for url in cleanup where fm.fileExists(atPath: url.path) {
@@ -165,7 +167,7 @@ enum FileExport {
     /// on macOS, share sheet on iOS) and cleans it up.
     static func zipData(entries: [BundleEntry], baseName: String) -> URL? {
         guard !entries.isEmpty else { return nil }
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(baseName).zip")
+        let url = NoopScratch.file("\(baseName).zip")
         try? FileManager.default.removeItem(at: url)
         guard let archive = try? Archive(url: url, accessMode: .create) else { return nil }
         for entry in entries {

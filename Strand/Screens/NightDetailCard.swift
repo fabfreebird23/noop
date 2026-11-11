@@ -1,4 +1,5 @@
 import SwiftUI
+import StrandAnalytics
 import StrandDesign
 import WhoopStore
 
@@ -40,8 +41,8 @@ struct NightDetailCard: View {
             StatTile(
                 label: "Sleep Debt",
                 value: debt.latest.map { durationText($0) } ?? "—",
-                caption: debtCaption(debt.latest),
-                accent: debtColor(debt.latest),
+                caption: nightDetailDebtCaption(debt.latest),
+                accent: nightDetailDebtColor(debt.latest),
                 sparkline: spark(debt.series),
                 sparkColor: StrandPalette.metricRose)
                 .frame(maxWidth: .infinity)
@@ -52,7 +53,8 @@ struct NightDetailCard: View {
                 StatTile(
                     label: "Rest",
                     value: pctValue(perf.latest),
-                    caption: vsTypical(perf.latest, perf.typical, suffix: "%"),
+                    caption: tileCaption(latestDay: perf.latestDay, latest: perf.latest,
+                                         typical: perf.typical, suffix: "%"),
                     accent: perf.latest.map { StrandPalette.recoveryColor($0) } ?? StrandPalette.textPrimary,
                     sparkline: spark(perf.series),
                     sparkColor: StrandPalette.restColor)
@@ -60,7 +62,8 @@ struct NightDetailCard: View {
                 StatTile(
                     label: "Efficiency",
                     value: pctValue(eff.latest),
-                    caption: vsTypical(eff.latest, eff.typical, suffix: "%"),
+                    caption: tileCaption(latestDay: eff.latestDay, latest: eff.latest,
+                                         typical: eff.typical, suffix: "%"),
                     accent: StrandPalette.statusPositive,
                     sparkline: spark(eff.series),
                     sparkColor: StrandPalette.statusPositive)
@@ -68,7 +71,8 @@ struct NightDetailCard: View {
                 StatTile(
                     label: "Consistency",
                     value: pctValue(cons.latest),
-                    caption: vsTypical(cons.latest, cons.typical, suffix: "%"),
+                    caption: tileCaption(latestDay: cons.latestDay, latest: cons.latest,
+                                         typical: cons.typical, suffix: "%"),
                     accent: cons.latest.map { StrandPalette.recoveryColor($0) } ?? StrandPalette.textPrimary,
                     sparkline: spark(cons.series),
                     sparkColor: StrandPalette.metricCyan)
@@ -76,7 +80,8 @@ struct NightDetailCard: View {
                 StatTile(
                     label: "Hours vs Needed",
                     value: pctValue(need.latest),
-                    caption: vsTypical(need.latest, need.typical, suffix: "%"),
+                    caption: tileCaption(latestDay: need.latestDay, latest: need.latest,
+                                         typical: need.typical, suffix: "%"),
                     accent: need.latest.map { StrandPalette.recoveryColor(min(100, $0)) } ?? StrandPalette.textPrimary,
                     sparkline: spark(need.series),
                     sparkColor: StrandPalette.restColor)
@@ -84,7 +89,8 @@ struct NightDetailCard: View {
                 StatTile(
                     label: "Restorative",
                     value: pctValue(rest.latest),
-                    caption: vsTypical(rest.latest, rest.typical, suffix: "%"),
+                    caption: tileCaption(latestDay: rest.latestDay, latest: rest.latest,
+                                         typical: rest.typical, suffix: "%"),
                     accent: StrandPalette.sleepREM,
                     sparkline: spark(rest.series),
                     sparkColor: StrandPalette.sleepREM)
@@ -92,7 +98,8 @@ struct NightDetailCard: View {
                 StatTile(
                     label: "Respiratory",
                     value: rrValue(resp.latest),
-                    caption: vsTypical(resp.latest, resp.typical, suffix: " rpm", decimals: 1),
+                    caption: tileCaption(latestDay: resp.latestDay, latest: resp.latest,
+                                         typical: resp.typical, suffix: " rpm", decimals: 1),
                     accent: StrandPalette.metricPurple,
                     sparkline: spark(resp.series),
                     sparkColor: StrandPalette.metricPurple)
@@ -103,8 +110,8 @@ struct NightDetailCard: View {
                 StatTile(
                     label: "Sleep Debt",
                     value: debt.latest.map { durationText($0) } ?? "—",
-                    caption: debtCaption(debt.latest),
-                    accent: debtColor(debt.latest),
+                    caption: nightDetailDebtCaption(debt.latest),
+                    accent: nightDetailDebtColor(debt.latest),
                     sparkline: spark(debt.series),
                     sparkColor: StrandPalette.metricRose)
                 #endif
@@ -122,6 +129,17 @@ struct NightDetailCard: View {
         v.map { String(format: "%.1f", $0) } ?? "—"
     }
 
+    /// #1946: a carried prior-day value is stamped "Carried · <date>" instead of "vs typical", so it
+    /// is never passed off as tonight's read. Falls through to `vsTypical` when the value is today's
+    /// own (or there is no value).
+    private func tileCaption(latestDay: String?, latest: Double?, typical: Double?,
+                             suffix: String, decimals: Int = 0) -> String {
+        if let carried = SleepModel.carriedMetricCaption(latestDay: latestDay, latest: latest) {
+            return carried
+        }
+        return vsTypical(latest, typical, suffix: suffix, decimals: decimals)
+    }
+
     /// "+12% vs typical" / "−0.4 rpm vs typical" — the latest-vs-mean caption every tile carries.
     private func vsTypical(_ latest: Double?, _ typical: Double?, suffix: String, decimals: Int = 0) -> String {
         guard let latest, let typical, typical != 0 else { return String(localized: "vs typical - ") }
@@ -130,20 +148,6 @@ struct NightDetailCard: View {
         let mag = abs(diff)
         let num = decimals == 0 ? "\(Int(mag.rounded()))" : String(format: "%.\(decimals)f", mag)
         return String(localized: "\(sign)\(num)\(suffix) vs typical")
-    }
-
-    private func debtCaption(_ debt: Double?) -> String {
-        guard let debt else { return String(localized: "vs need") }
-        return debt < 15 ? String(localized: "On target") : String(localized: "Below need")
-    }
-
-    private func debtColor(_ debt: Double?) -> Color {
-        guard let debt else { return StrandPalette.textPrimary }
-        switch debt {
-        case ..<15:  return StrandPalette.statusPositive
-        case ..<60:  return StrandPalette.statusWarning
-        default:     return StrandPalette.statusCritical
-        }
     }
 
     /// A sparkline needs at least two points; otherwise return nil so the tile stays clean.
@@ -158,5 +162,19 @@ struct NightDetailCard: View {
         let m = Swift.max(0, Int(minutes.rounded()))
         if m < 60 { return String(localized: "\(m)m") }
         return String(localized: "\(m / 60)h \(m % 60)m")
+    }
+}
+
+func nightDetailDebtCaption(_ debt: Double?) -> String {
+    guard let debt else { return String(localized: "vs need") }
+    return debt < SleepDebt.onTargetBandMin ? String(localized: "On target") : String(localized: "Below need")
+}
+
+func nightDetailDebtColor(_ debt: Double?) -> Color {
+    guard let debt else { return StrandPalette.textPrimary }
+    switch debt {
+    case ..<SleepDebt.onTargetBandMin: return StrandPalette.statusPositive
+    case ..<60: return StrandPalette.statusWarning
+    default: return StrandPalette.statusCritical
     }
 }

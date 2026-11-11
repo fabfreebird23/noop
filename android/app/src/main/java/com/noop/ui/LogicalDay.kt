@@ -117,6 +117,35 @@ internal fun lastVitalsRow(days: List<DailyMetric>, todayKey: String): DailyMetr
 internal fun lastSpo2Row(days: List<DailyMetric>, todayKey: String): DailyMetric? =
     days.lastOrNull { it.spo2Pct != null && it.day < todayKey }
 
+/**
+ * PER-FIELD twin of [lastVitalsRow] for HRV. [lastVitalsRow]'s predicate is an OR across HRV /
+ * resting-HR / respiratory, so it can select a row that has respRateBpm and a NULL avgHrv while an older
+ * row holds a real HRV — the card then reads null and prints "No Data" beside a tile showing a value
+ * (#1842). Same `it.day < todayKey` future-clock guard as its siblings.
+ */
+internal fun lastHrvRow(days: List<DailyMetric>, todayKey: String): DailyMetric? =
+    days.lastOrNull { it.avgHrv != null && it.day < todayKey }
+
+/** PER-FIELD twin of [lastVitalsRow] for resting heart rate. See [lastHrvRow]. */
+internal fun lastRestingHrRow(days: List<DailyMetric>, todayKey: String): DailyMetric? =
+    days.lastOrNull { it.restingHr != null && it.day < todayKey }
+
+/**
+ * The freshest strictly-prior row carrying EITHER skin-temp number (#1844), so a surface can lead with
+ * the absolute and fall back to the deviation from ONE night rather than mixing two.
+ *
+ * The OR here is deliberate and is NOT the #1842 defect. That bug read field X off a row selected on
+ * (X or Y), so a row holding only Y blanked X. This selects a row for a value that is "whichever of the
+ * two this night has", and the caller reads both fields off THAT row and lets
+ * [com.noop.analytics.SkinTempDisplay.leadReading] pick — so the chosen row always supplies the number
+ * shown, and the absolute and its deviation note always describe the same night.
+ *
+ * [lastSkinTempRow] stays as-is for the deviation-only surfaces. Twin of the Swift
+ * `DailyMetric.lastSkinTempReadingDay`.
+ */
+internal fun lastSkinTempReadingRow(days: List<DailyMetric>, todayKey: String): DailyMetric? =
+    days.lastOrNull { (it.skinTempC != null || it.skinTempDevC != null) && it.day < todayKey }
+
 /** PER-FIELD twin of [lastVitalsRow] for skin temperature deviation. See [lastSpo2Row]. */
 internal fun lastSkinTempRow(days: List<DailyMetric>, todayKey: String): DailyMetric? =
     days.lastOrNull { it.skinTempDevC != null && it.day < todayKey }

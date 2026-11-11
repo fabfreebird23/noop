@@ -202,6 +202,9 @@ struct RootView: View {
     @EnvironmentObject var router: NavRouter
     /// The liquid Today (default) vs the classic Today, same flag the iOS shell + Settings toggle read.
     @AppStorage("noop.liquidTodayEnabled") private var liquidTodayEnabled = true
+    /// The Coach master switch (`noop.coachEnabled`, shared by name with Android and iOS). Default ON.
+    @AppStorage("noop.coachEnabled") private var coachEnabled = true
+
     @State private var selection: NavItem? = .today
     /// Which sidebar groups are expanded (S1, #805). Default = the group owning the launch selection
     /// (`.today`). The single-item Today/Sleep sections always read expanded so their one row shows; the
@@ -328,6 +331,10 @@ struct RootView: View {
             case .liveSession: selection = .today
             // The #627 Today journal widget routes to the Insights sidebar row (which hosts the journal card).
             case .journal: selection = .insights
+            // #1862: the Today Coach card's launcher hands off here, so the send/stream/consent surface
+            // stays in exactly one place.
+            case .coach: selection = .coach
+            case .alarms: selection = .smartAlarm
             case nil: break
             }
             if dest != nil { router.requestedDestination = nil }
@@ -378,9 +385,15 @@ struct RootView: View {
     /// user-search semantics (case-insensitive, diacritic-insensitive, locale-aware) in one call.
     /// ALL groups filter, including single-item Today/Sleep; a group with no hits disappears entirely.
     private func visibleItems(in group: NavGroup) -> [NavItem] {
+        // Coach is dropped here, at the RENDER site, rather than out of `NavGroup.all`. That catalogue is
+        // asserted complete -- every NavItem appears in it exactly once (the M5 routability test) -- so
+        // filtering the source would trade a hidden row for a failing invariant. Hiding it here keeps the
+        // catalogue honest and still leaves the destination routable, which matters because a saved
+        // `selection` or a deep link can still name `.coach` after the switch goes off.
+        let items = coachEnabled ? group.items : group.items.filter { $0 != .coach }
         let query = trimmedQuery
-        guard !query.isEmpty else { return group.items }
-        return group.items.filter { $0.localizedTitle.localizedStandardContains(query) }
+        guard !query.isEmpty else { return items }
+        return items.filter { $0.localizedTitle.localizedStandardContains(query) }
     }
 
     /// One selectable destination row (same Label styling the flat list used), tagged for selection.
@@ -542,7 +555,16 @@ private struct SidebarStatus: View {
                 Text(statusText)
                     .font(StrandFont.rounded(12, weight: .medium))
                     .foregroundStyle(StrandPalette.textPrimary)
-                Text(live.batteryPct.map { String(localized: "Battery \(Int($0))%") } ?? String(localized: "Strap not connected"))
+                // #2208: gated on BOTH the link and whose device it is. This read had NO gate at all, so
+                // it showed the strap's last charge with nothing connected: `batteryPct` is never cleared,
+                // which made the honest `nil` branch below unreachable on any install that had paired a
+                // strap once. "Strap not connected" was dead text.
+                // The percent goes through the same rounding seam as the Devices card, so the two never
+                // read 34% and 35% for one charge (this used to truncate).
+                Text(live.connected && live.activeIsWhoop
+                     ? LiveConsoleReadout.batteryPercent(activeIsWhoop: true, whoopPct: live.batteryPct, ringPct: nil)
+                        .map { String(localized: "Battery \($0)%") } ?? String(localized: "Strap not connected")
+                     : String(localized: "Strap not connected"))
                     .font(StrandFont.rounded(11))
                     .foregroundStyle(StrandPalette.textTertiary)
             }

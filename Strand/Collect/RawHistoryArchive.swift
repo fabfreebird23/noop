@@ -137,10 +137,6 @@ struct RawHistoryArchive {
     /// kept as distinct buckets (their layouts differ despite the shared version number).
     private struct VersionKey: Hashable { let family: String; let version: Int }
 
-    private func versionKey(family: DeviceFamily, version: Int) -> VersionKey {
-        VersionKey(family: family.rawValue, version: version)
-    }
-
     /// Durably append `frames` as JSONL. `trim`/`family` tag each line so the corpus is replayable.
     /// Empty input is a no-op success. See `Result` for the ack contract.
     ///
@@ -164,7 +160,9 @@ struct RawHistoryArchive {
         // Build the new JSONL lines (each newline-terminated). The version that drives floor-aware
         // retention (#344) is re-derived per line from the stored frame inside `evictLines`.
         let newLines: [String] = frames.map { f in
-            let hex = f.map { String(format: "%02x", $0) }.joined()
+            // Fast encoder: one line per REJECTED frame, which on an unmapped-layout strap is every
+            // frame of every chunk.
+            let hex = f.hexLower
             // Hand-built JSON: the only dynamic field is hex (always [0-9a-f]) so no escaping is
             // needed, and this avoids a JSONEncoder allocation per frame on the offload hot path.
             return "{\"capturedAtMs\":\(capturedAtMs),\"trim\":\(Int(trim)),"
@@ -384,6 +382,7 @@ struct RawHistoryArchive {
             // the opt-in HR-from-PPG sub-lag interpolation flag (Test Centre → Experimental algorithms) so the
             // archive replay re-derives v26 HR with the same variant the live offload uses. Default OFF.
             let streams = extractHistoricalStreams(parsed, deviceClockRef: 0, wallClockRef: 0,
+                                                   family: family,
                                                    subLagInterp: PuffinExperiment.ppgHrSubLagInterpEnabled)
             // Count rows ACTUALLY inserted, not decoded: under the per-app-version gate the archive
             // replays every release, and dedupe makes those re-runs insert 0 — counting decoded rows

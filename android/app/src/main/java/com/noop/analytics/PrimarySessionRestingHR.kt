@@ -1,21 +1,24 @@
 package com.noop.analytics
 
 /**
- * #1169: an alternative headline resting-HR definition — the arithmetic MEAN of valid HR samples in the
- * LONGEST (primary) sleep session, rather than the lowest-per-session floor `AnalyticsEngine` ships today.
+ * #1169: a shadow resting-HR definition — the arithmetic MEAN of valid HR samples in the longest
+ * (primary) sleep session, rather than the five-minute floor `AnalyticsEngine` ships today.
  *
  * ## Why (issue #1169, artemc)
- * The shipped daily RHR is `restingHRDaily = matched…restingHR.min()` — a nightly HR FLOOR, and the `.min()`
- * lets a short low-HR nap replace the main overnight session. A clean-room, single-participant 5-night
+ * The original daily RHR took the minimum floor across sessions, letting a short low-HR nap replace
+ * the main overnight session. A clean-room, single-participant 5-night
  * experiment (official WHOOP RHR + a Polar H10 ECG mean as independent references, a pre-declared dev/holdout
  * split, no fitted offset) found the primary-session sample mean tracked both far better: rounded MAE vs the
  * official target 6.0->2.0 (dev) / 7.5->0.8 (holdout).
  *
- * ## Deliberately PURE and UNWIRED
- * This computes the metric and is unit-tested, but nothing consumes it yet. The shipped headline AND the
- * recovery / strain / workout-detection / energy inputs all read the floor `restingHRDaily`, so switching
- * them is a re-baselining of core scores that the issue itself says needs a larger multi-participant,
- * pre-declared holdout first. Out of scope here; this lands the transparent, testable definition.
+ * ## Shadow metric after #2522
+ * #2358 temporarily wired this mean into the daily headline while selecting the primary session to
+ * avoid the nap problem. #2522 keeps that session selection but takes its existing five-minute floor.
+ * This mean remains in `rhr_primary_session` for comparison and does not feed scoring.
+ *
+ * What that means for the evidence below: the MAE figures are from ONE participant over five nights
+ * against a pre-declared split, which is the holdout the issue says is not yet large enough. #2284
+ * proposes changing a session's `restingHR` definition separately; this shadow comparison does not enact it.
  *
  * ## Definition
  * - **Primary session**: the LONGEST by duration; ties resolve to the FIRST. A nap never replaces the night.

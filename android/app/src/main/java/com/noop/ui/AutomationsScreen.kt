@@ -56,6 +56,7 @@ import com.noop.analytics.HrZones
 import com.noop.analytics.NapCandidate
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+import com.noop.analytics.ClockFormat
 
 /**
  * Automations — turn the strap's physical inputs (double-tap, wrist on/off) and live
@@ -248,8 +249,7 @@ fun AutomationsScreen(viewModel: AppViewModel) {
                 if (!notifMasterOn) {
                     RowDivider()
                     Text(
-                        uiString(R.string.l10n_automations_screen_notifications_are_off_so_this_can_b3dba7ee) +
-                            "Settings → Notifications to let it through.",
+                        uiString(R.string.l10n_automations_screen_notifications_are_off_so_this_can_b3dba7ee),
                         style = NoopType.footnote, color = Palette.statusWarning,
                     )
                 }
@@ -458,7 +458,10 @@ private fun NapActionButton(icon: ImageVector, contentDescription: String, tint:
 
 /** "HH:mm–HH:mm · ~N min", local time. Pure-ish (reads the device clock format only). */
 private fun napWindowLabel(nap: NapCandidate, ctx: android.content.Context): String {
-    val fmt = android.text.format.DateFormat.getTimeFormat(ctx)
+    // #1821: the reader's chosen clock, not the raw device format.
+    val fmt = java.text.SimpleDateFormat(
+        ClockFormat.hourMinutePattern(ClockPrefs.uses24Hour(ctx)), java.util.Locale.getDefault(),
+    )
     val start = fmt.format(java.util.Date(nap.start * 1000L))
     val end = fmt.format(java.util.Date(nap.end * 1000L))
     val mins = nap.durationS / 60

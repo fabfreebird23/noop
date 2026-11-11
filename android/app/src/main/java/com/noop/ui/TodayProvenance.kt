@@ -7,6 +7,7 @@ import com.noop.analytics.FusionSource
 import com.noop.analytics.ReadinessEngine
 import com.noop.ble.WhoopBleClient
 import com.noop.data.WhoopRepository
+import com.noop.data.Vo2MaxEstimator
 
 /**
  * The Today provenance label for the day's REAL merge winner, extends the existing By-Day badge
@@ -57,6 +58,17 @@ internal fun provenanceDisplayLabel(
     rawSource: String,
     deviceId: String = WhoopRepository.WHOOP_SOURCE,
 ): DisplayText {
+    if (rawSource.startsWith(VO2_MAX_ATTRIBUTION_PREFIX)) {
+        val raw = rawSource.removePrefix(VO2_MAX_ATTRIBUTION_PREFIX)
+        return DisplayText.Resource(vo2MaxAttributionLabelRes(Vo2MaxEstimator.fromProvenanceId(raw)))
+    }
+    // #103/queue-11a follow-up: the spo2 candidate-fallback rows in the vital-detail readings table
+    // (see [SPO2_CANDIDATE_ATTRIBUTION_SOURCE]) must read "strap estimate (unverified)" — the SAME
+    // string every other candidate-fallback surface uses — never a device name, which would
+    // misrepresent an unvalidated estimate as a calibrated reading in this table's Source column.
+    if (rawSource == SPO2_CANDIDATE_ATTRIBUTION_SOURCE) {
+        return DisplayText.Resource(R.string.spo2_strap_estimate_caption)
+    }
     if (rawSource.endsWith("-noop")) return DisplayText.Resource(R.string.today_source_on_device)
     if (rawSource == deviceId || rawSource == WhoopRepository.WHOOP_SOURCE) return DisplayText.Resource(R.string.today_source_whoop)
     if (rawSource == WhoopRepository.APPLE_HEALTH_SOURCE) return DisplayText.Resource(R.string.today_source_apple_health)
@@ -64,6 +76,13 @@ internal fun provenanceDisplayLabel(
     return FusionSource.entries.firstOrNull { it.id == rawSource }
         ?.let { source -> provenanceBadgeLabel(source) }
         ?: DisplayText.Dynamic(rawSource)
+}
+
+@StringRes
+internal fun vo2MaxAttributionLabelRes(estimator: Vo2MaxEstimator?): Int = when (estimator) {
+    Vo2MaxEstimator.NES -> R.string.vo2max_method_nes
+    Vo2MaxEstimator.UTH -> R.string.vo2max_method_uth
+    null -> R.string.vo2max_method_unknown
 }
 
 /** Today uses the audience-facing sensor name for Apple Health scores, matching the Swift Today lane. */
@@ -142,13 +161,27 @@ internal fun scoreHeroSourceLabel(
     )
 }
 
-/** Today pull-to-sync mirrors the BLE client's manual-sync guard, so the gesture never starts a sync while
- *  disconnected, still bonding, or already offloading. Kept pure for the UI-specific contract test. */
+/**
+ * Today pull-to-sync mirrors the BLE client's manual-sync guard, so the gesture never starts a sync while
+ * disconnected, still bonding, or already offloading. Kept pure for the UI-specific contract test.
+ *
+ * [historyReady] is the second half of that mirror and was missing. `canRequestSync` checks `bonded`,
+ * which on a 5/MG is set by the live-HR path — true on a strap that has never completed a handshake. So
+ * the gesture was offered, accepted, and then refused by `beginBackfill`'s own `connectHandshakeDone`
+ * gate with nothing shown: a control that ran and did nothing, reported four times as "refresh doesn't
+ * work". It was working; it was silent.
+ *
+ * Adding the client's OWN precondition cannot disable a sync that would have run, because
+ * `beginBackfill` already requires exactly this flag before it will request an offload. The gesture now
+ * goes away precisely when the sync would have been declined anyway — including on a WHOOP 4.0 whose
+ * bond has not landed yet, which a strap-family check would have missed.
+ */
 internal fun todayPullToSyncEnabled(
     connected: Boolean,
     bonded: Boolean,
     backfilling: Boolean,
-): Boolean = WhoopBleClient.canRequestSync(connected, bonded, backfilling)
+    historyReady: Boolean,
+): Boolean = WhoopBleClient.canRequestSync(connected, bonded, backfilling) && historyReady
 
 /** The tint for a per-metric provenance badge, keyed on the resolved LABEL, gold for Whoop, cyan for
  *  Apple Health, the positive status hue for on-device (and anything else). Matches the Data Sources

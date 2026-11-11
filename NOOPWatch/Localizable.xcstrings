@@ -290,9 +290,33 @@
           }
         },
         "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%lld вдохов · %@"
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld вдох · %@"
+                }
+              },
+              "few": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld вдоха · %@"
+                }
+              },
+              "many": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld вдохов · %@"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld вдоха · %@"
+                }
+              }
+            }
           }
         },
         "zh-Hans": {
@@ -354,9 +378,33 @@
           }
         },
         "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Осталось %1$lld секунд, %2$@"
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Осталась %1$lld секунда, %2$@"
+                }
+              },
+              "few": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Осталось %1$lld секунды, %2$@"
+                }
+              },
+              "many": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Осталось %1$lld секунд, %2$@"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Осталось %1$lld секунды, %2$@"
+                }
+              }
+            }
           }
         },
         "zh-Hans": {
@@ -674,9 +722,33 @@
           }
         },
         "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Вдох на %lld секунд"
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Вдох на %lld секунду"
+                }
+              },
+              "few": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Вдох на %lld секунды"
+                }
+              },
+              "many": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Вдох на %lld секунд"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Вдох на %lld секунды"
+                }
+              }
+            }
           }
         },
         "zh-Hans": {
@@ -802,9 +874,33 @@
           }
         },
         "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Выдох на %lld секунд"
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Выдох на %lld секунду"
+                }
+              },
+              "few": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Выдох на %lld секунды"
+                }
+              },
+              "many": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Выдох на %lld секунд"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Выдох на %lld секунды"
+                }
+              }
+            }
           }
         },
         "zh-Hans": {

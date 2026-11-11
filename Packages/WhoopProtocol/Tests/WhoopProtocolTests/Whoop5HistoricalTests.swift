@@ -50,9 +50,14 @@ final class Whoop5HistoricalTests: XCTestCase {
         let gz = f.parsed["gravity_z"]?.doubleValue ?? 0
         XCTAssertEqual((gx * gx + gy * gy + gz * gz).squareRoot(), 1.0, accuracy: 0.05)
 
-        // R-R is internally consistent with the heart rate (60000 / mean(R-R) ≈ bpm).
-        let meanRR = Double(602 + 613) / 2.0
-        XCTAssertEqual(60000.0 / meanRR, 102, accuracy: 8)
+        // This loose physiological check cannot distinguish milliseconds from 1/1024-s ticks.
+        // Units are established by matching whole native arrays to standard 0x2A37 raw arrays,
+        // not by fitting an averaged heart rate to two beats (firmware 50.41.1.0).
+        let rr = f.parsed["rr_intervals"]?.intArrayValue ?? []
+        XCTAssertFalse(rr.isEmpty, "no R-R decoded — the cross-check below would be vacuous")
+        let meanRR = Double(rr.reduce(0, +)) / Double(rr.count)
+        let hr = f.parsed["heart_rate"]?.intValue ?? 0
+        XCTAssertEqual(60000.0 / meanRR, Double(hr), accuracy: 4)
     }
 
     func testHistoricalV18BiometricFields() {

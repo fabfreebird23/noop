@@ -1,5 +1,26 @@
 package com.noop.protocol
 
+/** Sensor-contact state carried by the standard BLE Heart Rate Measurement flags. */
+enum class StandardHrContact(val storageValue: String) {
+    UNSUPPORTED("unsupported"),
+    SUPPORTED_NOT_DETECTED("supported_not_detected"),
+    SUPPORTED_DETECTED("supported_detected"),
+
+    ;
+
+    companion object {
+        fun fromMeasurementFlags(flags: Int): StandardHrContact = when {
+            flags and 0x04 == 0 -> UNSUPPORTED
+            flags and 0x02 == 0 -> SUPPORTED_NOT_DETECTED
+            else -> SUPPORTED_DETECTED
+        }
+
+        fun fromStorageValue(value: String): StandardHrContact? = entries.firstOrNull {
+            it.storageValue == value
+        }
+    }
+}
+
 /**
  * Decoded stream rows — the durable, compact local record produced from parsed frames.
  *
@@ -12,10 +33,11 @@ package com.noop.protocol
 data class HrSample(val ts: Int, val bpm: Int)
 
 /**
- * WHICH sensor channel produced an R-R interval (#1071).
+ * The sensor channel or transport that produced an R-R interval.
  *
- * A WHOOP strap has ONE beat source, so its rows carry no channel (null) and nothing here changes for
- * them. An Oura ring has more than one: the green-quality tag (0x80) and the SpO2 tag (0x6E) both
+ * WHOOP 5 exposes one beat train over several labelled transports. WHOOP 4 type-47 history uses code 8;
+ * its standard BLE and legacy rows keep null.
+ * An Oura ring has more than one optical channel: the green-quality tag (0x80) and the SpO2 tag (0x6E) both
  * decode to R-R and both were stored, so the table held roughly TWO complete copies of every night —
  * not duplicate rows to de-duplicate, but the SAME heartbeats measured twice. Labelling the channel is
  * what lets scoring read one copy while both stay on disk as each other's cross-check.
@@ -51,7 +73,24 @@ enum class RrSourceChannel(val code: Int) {
      * Labelling only — both are read exactly as before.
      */
     IBI_BARE(4),
+    /** WHOOP 5 v18 history, converted from wire ticks to milliseconds. */
+    WHOOP5_HISTORICAL(5),
+    /** WHOOP 5 type-40 live transport, converted from wire ticks to milliseconds. */
+    WHOOP5_REALTIME(6),
+    /** WHOOP 5 standard BLE 0x2A37, already converted to milliseconds. */
+    WHOOP5_STANDARD(7),
+    /** WHOOP 4.0 type-47 historical stream, distinguished from its unlabelled live BLE feed. */
+    WHOOP4_HISTORICAL(8),
+    /** WHOOP 4.0 type-40 realtime RR, timestamped from its record clock. */
+    WHOOP4_REALTIME(9),
+    /** WHOOP 4.0 standard BLE 0x2A37 RR, timestamped on notification receipt. */
+    WHOOP4_STANDARD(10),
     ;
+
+    val isWhoop5Transport: Boolean get() = code in 5..7
+
+    /** The ring's beat trains (0x80, 0x6E, 0x60, 0x44), as opposed to a WHOOP transport. */
+    val isOura: Boolean get() = code in 1..4
 
     companion object {
         /** The channel with this durable storage [code], or null for an unknown/absent one. */
@@ -285,12 +324,18 @@ private fun toWall(deviceTs: Int?, deviceClockRef: Int, wallClockRef: Int): Int?
  *
  * HR/R-R are taken ONLY from REALTIME_DATA (type 40). REALTIME_RAW_DATA (type 43) also carries an
  * HR byte but streams alongside type-40 during raw collection, so routing both would double-count
- * HR for the same instants. CRC-failed and non-ok frames are skipped.
+ * HR for the same instants. Frames whose full integrity verdict is negative are skipped — that is
+ * the header checksum, the payload CRC32 and the structural length together, not the payload CRC
+ * alone.
+ *
+ * Swift twin: `extractStreams`. Adding `family` changed the arity on both sides at once, which
+ * unpaired them in the ledger even though they moved together.
  */
-fun extractStreams(parsed: List<ParsedFrame>, deviceClockRef: Int, wallClockRef: Int): Streams {
+fun extractStreams(parsed: List<ParsedFrame>, deviceClockRef: Int, wallClockRef: Int,
+                   family: DeviceFamily? = null): Streams {
     val out = Streams()
     for (r in parsed) {
-        if (!r.ok || r.crcOk == false) continue
+        if (!r.ok) continue
         val p = r.parsed
         when (r.typeName) {
             "REALTIME_DATA" -> {
@@ -299,7 +344,9 @@ fun extractStreams(parsed: List<ParsedFrame>, deviceClockRef: Int, wallClockRef:
                     p.intOrNull("heart_rate")?.let { bpm -> out.hr.add(HrSample(ts, bpm)) }
                     // Drop RR rows when timestamp is absent (a ts-less RR row is unstorable).
                     p.intArrayOrNull("rr_intervals")?.let { rrs ->
-                        for (rr in rrs) out.rr.add(RrInterval(ts, rr))
+                        val source = RrSourceChannel.fromCode(p.intOrNull("rr_source_channel"))
+                            ?: if (family == DeviceFamily.WHOOP4) RrSourceChannel.WHOOP4_REALTIME else null
+                        for (rr in rrs) out.rr.add(RrInterval(ts, rr, source))
                     }
                 }
             }

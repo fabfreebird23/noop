@@ -87,6 +87,13 @@ class OuraDriver(
      */
     val allowKeyInstall: Boolean = false,
     /**
+     * The SetNotification mask both handshake paths send (Ready and the post-install re-auth).
+     * [OuraCommands.NOTIFICATION_MASK_DEFAULT] (`3f`) unless the Test Centre A/B asks for the official
+     * app's `ff` — see [OuraCommands.NOTIFICATION_MASK_FULL]. Reversible: the next session sends the mask
+     * it is constructed with, nothing persists on the ring. Twin of Swift's `notificationMask`.
+     */
+    val notificationMask: Int = OuraCommands.NOTIFICATION_MASK_DEFAULT,
+    /**
      * Wall-clock "now" in unix ms, used ONLY to reject a banked sample that converts to the future
      * (#1073). Injectable so the gate is testable without touching the system clock; defaults to the
      * real clock, so no ingest call site has to thread it. Twin of Swift's `nowMsProvider`.
@@ -98,6 +105,21 @@ class OuraDriver(
 
     /** Tracks how many of the live-HR enable triplet ACKs have been seen. */
     private var liveHREnableStep = 0
+
+    /**
+     * Whether auth success should arm the live-HR enable triplet (`dhr_read` / `dhr_enable` /
+     * `dhr_subscribe`). Default true — the historical behaviour. The app clears it for a connect it
+     * makes while its live-HR stream is suspended (screen off overnight): before this flag every
+     * reconnect ran the triplet unconditionally, the app's suspend guard undid it one second later,
+     * and the ring logged `DHR_mode:3` → `DHR_mode:0` on each visit. On a Ring 5 overnight capture
+     * (issue #2075's reporter, 2026-09-16) four of the five interruptions of the ring's own SpO2
+     * session started on exactly the second of such a connect (3–49 min each, ≈ 2 h of a 9 h night).
+     * With the flag false the driver goes straight to `Streaming` — authenticated and idle — so the
+     * history drain, SyncTime and status reads run as before and no daytime-HR write is made at all.
+     * Read once, at the auth-success step. Twin of the Swift `OuraDriver.liveHRWanted`; Android's
+     * `OuraLiveSource` has no screen-off suspend yet (#1546), so nothing clears it there today.
+     */
+    var liveHRWanted: Boolean = true
 
     /**
      * The most recent ring time seen on any record, used to stamp live-HR pushes (which are not TLV
@@ -146,7 +168,7 @@ class OuraDriver(
                 phase = OuraDriverPhase.Authenticating
                 // Enable notifications, then request the auth nonce. SyncTime can follow auth.
                 listOf(
-                    OuraCommands.enableAllNotifications(),
+                    OuraCommands.enableAllNotifications(mask = notificationMask),
                     OuraCommand("get_nonce", OuraAuth.getAuthNonceCommand()),
                 )
             }
@@ -175,10 +197,18 @@ class OuraDriver(
 
         is OuraTransition.AuthCompleted -> when (after.status) {
             OuraAuthStatus.SUCCESS -> {
-                phase = OuraDriverPhase.EnablingLiveHR
-                liveHREnableStep = 0
-                // Begin the live-HR enable triplet (gen-appropriate; gen3 verified, gen4/5 same path).
-                listOf(OuraCommands.liveHREnableSequence()[0])
+                // A connect the app does not want live HR for (suspended night) skips the triplet
+                // entirely: `Streaming` here means "authenticated, idle", which is all the history
+                // fetch / SyncTime / status reads need. Nothing is written to the daytime-HR feature.
+                if (!liveHRWanted) {
+                    phase = OuraDriverPhase.Streaming
+                    emptyList()
+                } else {
+                    phase = OuraDriverPhase.EnablingLiveHR
+                    liveHREnableStep = 0
+                    // Begin the live-HR enable triplet (gen-appropriate; gen3 verified, gen4/5 same path).
+                    listOf(OuraCommands.liveHREnableSequence()[0])
+                }
             }
             OuraAuthStatus.IN_FACTORY_RESET -> {
                 // Ring needs a key install first; this is an explicit, named provisioning step the app
@@ -276,9 +306,21 @@ class OuraDriver(
         if (phase != OuraDriverPhase.InstallingKey || installedKey == null) return emptyList()
         phase = OuraDriverPhase.Authenticating
         return listOf(
-            OuraCommands.enableAllNotifications(),
+            OuraCommands.enableAllNotifications(mask = notificationMask),
             OuraCommand("get_nonce", OuraAuth.getAuthNonceCommand()),
         )
+    }
+
+    /**
+     * The `get_nonce` request again, for the auth watchdog (#2304) — and ONLY while the driver is still
+     * waiting for a nonce. Outside Authenticating there is nothing to retry and this returns null, so the
+     * transport can never re-open the handshake on a session that already moved on (streaming, a pairing
+     * dead-end, stopped). Same bytes as the Ready step; the phase is left untouched. Kotlin twin of the
+     * Swift `authNonceRetryCommand`.
+     */
+    fun authNonceRetryCommand(): OuraCommand? {
+        if (phase != OuraDriverPhase.Authenticating) return null
+        return OuraCommand("get_nonce", OuraAuth.getAuthNonceCommand())
     }
 
     /** Stop: reset the flow so a fresh session re-runs auth (the app key is session-scoped, s3.1). */
@@ -649,22 +691,81 @@ class OuraDriver(
         private const val SAMPLE_FUTURE_TOLERANCE_SECONDS = 300L
 
         /**
+         * How far the ring's clock may run AHEAD of [lowerBoundTicks] and still be recognised. The bound
+         * is a stale resume cursor or the oldest ring-time a drain has seen, either of which can trail
+         * the ring's clock by the ring's whole banked depth (~14 days) plus however long the cursor has
+         * been stuck — the original 7-day window silently excluded exactly that case: in the 2026-09-02/03
+         * iOS captures an 8.2-day-stale cursor could never be re-anchored, so it could never advance, so
+         * the staleness only grew — one full re-serve of the same window per launch, forever. Both
+         * readings fit the window only when `window >= 9 × lowerBound`, i.e. a ring under ~5 days of
+         * clock; that case is settled by [SYNC_TIME_ANCHOR_ADJACENCY_TICKS], never by preference.
+         * Byte-identical twin of Swift's syncTimeAnchorWindowTicks.
+         */
+        const val SYNC_TIME_ANCHOR_WINDOW_TICKS = 38_880_000L   // 45 days of 100 ms ticks
+
+        /**
+         * How close to [lowerBoundTicks] a reading must sit to be IDENTIFIED rather than merely plausible,
+         * and how far a ticks reading may trail the bound. One hour of 100 ms ticks. Two facts set it:
+         * (1) the bound can post-date the reply — [OuraHistoryDrain.maxSeenRingTime] is fed by records
+         * that land AFTER the 0x13 was answered, and the ring keeps ticking, so the reply's own clock
+         * legitimately sits a few ticks (or a whole drain's worth) BELOW the newest record; (2) the two
+         * readings differ by `9 × value`, so once the drain's ring-times are within an hour of one of
+         * them, the other is days away and the unit is settled by the ring's own records, not by a guess.
+         * Found on a Ring 5 with under five days of clock (2026-09-15, a user bundle, #2239): a reply 22
+         * ticks below the drain's newest record was excluded as "before the floor", the ×10 reading was
+         * the only one left inside the 45-day window, and the whole session was filed 41 days in the
+         * past. Byte-identical twin of Swift's syncTimeAnchorAdjacencyTicks.
+         */
+        const val SYNC_TIME_ANCHOR_ADJACENCY_TICKS = 36_000L   // 1 hour of 100 ms ticks
+
+        /**
          * Resolve the 0x13 SyncTime-response device timestamp into ring TICKS, or null when no
          * unambiguous reading exists. ringverse BLE.md labels the field "seconds" but the ring's record
          * clock runs in 100 ms ticks, so both readings are tried: the raw value (already ticks) and
-         * value×10 (seconds→ticks). The ring's clock at connect must sit shortly AFTER where the last
-         * drain ended, so a candidate is plausible iff it falls in `[historyCursor, historyCursor +
-         * 7 days]`; exactly one must fit (ambiguity or a fresh/reset cursor → null → the caller logs
-         * raw instead of guessing). Pure. Byte-identical twin of Swift's syncTimeAnchorCandidate.
+         * value×10 (seconds→ticks). A candidate is plausible iff it falls in `[lowerBoundTicks −
+         * adjacency, lowerBoundTicks + SYNC_TIME_ANCHOR_WINDOW_TICKS]` — the ring's clock at the reply
+         * sits after any ring-time known BEFORE the reply, and at most
+         * [SYNC_TIME_ANCHOR_ADJACENCY_TICKS] before one learned after it. Then:
+         *
+         * - only the ticks reading fits → ticks (the ordinary case on a ring with days of clock: ×10
+         *   lands beyond the window);
+         * - both fit (a ring under ~5 days of clock) → the reading within
+         *   [SYNC_TIME_ANCHOR_ADJACENCY_TICKS] of the bound, if exactly one is — the drain's own
+         *   ring-times identify the unit; otherwise null, and the caller parks the reply until the drain
+         *   has caught up to the present;
+         * - only the ×10 reading fits → it, but ONLY when adjacent. No capture on either ring generation
+         *   has ever produced a seconds-unit reply (every anchor on file resolved as ticks), so the label
+         *   alone does not earn adoption; the drain's ring-times must corroborate it. A ticks reply that
+         *   has fallen more than an hour behind the bound is therefore null, never silently ×10.
+         *
+         * [lowerBoundTicks] is any ring-time known to precede the ring's clock NOW: the persisted resume
+         * cursor at connect, or — when that is 0 (fresh pair / post-reboot reset) or too stale — the
+         * largest envelope ring-time the drain has actually seen ([OuraHistoryDrain.maxSeenRingTime]),
+         * which needs no anchor to read and so breaks the cursor↔anchor deadlock (2026-09-02/03 captures).
+         *
+         * Pure. Byte-identical twin of Swift's syncTimeAnchorCandidate.
          */
-        fun syncTimeAnchorCandidate(responseValue: Long, historyCursor: Long): Long? {
-            if (historyCursor <= 0) return null
-            val lower = historyCursor
-            val upper = lower + 6_048_000L   // 7 days of 100 ms ticks
-            val readings = listOf(responseValue, responseValue * 10)
-            val fits = readings.filter { it in lower..upper && it <= 0xFFFF_FFFFL }
-            if (fits.size != 1) return null
-            return fits[0]
+        fun syncTimeAnchorCandidate(responseValue: Long, lowerBoundTicks: Long): Long? {
+            if (lowerBoundTicks <= 0) return null
+            val lower = lowerBoundTicks
+            val floor = lower - SYNC_TIME_ANCHOR_ADJACENCY_TICKS
+            val upper = lower + SYNC_TIME_ANCHOR_WINDOW_TICKS
+            val ticks = responseValue
+            val secondsX10 = responseValue * 10
+            fun plausible(v: Long) = v >= floor && v <= upper && v <= 0xFFFF_FFFFL
+            fun adjacent(v: Long) = kotlin.math.abs(v - lower) <= SYNC_TIME_ANCHOR_ADJACENCY_TICKS
+            val ticksFit = plausible(ticks)
+            val x10Fit = plausible(secondsX10)
+            return when {
+                ticksFit && !x10Fit -> ticks
+                !ticksFit && x10Fit -> if (adjacent(secondsX10)) secondsX10 else null
+                ticksFit && x10Fit -> when {
+                    adjacent(ticks) && !adjacent(secondsX10) -> ticks
+                    adjacent(secondsX10) && !adjacent(ticks) -> secondsX10
+                    else -> null
+                }
+                else -> null
+            }
         }
     }
 }

@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
+import com.noop.BuildConfig
 
 /**
  * The Android environment-header block (spec section 3.4), bringing Android to the same shape as the iOS
@@ -17,6 +18,22 @@ import android.os.PowerManager
  * gracefully, never fabricates a value it can't read.
  */
 object AndroidDiagnostics {
+
+    /**
+     * `App:     <version> (<tier>) build <code> <applicationId>` for every export header.
+     *
+     * The applicationId was missing (#2553, Apple twin in `LiveState.appIdentityLine`). It is not decoration
+     * here: the id varies across the four builds this project ships (`com.noop.whoop`, plus `.debug`,
+     * `.staging` and `.demo` suffixes), and `.staging` is a SIDE-INSTALL, so a wearer can be running prod and
+     * staging at once. Two exports from that phone otherwise differ only by tier, and the id is what says
+     * which install produced the log.
+     *
+     * One property rather than three copies: the three header builders each wrote this line out themselves,
+     * which is how a field lands in one export and not the others.
+     */
+    val appIdentityLine: String
+        get() = "App:     ${BuildConfig.VERSION_NAME} (${BuildConfig.TIER}) " +
+            "build ${BuildConfig.VERSION_CODE} ${BuildConfig.APPLICATION_ID}"
 
     /** Aux rows read for one night's SpO2-candidate line (#112). Twin of the Swift
      *  `DebugDataDiagnostics.spo2CandidateAuxLimit`. */
@@ -55,6 +72,88 @@ object AndroidDiagnostics {
     }
 
     /**
+     * The history-offload write-health line.
+     *
+     * "Offload:", not "Data write:". The stamp behind it is written ONLY when a backfill session
+     * persists rows, so it says nothing about live streaming - and on a strap that offloads nothing but
+     * streams happily (an unbonded 5/MG, the designed end state of #1635) the old label read as "this
+     * app has stored nothing from your strap" while a hundred thousand HR rows sat under that very
+     * device id. The scope now lives in the label, and the zero case says outright what it excludes.
+     *
+     * Pure and extracted for the same reason [strapProvidesLine] is: [summaryLines] needs a real
+     * Context, and the wording is the part a change would silently break.
+     */
+    internal fun offloadLine(okAtSec: Long, ageMs: Long): String =
+        "Offload:     " + if (okAtSec > 0L) {
+            "rows last landed ${relTime(ageMs)}"
+        } else {
+            "no history rows ever persisted (live HR/R-R are not counted here)"
+        }
+
+    /**
+     * The note that says the funnel did NOT analyse the latest night, and which one it skipped.
+     *
+     * The funnel deliberately walks back to the most recent night carrying skin temperature, because a
+     * night without it reports "skin=0" and teaches nothing. That fallback is right; printing its result
+     * under a heading that says "latest night" is not. On #2012 it reported a night four days older than
+     * the export with no indication, and reading it as the latest night is what a careful reader does.
+     *
+     * Empty when the funnel really did take the newest session, so the common case stays unchanged.
+     */
+    internal fun funnelFallbackNote(chosenDay: String, newestDay: String): String =
+        if (chosenDay == newestDay) "" else " (NOT the latest night: $newestDay carried no skin temperature)"
+
+    /**
+     * The strap id the report is describing: the registry's ACTIVE device, falling back to the canonical
+     * spine id when the registry has nothing usable.
+     *
+     * A BLANK or absent id must fall back rather than be queried. It matches no rows, so every read
+     * scoped to it comes back empty and the report states absences that are really just a bad lookup.
+     *
+     * Pure so the fallback rule is pinned by a test; the Context-touching resolution stays at the call
+     * site, which is the split the rest of this file uses.
+     */
+    internal fun activeStrapId(registryId: String?): String =
+        registryId?.takeIf { it.isNotBlank() } ?: com.noop.data.WhoopRepository.WHOOP_SOURCE
+
+    /**
+     * What the active strap actually delivered over the window — the line that says which scores can
+     * exist at all.
+     *
+     * A 5/MG that never completes its handshake streams live HR and R-R over the standard characteristic
+     * and nothing else: motion and steps arrive only with the proprietary offload. Without motion the
+     * sleep stager has no HR-only fallback and the workout detector returns before it looks at heart rate,
+     * so Rest reads "No data" and no bout is ever found — and until now a report showed those absences
+     * with nothing connecting them to their single cause. A reader had to know the pipeline to infer it.
+     *
+     * The window is IN the label. Without it "Provides: motion NO" reads as a capability claim, and a
+     * strap simply not worn for two days would be reported as incapable of motion — the opposite kind of
+     * wrong from the one this line exists to prevent. Over a window of actual wear, delivered and capable
+     * are the same thing; the label keeps that assumption visible instead of implied.
+     * The label is padded to 13 like every other in this block ("Model:", "Offload:"), and the window
+     * rides the VALUE. "Provides(48h):" is 15 and overhung the column in a report that is aligned by hand
+     * and read by eye.
+     * Pure so it is unit-tested directly; byte-identical to the Swift twin.
+     */
+    internal fun strapProvidesLine(
+        hr: Boolean,
+        rr: Boolean,
+        motion: Boolean,
+        steps: Boolean,
+        deviceId: String,
+    ): String {
+        fun mark(b: Boolean) = if (b) "yes" else "NO"
+        // The DEVICE rides the value beside the window, for the same reason the window does. This asks
+        // ONE id, the active one, while every scorer reads the union of the active, canonical and
+        // computed ids. Those disagree on a re-added strap, an archived spine, or a Health Connect
+        // import, and the line then reads as "this install has no heart rate" when it means "the active
+        // strap id delivered none". That misreading cost real triage time on #2012, where the header
+        // said HR NO while the same export scored a day off 28,141 samples read through the union.
+        return "Provides:    HR ${mark(hr)} · R-R ${mark(rr)} · motion ${mark(motion)} · steps ${mark(steps)}" +
+            " ($deviceId, last 48h)"
+    }
+
+    /**
      * Strap identity + data-state lines for the debug export. Offline-safe: reads persisted prefs and the
      * canonical "my-whoop" daily spine, so it works from the scheduled background export too. Model,
      * last-known firmware, last-sync, timezone, days of history, and the most recent sleep + recovery day.
@@ -71,23 +170,151 @@ object AndroidDiagnostics {
                     else -> reportedModel(context)?.displayName ?: "unknown (paired, family not yet detected)"
                 },
             )
-            add("Firmware:    ${com.noop.ui.NoopPrefs.lastFirmware(context) ?: "unknown (connect to record)"}")
-            val syncSec = com.noop.ui.NoopPrefs.lastSyncAt(context)
-            add("Last sync:   ${if (syncSec > 0L) relTime(System.currentTimeMillis() - syncSec * 1000L) else "never"}")
+            // #1633 follow-up: the ACTIVE device's own firmware. This read used to be the bare global key,
+            // so a two-strap log named whichever strap connected last - a 5/MG log reporting a 4.0's
+            // 41.17.6.0. resolveFirmware falls back to the legacy key only when one device is paired.
+            val fwRows = runCatching {
+                (context.applicationContext as? com.noop.NoopApplication)?.deviceRegistry?.all().orEmpty()
+            }.getOrDefault(emptyList())
+            val fwActive = runCatching {
+                (context.applicationContext as? com.noop.NoopApplication)?.deviceRegistry?.activeDeviceId()
+            }.getOrNull()
+            val fwRow = fwRows.firstOrNull { it.id == fwActive }
+            val fw = com.noop.ble.resolveFirmware(
+                live = null,
+                perDevice = com.noop.ui.NoopPrefs.firmwareFor(context, fwRow?.peripheralId),
+                legacyGlobal = com.noop.ui.NoopPrefs.lastFirmware(context),
+                pairedCount = fwRows.size,
+            )
+            add("Firmware:    ${fw ?: "unknown (connect to record)"}")
+            // THIS strap's own sync, attributed the same way the firmware above is. The old global key
+            // reported whichever strap synced last, so a 5/MG that had never banked a row showed its
+            // paired 4.0's timestamp — the line that made a non-existent sync regression look real.
+            val syncSec = com.noop.ble.resolveLastSync(
+                perDevice = com.noop.ui.NoopPrefs.lastSyncAtFor(context, fwRow?.peripheralId),
+                legacyGlobal = com.noop.ui.NoopPrefs.lastSyncAt(context),
+                pairedCount = fwRows.size,
+            ) ?: 0L
+            add("Last sync:   ${if (syncSec > 0L) relTime(System.currentTimeMillis() - syncSec * 1000L)
+                else "never (this strap)"}")
             // #57: write-health. "Last sync" fires even on an empty/failed offload, so distinguish "rows
             // actually landed" from "an offload STALLED on a persist failure" (history won't persist —
             // usually a backup restored without an app restart, the closed-DB class).
             val p = com.noop.ui.NoopPrefs.of(context)
-            val okAt = p.getLong("sync.lastWriteOkAt", 0L)
-            val stalledAt = p.getLong("sync.lastWriteStalledAt", 0L)
+            // Attributed exactly like "Last sync" above — the legacy global counts only when a single
+            // strap could have written it, so the pair can never mix one strap's stall with another's
+            // success. Read together: "stalled more recently than ok" is the alarm.
+            val okAt = com.noop.ble.resolveLastSync(
+                perDevice = com.noop.ble.writeHealthPrefKey(fwRow?.peripheralId, "lastWriteOkAt")
+                    ?.let { p.getLong(it, 0L) } ?: 0L,
+                legacyGlobal = p.getLong("sync.lastWriteOkAt", 0L),
+                pairedCount = fwRows.size,
+            ) ?: 0L
+            val stalledAt = com.noop.ble.resolveLastSync(
+                perDevice = com.noop.ble.writeHealthPrefKey(fwRow?.peripheralId, "lastWriteStalledAt")
+                    ?.let { p.getLong(it, 0L) } ?: 0L,
+                legacyGlobal = p.getLong("sync.lastWriteStalledAt", 0L),
+                pairedCount = fwRows.size,
+            ) ?: 0L
             val restoreAt = p.getLong("backup.lastRestoreAt", 0L)
             val now = System.currentTimeMillis()
-            add("Data write:  ${if (okAt > 0L) "rows last landed ${relTime(now - okAt * 1000L)}" else "no rows ever persisted"}")
+            // "Offload:", not "Data write:". The stamp behind it is written ONLY when a backfill session
+            // persists rows, so it says nothing about live streaming - and on a strap that offloads
+            // nothing but streams happily (an unbonded 5/MG, the designed end state of #1635) the old
+            // label read as "this app has stored nothing from your strap" while a hundred thousand HR
+            // rows sat under that very device id. The scope now lives in the label, and the zero case
+            // says outright what it does not cover.
+            // Age only means anything when something landed; pass 0 otherwise rather than `now`, which
+            // would be a 56-year "age" sitting unused in an argument a reader has to check is unused.
+            add(offloadLine(okAt, if (okAt > 0L) now - okAt * 1000L else 0L))
             if (stalledAt > 0L && stalledAt >= okAt) {
                 add("             ⚠ history NOT persisting — last offload STALLED ${relTime(now - stalledAt * 1000L)} " +
                     "(if you restored a backup, fully restart the app — #57)")
             }
             if (restoreAt > 0L) add("Last restore: ${relTime(now - restoreAt * 1000L)}")
+            // What the home-screen widgets actually cost. Reported unconditionally, including the "no
+            // pushes" case, because the absence of widget activity is itself the answer to a drain
+            // report — and until this line existed an export could not distinguish the two.
+            add(com.noop.widget.WidgetTelemetry.snapshot(now).render())
+            // #1770 follow-up: which streams the ACTIVE strap actually delivered over the last 48 h. Four
+            // EXISTS seeks, not counts — see WhoopDao.streamPresence for why that distinction matters on a
+            // table holding ~190k motion rows a night.
+            // Same resolution funnelLines uses, blank guard included: the registry's ACTIVE id, not
+            // the canonical label, so a two-strap install reports the strap actually being worn. A
+            // BLANK id must fall back rather than be queried — it matches no rows, so every stream
+            // would read NO and the line would report a working strap as providing nothing, which is
+            // the exact misreading it exists to prevent.
+            //
+            // Resolved once for the three readers in this block ("Provides", "Last sleep", "Last recov."):
+            // they all describe the same strap and must not be able to name different ones.
+            //
+            // Other blocks resolve it for themselves and are deliberately left alone here. `funnelLines`
+            // uses this same expression; the workout, daily-data and body-clock blocks use a DIFFERENT
+            // one (the `activeDeviceId` property through an unchecked cast, falling back to "unknown"
+            // rather than to the spine). Consolidating those is a separate change: the second form has a
+            // fallback this helper would alter, so folding it in silently would be a behaviour change
+            // wearing a refactor's clothes.
+            val activeId = activeStrapId(
+                runCatching {
+                    (context.applicationContext as? com.noop.NoopApplication)?.deviceRegistry?.activeDeviceId()
+                }.getOrNull(),
+            )
+            runCatching {
+                val nowSec = now / 1000L
+                val present = com.noop.data.WhoopRepository.from(context)
+                    .streamPresence(activeId, nowSec - 48L * 3600L, nowSec)
+                add(strapProvidesLine(present.hr, present.rr, present.gravity, present.steps, activeId))
+            }
+            // #2117, emitted HERE as well as on the BLE path, so it reaches the export unconditionally.
+            // The judgement lives in `ConnectionTrace.rrTransportLine`, shared byte for byte with Apple;
+            // this is the hand-off, and the twin of `TestBundleAssembler.universalRRTransportLine`.
+            //
+            // The BLE emission is deliberately left in place: it is correct for a strap that completes an
+            // offload, and this adds the case it cannot cover rather than relocating it. On such a strap
+            // both now appear, on different surfaces, from the same formatter over the same two MINs. They
+            // can differ only in freshness, since an offload landing between connect and export can move
+            // `firstRecorded` earlier, and the export-time read is then the more current of the two.
+            //
+            // That BLE emission rides the GET_DATA_RANGE reply, which is part of the offload
+            // handshake. An unbonded 5/MG never completes that handshake (#1635) and so never reached it:
+            // in two full multi-session exports from such a device the line is absent, and so is the
+            // clock-drift line emitted beside it. That is precisely the wearer it exists for, the one
+            // whose HRV blanked because the beats on disk predate transport labelling. Apple has never had
+            // this gap, because it refreshes the same facts whenever a link comes UP and the assembler
+            // emits from the bundle; reading them here, at export, is the same guarantee reached the
+            // Android way, and needs no session state that could go stale between connect and export.
+            //
+            // Silent when it cannot read its inputs, matching both platforms: a diagnostic that cannot
+            // measure says nothing rather than guessing.
+            runCatching {
+                val repoForRr = com.noop.data.WhoopRepository.from(context)
+                // The two MINs only feed a line the formatter suppresses unless this is strict, so a
+                // device the policy does not govern stops after the one registry read. Same early-out
+                // the BLE caller and the Apple twin both take.
+                if (repoForRr.isWhoop5RrSource(activeId)) {
+                    com.noop.analytics.ConnectionTrace.rrTransportLine(
+                        strictWhoop5 = true,
+                        firstRecordedUnix = repoForRr.firstRecordedRrTs(activeId),
+                        firstScorableUnix = repoForRr.firstScorableWhoop5RrTs(activeId),
+                    )
+                } else {
+                    null
+                }
+            }.getOrNull()?.let { add(it) }
+            // #1735: row COUNTS alone cannot separate "Health Connect never brought the ride in" from
+            // "it did, but nothing has re-scored since". Both halves of that need a WHEN, and neither had
+            // one: the importer recorded no run time at all, and the engine's "re-score: done" goes only to
+            // the live log, so an export written hours later has already rolled it away.
+            val hcAt = p.getLong("hc.lastImportOkAt", 0L)
+            add(
+                hcImportLine(
+                    ago = if (hcAt > 0L) relTime(now - hcAt * 1000L) else null,
+                    rows = p.getInt("hc.lastImportRows", 0),
+                    throughDay = p.getString("hc.lastImportThroughDay", null),
+                ),
+            )
+            val scoredAt = p.getLong("score.lastPassAt", 0L)
+            add(scoringPassLine(ago = if (scoredAt > 0L) relTime(now - scoredAt * 1000L) else null))
             add("Timezone:    ${tzLine()}")
             val repo = com.noop.data.WhoopRepository.from(context)
             val days = repo.days("my-whoop")
@@ -96,9 +323,32 @@ object AndroidDiagnostics {
             // strap-only user's freshest scored day lives under the "-noop" computed sibling, so reading the
             // spine showed a stale value (could be a month old) while the app displayed today's. Twin of
             // Swift DebugDataDiagnostics, which already reads the merged `repo.days`.
-            val merged = repo.daysMerged("my-whoop")
+            //
+            // Scoped to the ACTIVE strap, not the canonical literal. `importedSourceIdsFor` short-circuits
+            // on the canonical id to `listOf(WHOOP_SOURCE)`, so passing "my-whoop" on a two-strap install
+            // read the RETIRED strap's sources and skipped the active one entirely: a field report showed
+            // "Last sleep: 2026-09-06" from a 4.0 put away a fortnight earlier, while the same log carried
+            // a full scoring pass for that night under the 5/MG that was actually being worn. Passing the
+            // active id widens the union to both (the parameter is named `activeDeviceId` for this reason).
+            val merged = repo.daysMerged(activeId)
             add("Last sleep:  ${merged.lastOrNull { (it.totalSleepMin ?: 0.0) > 0.0 }?.let { "${it.day} · ${it.totalSleepMin?.toInt()} min" } ?: "none"}")
             add("Last recov.: ${merged.lastOrNull { it.recovery != null }?.let { "${it.day} · ${it.recovery?.toInt()}%" } ?: "none"}")
+            // #1300 follow-up: the header above describes ONE device because it reads the last-connected
+            // prefs, not the registry — so a two-strap install produced a log that never mentioned the
+            // second strap, leaving `dayOwner readId=` and the funnel's orphan check with nothing to be
+            // checked against. Name the whole set instead.
+            val invRows = runCatching {
+                (context.applicationContext as? com.noop.NoopApplication)?.deviceRegistry?.all().orEmpty()
+                    .map {
+                            InventoryRow(it.id, it.brand, it.model, it.status, it.lastSeenAt,
+                                         com.noop.ui.NoopPrefs.firmwareFor(context, it.peripheralId))
+                        }
+            }.getOrDefault(emptyList())
+            val invActive = runCatching {
+                (context.applicationContext as? com.noop.NoopApplication)?.deviceRegistry?.activeDeviceId()
+            }.getOrNull()
+            deviceInventoryLines(invRows, invActive, System.currentTimeMillis() / 1000L) { relTime(it) }
+                .forEach { add(it) }
         }.onFailure { add("(strap/data state unavailable: ${it.message})") }
     }
 
@@ -138,7 +388,8 @@ object AndroidDiagnostics {
                 add("(no sleep session in the last 14 days to analyze)")
                 return@runCatching
             }
-            var session = recent.last()   // non-null (list checked non-empty), newest by ASC start order
+            val newestSession = recent.last()   // non-null (list checked non-empty), newest by ASC start
+            var session = newestSession
             var skin = repo.skinTempSamples(id, session.startTs, session.endTs, Int.MAX_VALUE)
             if (skin.isEmpty()) {
                 for (s in recent.asReversed()) {
@@ -146,17 +397,57 @@ object AndroidDiagnostics {
                     if (sk.isNotEmpty()) { session = s; skin = sk; break }
                 }
             }
-            val grav = repo.gravitySamples(id, session.startTs, session.endTs, Int.MAX_VALUE)
-            val hr = repo.hrSamples(id, session.startTs, session.endTs, Int.MAX_VALUE)
-            val rr = repo.rrIntervals(id, session.startTs, session.endTs, Int.MAX_VALUE)
+            val grav = repo.gravitySamplesForDevice(id, session.startTs, session.endTs, Int.MAX_VALUE)
+            val hr = repo.hrSamplesForDevice(id, session.startTs, session.endTs, Int.MAX_VALUE)
+            // Beats BANKED, not beats scored: the raw read, so `rr=` keeps the meaning it had in every log
+            // filed before the one-Oura-channel selection, on both platforms (Swift `DebugDataDiagnostics`).
+            // On a WHOOP 5 this steps the number UP rather than restoring it: the strict transport
+            // selection predates that change, so `rr=` now counts every banked transport. Banked is what
+            // this line has always meant. See `rawRrIntervals` for why, and for the #2456 interaction.
+            val rr = repo.rawRrIntervalsForDevice(id, session.startTs, session.endTs, Int.MAX_VALUE)
             val resp = repo.respSamples(id, session.startTs, session.endTs, Int.MAX_VALUE)
-            add("Night ${dayStamp(session.startTs)}: grav=${grav.size} hr=${hr.size} rr=${rr.size} resp=${resp.size} skin=${skin.size}")
+            add(
+                "Night ${dayStamp(session.startTs)}" +
+                    funnelFallbackNote(dayStamp(session.startTs), dayStamp(newestSession.startTs)) +
+                    ": grav=${grav.size} hr=${hr.size} rr=${rr.size} resp=${resp.size} skin=${skin.size}",
+            )
             if (grav.isEmpty() && hr.isEmpty()) {
-                add("(no raw biometric samples under '$id' for this night — expected on a freshly re-added strap; reconnect + let a history sync run, then re-export)")
+                // #1617 follow-up: do NOT assert "freshly re-added" without testing the other explanation.
+                // Several ids can hold one physical strap's data (#1193/#740), and when the history spine
+                // and the raw stream split, the samples exist - just under a different id. The old line
+                // printed the innocent cause for that case, which stops the investigation at exactly the
+                // point it should start. Ask the SAMPLE TABLES, not the registry: "my-whoop" is a source
+                // label rather than a pairedDevice row, and forgetting a device drops its row while leaving
+                // its samples - so the registry is blind to exactly the ids worth naming here. Only runs
+                // when the active id came back empty, so a healthy install pays nothing.
+                val elsewhere = runCatching {
+                    repo.rawSampleCountsByDevice(session.startTs, session.endTs)
+                        .filter { it.first != id }
+                }.getOrDefault(emptyList())
+                // The registry, so a SECOND strap's night is not reported as a read failure. Only queried
+                // when the active id came back empty, so a healthy install still pays nothing.
+                val otherStraps = runCatching {
+                    repo.pairedDevices()
+                        .filter { it.status != "archived" && it.id != id }
+                        .map { it.id }
+                        .toSet()
+                }.getOrDefault(emptySet())
+                add(orphanedSamplesLine(id, elsewhere, otherStraps))
                 return@runCatching
             }
             com.noop.analytics.SleepStager.remFunnelDiagnostic(session.startTs, session.endTs, grav, hr, rr, resp)
-                ?.let { add(it.summary) } ?: add("REM funnel: insufficient motion data (<2 gravity samples)")
+                ?.let {
+                    // The funnel replays the V1 classifier, but the shipped hypnogram is staged by V2
+                    // whenever the default-on flag says so — name both, or the two totals read as one
+                    // fact disagreeing. On a 5/MG the gap is maximal: V1's primary REM gate needs the
+                    // raw resp channel that hardware never emits, while V2 recovers respiration from
+                    // R-R. Suffix byte-identical to the Swift twin in DebugDataDiagnostics.
+                    val screenStager =
+                        if (com.noop.ble.PuffinExperiment.from(context).experimentalSleepV2) "V2" else "V1"
+                    var summary = it.summary + " · funnel replays V1; screen staged by $screenStager"
+                    if (screenStager != "V1") summary += " — totals can differ"
+                    add(summary)
+                } ?: add("REM funnel: insufficient motion data (<2 gravity samples)")
             val det = com.noop.analytics.DetectedSleep(
                 start = session.startTs, end = session.endTs,
                 efficiency = session.efficiency ?: 0.0, stages = emptyList(),
@@ -232,6 +523,27 @@ object AndroidDiagnostics {
             add("Stored: " + perSource.joinToString("  ") { "${it.first}=${it.second.size}" })
             val latest = perSource.flatMap { it.second }.maxByOrNull { it.startTs }
             add(if (latest != null) "Latest: ${dayStamp(latest.startTs)} · ${latest.sport} (${latest.source})" else "Latest: none")
+            // #1735/#2187: the Settings toggle governs the opt-in suggestion card, now the only path that
+            // can create a new user-visible automatic workout, and only after Save. The engine may still
+            // analyze bouts to enrich an overlapping real workout, but no longer publishes generic rows.
+            // Counts remain useful because grandfathered sport="detected" history is deliberately retained.
+            // Guarded SEPARATELY from the section: this file's contract is that every probe is guarded,
+            // and a throw in here would otherwise be caught by the outer handler and reported as
+            // "(workout sources unavailable)" - blaming the store for a failure in the auto-detect probe,
+            // with the sources sitting right above it having plainly worked.
+            runCatching {
+                autoDetectStateLine(
+                    suggestionCardEnabled = com.noop.ui.NoopPrefs.autoDetectWorkouts(context),
+                    storedDetectedRows = perSource.flatMap { it.second }.count { it.sport == "detected" },
+                    // Summed over the SAME strap ids whose rows were counted above. A two-strap install
+                    // banks detected rows under both "<active>-noop" and "my-whoop-noop", so reading
+                    // dismissals for the active strap alone could print "detected=52 dismissed=0" while
+                    // the dismissals sat under the other id, sending a reader after the #107 mechanism.
+                    dismissedMarkers = runCatching {
+                        listOf(active, "my-whoop").distinct().sumOf { repo.dismissedDetected(it).size }
+                    }.getOrNull(),
+                )
+            }.onSuccess { add(it) }.onFailure { add("(auto-detect state unavailable: ${it.message})") }
         }.onFailure { add("(workout sources unavailable: ${it.message})") }
     }
 
@@ -285,8 +597,17 @@ object AndroidDiagnostics {
 
     /** Alarm state for the debug export: the configured wake + the last arm's sent-vs-strap-reports (#34), so
      *  a "didn't buzz" report shows whether the strap accepted the time. Reads persisted prefs (written by
-     *  WhoopBleClient.armStrapAlarm + the GET_ALARM_TIME readback). Best-effort. */
-    fun alarmLines(context: Context): List<String> = buildList {
+     *  WhoopBleClient.armStrapAlarm + the GET_ALARM_TIME readback). Best-effort.
+     *
+     *  [activePeripheralId] and [clockPairedCount] attribute the strap-clock verdict to the active strap,
+     *  the same way Firmware and Last sync are in [strapAndDataLines]. Passed in rather than read here
+     *  because the registry accessors suspend and this builder does not; defaulted so a caller with no
+     *  registry to hand still gets every other alarm line. */
+    fun alarmLines(
+        context: Context,
+        activePeripheralId: String? = null,
+        clockPairedCount: Int = 1,
+    ): List<String> = buildList {
         add("─".repeat(40))
         add("Alarm")
         runCatching {
@@ -300,8 +621,13 @@ object AndroidDiagnostics {
                     val exp = com.noop.ble.PuffinExperiment.from(context).isEnabled
                     // displayName, not a literal: this block spelled it "WHOOP 5.0/MG" while the enum (and
                     // the header a few lines up) says "WHOOP 5.0 / MG", so one export disagreed with itself.
+                    // Name the switch a reader can actually find. #2464 was filed because the Alarms copy
+                    // sent a wearer to "Experimental" in Settings, which is neither where nor what the gate
+                    // is; the copy and the refusal logs were corrected in #2484 / #2488 and this line was
+                    // missed, so a wearer reading their own strap log was still sent after the old name.
                     add(
-                        "Model: ${com.noop.ble.WhoopModel.WHOOP5_MG.displayName} · experimental: " +
+                        "Model: ${com.noop.ble.WhoopModel.WHOOP5_MG.displayName} · " +
+                            "Protocol probes (Test Centre): " +
                             if (exp) "on" else "off → firmware alarm NOT armed",
                     )
                 }
@@ -310,20 +636,41 @@ object AndroidDiagnostics {
             }
             // #4: strap clock health — a reset/stale OR future-dated clock (the #34 / #928 causes) breaks
             // the alarm even when armed.
-            val newest = p.getLong("strap.newestRecordTs", 0L)
+            //
+            // Attributed to THIS strap, the same way Firmware and Last sync above are. The global key
+            // reported whichever strap last answered a range reply, so a two-strap capture asserted
+            // "20d behind wall (reset/stale — alarm unreliable)" about an active 5/MG that had banked
+            // nothing at all; the 20 days belonged to a 4.0 last seen 20 days earlier. A verdict about
+            // one strap's alarm must not be computed from another strap's clock.
+            val newest = com.noop.ble.resolveStrapClockTs(
+                perDevice = com.noop.ui.NoopPrefs.strapNewestRecordTsFor(context, activePeripheralId),
+                legacyGlobal = p.getLong("strap.newestRecordTs", 0L),
+                pairedCount = clockPairedCount,
+            ) ?: 0L
+            if (newest <= 0L && clockPairedCount > 1) {
+                // Say why there is no verdict, rather than printing nothing and leaving the reader to
+                // assume the clock was checked and found fine.
+                add("Strap clock: not known for this strap (no range reply recorded against it; the " +
+                    "legacy shared reading is not attributable with $clockPairedCount straps paired)")
+            }
             if (newest > 0L) {
                 val behind = System.currentTimeMillis() / 1000L - newest
                 add(when {
                     behind > 3 * 86400L -> "Strap clock: ${behind / 86400L}d behind wall (reset/stale — alarm unreliable)"
                     behind < -3 * 86400L -> "Strap clock: ${-behind / 86400L}d AHEAD of wall (future-dated — alarm unreliable)"
-                    else -> "Strap clock: OK"
+                    // #1706: say what this is measuring. It reads RECORD timestamps, and sat two lines
+                    // above an alarm readback claiming 2045, which reads as the two contradicting.
+                    else -> "Strap clock: OK (from record timestamps, not the alarm readback)"
                 })
             }
             val sent = p.getLong("alarm.lastArmSentEpoch", 0L)
             if (sent > 0L) {
                 val at = p.getLong("alarm.lastArmAt", 0L)
-                var line = "Last arm: sent ${alarmStamp(sent)}"
-                if (at > 0L) line += " · ${relTime(System.currentTimeMillis() - at)}"
+                // #2322: "for <alarm time> · sent <ago>". The old shape put both clocks on one line as
+                // "sent <alarm time> · <ago>", which reads as "we sent that time, that long ago" — but the
+                // stamp is the FUTURE instant armed and the relative time is when the command went out.
+                var line = "Last arm: for ${alarmStamp(sent)}"
+                if (at > 0L) line += " · sent ${relTime(System.currentTimeMillis() - at)}"
                 if (!p.getBoolean("alarm.lastArmConnected", false)) line += " · strap NOT connected (queued)"
                 // #34: live HR at arm, logged only to test whether the strap's own sleep/rest detection
                 // (not anything NOOP sends) gates the physical haptic — see recordAlarmArm's doc comment.
@@ -331,9 +678,42 @@ object AndroidDiagnostics {
                 add(line)
                 val reported = p.getLong("alarm.lastReportedEpoch", 0L)
                 if (reported > 0L) {
-                    val mismatch = kotlin.math.abs(reported - sent) > 120
-                    add("Strap reports: ${alarmStamp(reported)}" +
-                        if (mismatch) "  ⚠️ MISMATCH — strap didn't accept the time" else "  ✓ matches")
+                    // #1706: only judge when both halves are known to be the SAME strap. The readback is
+                    // written on the WHOOP 4.0 path alone, so a 5.0-active install comparing these was
+                    // always comparing two devices and then blaming one of them.
+                    // #2322: and only when the readback ANSWERED this arm. A readback that failed to
+                    // decode leaves the previous one standing, so without the arrival stamps this line
+                    // compared two different arms and blamed the strap for the difference.
+                    val reportedAt = p.getLong("alarm.lastReportedAt", 0L)
+                    val verdict = com.noop.analytics.AlarmReadback.verdict(
+                        sentEpoch = sent,
+                        reportedEpoch = reported,
+                        sentDeviceId = p.getString("alarm.lastArmDeviceId", null),
+                        reportedDeviceId = p.getString("alarm.lastReportedDeviceId", null),
+                        sentAt = at,
+                        reportedAt = reportedAt,
+                    )
+                    var rl = "Strap reports: ${alarmStamp(reported)}" + com.noop.analytics.AlarmReadback.suffix(verdict)
+                    // When the readback landed, so a reader can see the provenance of both halves rather
+                    // than having to trust that they belong together.
+                    if (reportedAt > 0L) rl += " · read ${relTime(System.currentTimeMillis() - reportedAt)}"
+                    add(rl)
+                    // The bytes the epoch was decoded from: what tells a stored stale alarm from a misdecode.
+                    // #1707 started banking the frame on 2026-08-28, so a readback taken before that has an
+                    // epoch and no frame. Printing nothing there read as "the frame was checked and was
+                    // fine", and a 2045 readback in a 2026-09-28 capture cost a trip through git history to
+                    // explain. Say which of the two it is, the way the strap-clock verdict above says why it
+                    // abstains rather than printing no line at all.
+                    val reportedRaw = p.getString("alarm.lastReportedRaw", null)?.takeIf { it.isNotBlank() }
+                    add(
+                        if (reportedRaw != null) {
+                            "Readback frame: $reportedRaw"
+                        } else {
+                            "Readback frame: not stored (this readback predates the frame capture, or the " +
+                                "write failed), so a genuinely-stored stale alarm cannot be told from a " +
+                                "misdecode of a fixed response field here"
+                        },
+                    )
                 } else add("Strap reports: (no readback)")
             } else add("Last arm: never")
             // #1: did the strap actually fire? (STRAP_DRIVEN_ALARM_EXECUTED)
@@ -350,9 +730,143 @@ object AndroidDiagnostics {
      *  guarded per-section so it never throws into the export. */
     suspend fun dynamicLines(context: Context): List<String> =
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            // Resolved HERE because the registry accessors suspend and alarmLines is a plain builder. An
+            // unreadable or empty registry counts as ONE strap, matching the Apple twin: at a literal 0 the
+            // legacy shared reading would be refused (it is trusted only at exactly 1) and the "not known"
+            // branch would not fire either, so the clock line would vanish for everyone whose registry read
+            // failed, which is strictly worse than the shared reading it replaced.
+            val clockRows = runCatching {
+                (context.applicationContext as? com.noop.NoopApplication)?.deviceRegistry?.all().orEmpty()
+            }.getOrDefault(emptyList())
+            val clockActiveId = runCatching {
+                (context.applicationContext as? com.noop.NoopApplication)?.deviceRegistry?.activeDeviceId()
+            }.getOrNull()
+            val clockAddr = clockRows.firstOrNull { it.id == clockActiveId }?.peripheralId
+            val clockPaired = maxOf(1, clockRows.size)
             strapAndDataLines(context) + funnelLines(context) + workoutSourceLines(context) +
-                dailyDataLines(context) + alarmLines(context)
+                dailyDataLines(context) + alarmLines(context, clockAddr, clockPaired) + circadianLines(context)
         }
+
+    /**
+     * One-decimal float, always with a DOT.
+     *
+     * This file already pins `Locale.US` for its dates, for the same reason: the strap log is pasted into
+     * issues and read by whoever picks them up, so a device in a comma-decimal locale must not emit
+     * "4,7 bpm" beside US-formatted timestamps. Kotlin's `"%.1f".format(x)` uses the default locale and
+     * would do exactly that.
+     */
+    private fun fmt1(v: Double): String = String.format(java.util.Locale.US, "%.1f", v)
+
+    /** Hourly HR buckets over the 14-day window below which the profile is not pooled at all. Mirrors
+     *  `circadianBinsFrom`'s own floor — kept here so the diagnostic names the real number, not a guess. */
+    internal const val CIRCADIAN_MIN_BUCKETS = 24
+    /** Distinct populated local hours below which no estimate is attempted.
+     *
+     *  REFERENCES the engine's own constant rather than repeating its value. A diagnostic that prints
+     *  "needs 6" while the code requires 8 would send whoever reads the log after the wrong thing —
+     *  the one failure mode this section exists to prevent. */
+    internal val CIRCADIAN_MIN_HOURS get() = com.noop.analytics.V5HealthSignals.MIN_CIRCADIAN_BINS
+
+    /**
+     * Which gate the body clock is failing.
+     *
+     * The first two are sequential gates and are reported in the order they run. The last two are a
+     * SINGLE condition in the engine (`daysObserved < minDaysForFit || relativeAmplitude <
+     * minRelativeAmplitude`), split apart here because "unreadable" on its own does not say whether to
+     * keep wearing the strap or to question the threshold — and those lead somewhere different.
+     *
+     * The card vanishes for two DIFFERENT reasons that look identical on screen: below the bucket floor
+     * or the hour floor there is NO estimate at all (`V5HealthSignals` returns null and the card's `?.let`
+     * skips it), while a thin or flat fit still returns an estimate marked UNREADABLE, which DOES draw a
+     * card with its own copy. Without this line those are indistinguishable from the outside — the report
+     * that prompted it had a body clock missing on both the Health card and the Sleep dial with no way to
+     * say which floor was short.
+     *
+     * Pure so the wording is assertable without a store, matching `noCaptureMsgText`.
+     */
+    internal fun circadianVerdict(
+        buckets: Int,
+        populatedHours: Int,
+        daysObserved: Int,
+        relativeAmplitude: Double?,
+        amplitudeBpm: Double? = null,
+    ): String = when {
+        buckets < CIRCADIAN_MIN_BUCKETS ->
+            "no estimate — $buckets hourly HR buckets in 14d, needs $CIRCADIAN_MIN_BUCKETS"
+        populatedHours < CIRCADIAN_MIN_HOURS ->
+            "no estimate — HR lands in $populatedHours of 24 local hours, needs $CIRCADIAN_MIN_HOURS"
+        // Mirrors the engine's OR: a swing passes on the proportional test or on the absolute one. Read
+        // the two apart and this line starts reporting "too flat" for rhythms the engine accepts.
+        relativeAmplitude != null &&
+            relativeAmplitude < com.noop.analytics.CircadianEngine.minRelativeAmplitude &&
+            (amplitudeBpm ?: 0.0) < com.noop.analytics.CircadianEngine.minAbsoluteAmplitudeBpm ->
+            "unreadable — rhythm too flat (amplitude ${fmt1(relativeAmplitude * 100)}% of mesor, " +
+                "needs ${fmt1(com.noop.analytics.CircadianEngine.minRelativeAmplitude * 100)}% or " +
+                "${fmt1(com.noop.analytics.CircadianEngine.minAbsoluteAmplitudeBpm)} bpm)"
+        daysObserved < com.noop.analytics.CircadianEngine.minDaysForFit ->
+            "unreadable — $daysObserved days observed, needs " +
+                "${com.noop.analytics.CircadianEngine.minDaysForFit}"
+        // SOLID needs BOTH axes, exactly as estimatePhase assigns it. Reading only the days here printed
+        // "solid" for a wearer the engine had marked WIDE — the diagnostic contradicting the very screen
+        // it exists to explain, which is the one thing this section must never do.
+        daysObserved < com.noop.analytics.CircadianEngine.goodDaysForFit ->
+            "wide — $daysObserved days observed"
+        relativeAmplitude != null &&
+            relativeAmplitude < com.noop.analytics.CircadianEngine.minRelativeAmplitude ->
+            "wide — $daysObserved days observed, but the swing clears only the absolute floor " +
+                "(${fmt1(relativeAmplitude * 100)}% of mesor)"
+        else -> "solid — $daysObserved days observed"
+    }
+
+    /**
+     * The body clock's three inputs, RECOMPUTED from the store.
+     *
+     * It reports what `estimatePhase` WOULD return for the data on disk — not what `_v5Signals.bodyClock`
+     * is currently holding. Those can diverge: a cached-bins staleness once nulled the live estimate on a
+     * device whose store was fine, and against that failure this section would have printed a confident
+     * verdict beside a missing card, misleading exactly as the silence it replaced did. So a verdict here
+     * that disagrees with the screen is itself the finding — it means the snapshot, not the data, is wrong.
+     *
+     * Hours and days are counted from the RAW buckets rather than from `circadianBinsFrom`, which
+     * short-circuits to empty below the bucket floor — reporting its zeros would hide the very numbers
+     * this line exists to show.
+     */
+    suspend fun circadianLines(context: Context): List<String> = buildList {
+        add("─".repeat(40))
+        add("Body clock inputs (recomputed from the store, not the live snapshot)")
+        runCatching {
+            val repo = com.noop.data.WhoopRepository.from(context)
+            val active = runCatching {
+                (context.applicationContext as com.noop.NoopApplication).activeDeviceId
+            }.getOrNull() ?: "unknown"
+            val nowMs = System.currentTimeMillis()
+            val now = nowMs / 1000L
+            val tz = java.util.TimeZone.getDefault().getOffset(nowMs) / 1000L
+            val buckets = repo.hrBucketsUnion(active, now - 14L * 86_400L, now, 3_600L)
+            val hours = buckets.map { (((it.bucket + tz) % 86_400L + 86_400L) % 86_400L / 3_600L) }
+                .distinct().size
+            val days = buckets.map { (it.bucket + tz) / 86_400L }.distinct().size
+            val bins = com.noop.ui.circadianBinsFrom(buckets, tz).first
+            val fit = com.noop.analytics.CircadianEngine.cosinor(bins)
+            val amp = fit?.let { f ->
+                if (f.mesor != 0.0) f.amplitude / kotlin.math.abs(f.mesor) else 0.0
+            }
+            add("Source: $active (+ imported)  window: last 14d")
+            add("Buckets: ${buckets.size} (floor $CIRCADIAN_MIN_BUCKETS)  " +
+                "hours: $hours/24 (need $CIRCADIAN_MIN_HOURS)  days: $days " +
+                "(need ${com.noop.analytics.CircadianEngine.minDaysForFit})")
+            // The ratio alone is not interpretable — "7.3% of mesor" says nothing about whether the
+            // rhythm is genuinely flat or the bar is simply set high for this wearer. The absolute pair is
+            // what makes the threshold arguable, and it is what `minRelativeAmplitude`'s own note asks for
+            // ("it needs a wearer whose amplitude is disproportionately small for their mesor").
+            if (fit != null) {
+                add("Rhythm: amplitude ${fmt1(fit.amplitude)} bpm on a " +
+                    "${fmt1(fit.mesor)} bpm mesor  (acrophase " +
+                    "${fmt1(fit.acrophaseHours)}h)")
+            }
+            add("Verdict: " + circadianVerdict(buckets.size, hours, days, amp, fit?.amplitude))
+        }.onFailure { add("  (unavailable: ${it.message})") }
+    }
 
     /** "3h 12m ago" style relative stamp for a positive age in ms. */
     private fun relTime(deltaMs: Long): String {
@@ -387,11 +901,72 @@ object AndroidDiagnostics {
         }
     }.getOrDefault("unknown")
 
+    /**
+     * When Health Connect last completed an import, and what it brought.
+     *
+     * The export already listed per-source row counts, which answer "is there data" but never "is it
+     * MOVING". #1735 turns on exactly that difference: a ride that has not appeared is either one Health
+     * Connect never imported or one it imported and nothing re-scored, and a static count cannot tell
+     * those apart. [rows] of 0 with a recent [ago] is a real and useful state - the import ran and found
+     * nothing - which is why the empty path is stamped too.
+     *
+     * A null [ago] means no import has ever completed on this install. Stated plainly rather than dressed
+     * up as a fault: plenty of installs never connect Health Connect at all.
+     */
+    internal fun hcImportLine(ago: String?, rows: Int, throughDay: String?): String {
+        if (ago == null) return "HC import:   never completed on this install"
+        val through = throughDay?.let { " · through $it" } ?: ""
+        return "HC import:   $rows row(s) $ago$through"
+    }
+
+    /**
+     * When the scoring engine last completed a pass.
+     *
+     * The analyze watermark records WHAT was scored (an HR fingerprint) and never WHEN, and the engine's
+     * own "re-score: done" line is live-log only, so an export written hours after the pass has already
+     * rolled it away. Without this, "I synced and nothing appeared" cannot distinguish a pass that ran and
+     * found nothing new from one that never ran - and those need opposite next steps.
+     *
+     * Stamped at BOTH completion sites (the idle pass and the post-sync pass), so the freshest of the two
+     * is what shows.
+     */
+    internal fun scoringPassLine(ago: String?): String =
+        if (ago == null) "Scoring:     no pass has completed on this install"
+        else "Scoring:     last pass $ago"
+
+    /**
+     * Whether automatic workout suggestions are enabled and how much grandfathered detected history is
+     * still stored. The suggestion card is the only path that can create a new user-visible automatic
+     * workout, and it saves nothing until the user confirms. IntelligenceEngine still analyzes bouts for
+     * daily analytics and overlap enrichment, but never publishes or reconciles generic workout rows.
+     *
+     * Reads COUNTS from the store rather than describing intent: it states what is on disk, not what the
+     * code believes it does. The retained-history clause is emitted only when the card is off and legacy
+     * rows remain, making clear that disabling stops future suggestions without destructively erasing them.
+     * [dismissedMarkers] is null when the query failed, and renders "n/a" rather than a wrong zero, which
+     * would read as "your dismissals are not sticking".
+     */
+    internal fun autoDetectStateLine(
+        suggestionCardEnabled: Boolean,
+        storedDetectedRows: Int,
+        dismissedMarkers: Int?,
+    ): String {
+        val card = if (suggestionCardEnabled) "on" else "off"
+        val dismissed = dismissedMarkers?.toString() ?: "n/a"
+        val note = if (!suggestionCardEnabled && storedDetectedRows > 0) {
+            " (stored rows are retained legacy history; disabling does not delete them)"
+        } else {
+            ""
+        }
+        return "Auto-detect: suggestion card=$card · new workouts=confirmation only; analytics does not " +
+            "publish generic rows · stored legacy detected=$storedDetectedRows · dismissed markers=$dismissed$note"
+    }
+
     /** A coarse OEM-kill heuristic by manufacturer (the aggressive-background-kill vendors). Pure and
      *  internal so it unit-tests without a Context (the suite stays Robolectric-free). */
     internal fun oemKillHeuristic(manufacturer: String): String =
         // Single source of truth for the aggressive-vendor set (#386): the same list the Settings
-        // "Keep NOOP alive overnight" toggle gates on, so the diagnostic and the fix never disagree.
+        // "Keep NOOP alive overnight" row gates on, so the diagnostic and the fix never disagree.
         if (com.noop.ble.BackgroundHealth.isAggressiveVendor(manufacturer))
             "aggressive vendor (${manufacturer.lowercase()}), whitelist NOOP to keep it alive"
         else "standard"
@@ -419,5 +994,67 @@ object AndroidDiagnostics {
             }.getOrDefault(false)
             "$label=${if (granted) "granted" else "denied"}"
         }
+    }
+
+    /**
+     * #1617 follow-up: the line the night funnel prints when the ACTIVE device id carries no raw samples.
+     *
+     * The previous wording asserted "expected on a freshly re-added strap" unconditionally. That is one of
+     * two explanations, and the other one is a bug: a registry can hold several ids for the same physical
+     * strap (#1193/#740), and when the history spine and the raw stream split, the samples are present -
+     * just filed under a different id. Printing the innocent cause for that case ends the investigation at
+     * the point it should begin, which is worse than printing nothing.
+     *
+     * [othersWithSamples] is (deviceId, sampleCount) for every OTHER registry id that does hold samples in
+     * the same window. Empty means the samples genuinely are not there and the fresh-re-add wording is
+     * right; non-empty names the id that has them so the split is visible rather than inferred.
+     *
+     * [otherLiveStrapIds] is the registered, non-archived device ids OTHER than the active one. It exists
+     * because the "not being read" wording was itself an over-assertion — the mirror image of the one it
+     * replaced. A wearer with TWO straps has nights owned by the other one, and [DayOwnerResolver] hands
+     * each day to whichever device actually holds its data. Samples under another id are then completely
+     * normal, and calling that a read failure sends the reader hunting a bug that is not there (it sent
+     * ME hunting one). Only when the id holding the samples is NOT a live registered strap is the #1193
+     * split the remaining explanation.
+     *
+     * That correction then over-corrected. "So this is expected" assumes a night is worn on ONE strap,
+     * and a reporter wearing a 4.0 and a 5.0 together hit the case it denies: the active strap banked
+     * nothing because its handshake never completed (#1635), while the other strap's rows made the line
+     * declare the silence normal. Nothing available here can tell the two apart — the wearer knows which
+     * straps were on the wrist and this function cannot — so it states the fork instead of picking a
+     * side, and names the sync as what to check in the half where something IS wrong.
+     *
+     * Pure so the wording is unit-tested without a database, a strap, or a registry.
+     */
+    internal fun orphanedSamplesLine(
+        activeId: String,
+        othersWithSamples: List<Pair<String, Int>>,
+        otherLiveStrapIds: Set<String> = emptySet(),
+    ): String {
+        if (othersWithSamples.isEmpty()) {
+            return "(no raw biometric samples under '$activeId' for this night — expected on a freshly " +
+                "re-added strap; reconnect + let a history sync run, then re-export)"
+        }
+        val ownedByAnotherStrap = othersWithSamples.filter { it.first in otherLiveStrapIds }
+        if (ownedByAnotherStrap.isNotEmpty()) {
+            val who = ownedByAnotherStrap
+                .sortedWith(compareByDescending<Pair<String, Int>> { it.second }.thenBy { it.first })
+                .joinToString(", ") { "'${it.first}' (${it.second} rows)" }
+            return "(no raw biometric samples under the ACTIVE id '$activeId' for this night — they are " +
+                "under $who, another registered strap. If you wore THAT strap this night, this is expected " +
+                "and the dayOwner line for this date names the owner. If you wore BOTH, the active strap " +
+                "banked nothing for this night and its sync is what to check, not this line.)"
+        }
+        // Tie-break on id: Kotlin's sortedByDescending is stable but Swift's `sorted` is NOT, so equal
+        // counts could otherwise order differently on the two platforms and the twin lines would diverge.
+        // The tie-break itself compares UTF-16 code units here and Unicode canonical order in Swift; those
+        // agree for the machine-generated ASCII ids this ever sees ("my-whoop", "whoop-<mac>"), and a
+        // device NICKNAME is a separate field that never reaches this id.
+        val named = othersWithSamples
+            .sortedWith(compareByDescending<Pair<String, Int>> { it.second }.thenBy { it.first })
+            .joinToString(", ") { "'${it.first}' (${it.second} rows)" }
+        return "(no raw biometric samples under the ACTIVE id '$activeId' for this night — they are under " +
+            "$named instead. The history spine and the raw stream are on different device ids (#1193); this " +
+            "is NOT a fresh re-add, the samples exist and are not being read.)"
     }
 }

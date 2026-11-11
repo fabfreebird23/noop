@@ -3,6 +3,7 @@ package com.noop.ui
 import com.noop.R
 import com.noop.analytics.BaselineState
 import com.noop.analytics.Baselines
+import com.noop.analytics.ChargeBaselines
 import com.noop.analytics.ChargeDriver
 import com.noop.analytics.RecoveryDrivers
 import com.noop.analytics.RestScorer
@@ -20,7 +21,8 @@ import java.util.Locale
  * <seed>" progress shown in place of "No Data"; null once recovery exists or the baseline has crossed
  * the seed gate. N is the HRV baseline's `nValid` from folding the SAME day-keyed, epoch-aware history
  * the recovery engine folds ([Baselines.foldHistory] with [hrvBaselineEpoch]), NOT a looser per-night
- * bounds count.
+ * bounds count. Callers pass the Charge HRV history ([ChargeBaselines.Resolved.hrvHistory], #2525), the
+ * nights the engine's fold actually reads.
  *
  * The old count advanced on every in-range night, including nights the engine's fold DROPS after a
  * manual "Recalibrate HRV baseline" (each night dated before the epoch is discarded, not skip-and-held).
@@ -28,49 +30,51 @@ import java.util.Locale
  * and the Today score side fell through to [ScoreState.NeedsStrap] while the post-recalibration baseline
  * was still seeding (Bug B, #393 follow-up). `nValid` is the exact count Baselines.computeStatus gates
  * CALIBRATING on, so N now tracks the baseline the Charge ring rides and can never over-state it.
- * [days] is oldest->newest (same order the engine folds). Pure + unit-tested (RecoveryCalibrationTest).
- * (PR #85)
+ * [nightlyHrv] and [dayKeys] are parallel and oldest->newest (same order the engine folds). Mirrors the
+ * Swift `RecoveryScorer.calibrationNights`. Pure + unit-tested (RecoveryCalibrationTest). (PR #85)
  */
 internal fun recoveryCalibrationNights(
-    days: List<DailyMetric>,
+    nightlyHrv: List<Double?>,
+    dayKeys: List<String>,
     hasRecovery: Boolean,
     hrvBaselineEpoch: Double,
     seed: Int = Baselines.minNightsSeed,
 ): Int? {
     if (hasRecovery) return null
-    val n = Baselines.foldHistory(
-        days.map { it.avgHrv }, days.map { it.day }, Baselines.hrvCfg, hrvBaselineEpoch,
-    ).nValid
+    val n = Baselines.foldHistory(nightlyHrv, dayKeys, Baselines.hrvCfg, hrvBaselineEpoch).nValid
     // Include 0: a brand-new user (no banked nights) reads "Calibrating, 0 of N" on Charge, not a
     // bare "No data" that looks broken (#335). Caller gates past days to null; >= seed -> null.
     return n.takeIf { it in 0 until seed }
 }
 
 /**
- * The ordered "What shaped it" Charge driver rows for [displayDay], rebuilt PURELY from the visible
- * [days] history (the same in-memory rows the dashboard already shows, imports win field-by-field in
- * the merge), so no engine round-trip is needed and the bars match the Charge ring's own inputs. Folds
- * the whole history (oldest first) into the four-plus-one personal baselines with [Baselines.foldHistory]
- * (byte-identical to the engine's whole-history fold when no manual Recalibrate epoch is set, the common
- * case), then defers to [RecoveryDrivers.chargeDrivers], which scores each row against the SAME inputs
- * [RestScorer] reads through the Today recovery path. Empty when the displayed day can't score
- * (cold-start / missing input), so the section hides rather than faking rows. Mirrors the iOS
- * chargeDrivers wiring.
+ * The ordered "What shaped it" Charge driver rows for [displayDay], scored against [baselines], the
+ * Charge baselines [AppViewModel.chargeBaselines] resolves with the engine's own rule (#2525), so the bars
+ * describe the baseline the Charge ring was scored against. Before #2525 this folded the whole visible
+ * history itself, which kept every imported night and every stored own night while the headline kept only
+ * the recent own nights plus the import, so the page could show one baseline in the rows and score against
+ * another. (#2315 had already closed the same gap for the recalibration epoch; the resolver applies both
+ * epochs.) Defers to [RecoveryDrivers.chargeDrivers], which scores each row against the SAME inputs
+ * [RestScorer] reads through the Today recovery path. Empty when the displayed day can't score (cold-start /
+ * missing input / no baselines yet), so the section hides rather than faking rows. Mirrors the iOS
+ * `ChargeBreakdownWiring.breakdown`.
  */
 internal fun recoveryChargeDrivers(
-    days: List<DailyMetric>,
+    baselines: ChargeBaselines.Resolved?,
     displayDay: DailyMetric?,
 ): List<ChargeDriver> {
+    val resolved = baselines ?: return emptyList()
     val day = displayDay ?: return emptyList()
     val hrv = day.avgHrv ?: return emptyList()
     val rhr = day.restingHr?.toDouble() ?: return emptyList()
 
-    // Whole-history fold (oldest first), exactly as the engine seeds baselines2.
-    val ordered = days.sortedBy { it.day }
-    val hrvBase = Baselines.foldHistory(ordered.map { it.avgHrv }, Baselines.hrvCfg)
+    val hrvBase = resolved.hrv
     if (!hrvBase.usable) return emptyList()
-    val rhrBase = Baselines.foldHistory(ordered.map { it.restingHr?.toDouble() }, Baselines.restingHRCfg)
-    val respBase = Baselines.foldHistory(ordered.map { it.respRateBpm }, Baselines.respCfg).takeIf { it.usable }
+    // Passed on ungated, unlike respBase below, and that is deliberate since #1988: chargeDrivers
+    // gates this one itself, for its score AND for the row it builds from the baseline directly.
+    // Gating again here would be harmless but would suggest the callee does not, which it does.
+    val rhrBase = resolved.restingHR
+    val respBase = resolved.resp.takeIf { it.usable }
 
     // sleepPerf: the Rest COMPOSITE (/100) when stages exist, else raw efficiency, the SAME derivation
     // recomputeRecovery uses, so the Sleep driver scores against the headline's own input.
@@ -89,17 +93,17 @@ internal fun recoveryChargeDrivers(
 }
 
 /**
- * The Charge (recovery) [ScoreConfidence] tier for [displayDay] against the HRV baseline folded from
- * [days], surfaced as the confidence dot + tier tag under the "What shaped it" rows. SURFACED, never
- * recomputed differently: it calls [ScoreConfidence.forCharge] with the SAME folded HRV baseline the
- * drivers scored against. Mirrors the iOS surfacing of the existing ScoreConfidence on the recovery screen.
+ * The Charge (recovery) [ScoreConfidence] tier for [displayDay] against the HRV baseline in [baselines],
+ * surfaced as the confidence dot + tier tag under the "What shaped it" rows. SURFACED, never recomputed
+ * differently: it calls [ScoreConfidence.forCharge] with the SAME HRV baseline the drivers scored against.
+ * Before the first resolve it reads an empty fold, exactly as an empty history did. Mirrors the iOS
+ * surfacing of the existing ScoreConfidence on the recovery screen.
  */
 internal fun chargeConfidenceTier(
-    days: List<DailyMetric>,
+    baselines: ChargeBaselines.Resolved?,
     displayDay: DailyMetric?,
 ): ScoreConfidence {
-    val hrvBase: BaselineState =
-        Baselines.foldHistory(days.sortedBy { it.day }.map { it.avgHrv }, Baselines.hrvCfg)
+    val hrvBase: BaselineState = baselines?.hrv ?: Baselines.foldHistory(emptyList(), Baselines.hrvCfg)
     return ScoreConfidence.forCharge(displayDay?.recovery, hrvBase)
 }
 
@@ -288,9 +292,39 @@ internal fun scoreStateForToday(
 }
 
 /**
- * The honest live-recording state of the strap, for the Today/Live chip. Derived from the BLE connection
- * + last-sync timestamp so people always know it's working, or know it isn't and why. Mirrors Swift
- * `RecordingState` 1:1 (same three cases, same [title] / [detail] copy, same [tone]).
+ * #1164/#2012 — should today's Rest be MARKED provisional? When the strap has banked records not yet
+ * offloaded, the Rest score is computed from partial data and may change once the full night lands and
+ * `analyzeRecent` re-scores it. Saying so reads honestly instead of as a bug when the number moves.
+ *
+ * True means "caption it as pending", NOT "hide it". #2012: the number used to be withheld on both
+ * surfaces while this was true, so a user whose night was scored saw nothing for as long as the strap
+ * had anything left to send, which on a continuously banking strap is most of the day. A number that
+ * may still move is not the same as no number, and it is the one the screen exists to show.
+ *
+ * Two honest signals, either of which means more data is expected:
+ * - [backfilling]: an offload is actively running right now (data is draining).
+ * - [historyPendingSync]: the strap reports banked records newer than our local frontier (the strap has
+ *   data we haven't ingested yet, even when no offload is running — e.g. right after connect, before
+ *   the first offload starts).
+ *
+ * Only applies to TODAY (a past day's score is final — no more data is coming for it) and only when a
+ * Rest score EXISTS (pending annotates a score; it never fabricates one where there is none). Pure +
+ * unit-tested. Mirror EXACTLY of Swift `TodayView.restPendingSync`.
+ */
+internal fun restPendingSync(
+    restScore: Double?,
+    backfilling: Boolean,
+    historyPendingSync: Boolean,
+    isTodaySelected: Boolean,
+): Boolean {
+    if (!isTodaySelected || restScore == null) return false
+    return backfilling || historyPendingSync
+}
+
+/**
+ * The honest live-recording state of the strap. Derived from the BLE connection and last-sync
+ * timestamp. Mirrors Swift `RecordingState` (same cases, [title] / [detail] copy, and [tone]).
+ * Android Today has no recording-status chip; the scan control is its current connection affordance.
  */
 sealed class RecordingState {
     /** The strap is connected and saving data live. */
@@ -383,7 +417,13 @@ internal fun recordingStateFor(
  *  [Hidden] only on a true cold start (the building-scores note owns that case). Previously this
  *  priority order lived inline inside the `@Composable`, where it could not be unit-tested. */
 sealed class SyncChipState {
-    data class Syncing(val chunks: Int) : SyncChipState()
+    /** #689/#815 follow-up: [pagesBehind] is the strap's GET_DATA_RANGE ring backlog, sampled ONCE at
+     *  connect (`LiveState.pagesBehindAtConnect`) and never re-polled, so it is a figure "at connect"
+     *  rather than a live one — the copy says so. null when no reply has landed this session, when the
+     *  frame did not decode, AND when the backlog is zero: a chip that is actively syncing while
+     *  claiming "0 pages behind" contradicts itself, and a zero sample carries nothing a reader can
+     *  act on. [resolve] applies that rule so both platforms drop the same case. */
+    data class Syncing(val chunks: Int, val pagesBehind: Int? = null) : SyncChipState()
     data class Synced(val agoText: String) : SyncChipState()
     object ExperimentalLive : SyncChipState()
     object Hidden : SyncChipState()
@@ -406,8 +446,12 @@ sealed class SyncChipState {
             lastSyncAtSec: Long?,
             historySyncExperimental: Boolean,
             nowSec: Long,
+            pagesBehind: Int? = null,
         ): SyncChipState = when {
-            backfilling -> Syncing(chunks)
+            // `takeIf { it > 0 }` is the zero rule from [Syncing.pagesBehind], applied here so the
+            // decision is pure and testable rather than sitting in the composable. Negative can't come
+            // off the wire (the decoder returns a ring delta), but the bound reads the same either way.
+            backfilling -> Syncing(chunks, pagesBehind?.takeIf { it > 0 })
             lastSyncAtSec != null -> Synced(shortSyncAgo(lastSyncAtSec, nowSec))
             historySyncExperimental -> ExperimentalLive
             else -> Hidden
@@ -464,3 +508,37 @@ internal fun buildingHint(metric: KeyMetric, isToday: Boolean): Int? {
         else -> null
     }
 }
+
+/**
+ * #1599: which series the Blood Oxygen tile plots — the calibrated one, or the strap candidate.
+ *
+ * `AnalyticsEngine` writes `spo2Pct = null` on every computed day and banks the raw red/IR ADC instead,
+ * so a calibrated reading only ever arrives from an IMPORT. On a strap-only install [calibrated] is empty
+ * by construction, and the tile drew a value above a blank panel while every neighbour had a line.
+ *
+ * Gated on whether a series can be DRAWN, not on whether a value exists. The Apple tile asks the latter
+ * (`spo2.value == "—" && candidateTail != nil`), and that misses the case this issue was actually
+ * reported from: one old imported reading carries the tile's VALUE forward indefinitely, so the value is
+ * never "—", so the swap never fires — while the 14-day window it would have to plot still holds nothing.
+ * A number with no line, which is the bug. The sparkline's question is "have I got two points", so that
+ * is what decides it.
+ *
+ * Falls back to [calibrated] when NEITHER can be drawn, so a tile with no data anywhere behaves exactly
+ * as it did — nothing is drawn, and nothing is invented to fill the space.
+ */
+internal fun spo2SparkSeries(
+    calibrated: List<Double>,
+    candidate: List<Double>,
+): List<Double> = if (calibrated.size >= 2 || candidate.size < 2) calibrated else candidate
+
+/**
+ * True when the tile's VALUE is the strap estimate rather than a measured reading, so the caption can
+ * say so.
+ *
+ * Deliberately about the value, not the line: the caption renders directly under the number, so it must
+ * describe the number. The two can differ — an unbounded carry can keep a measured value on a tile whose
+ * window has only estimates to plot — and in that case the value is captioned honestly and the line's
+ * provenance goes unlabelled, which is the lesser of the two silences available.
+ */
+internal fun spo2UsingCandidate(calibratedValue: Double?, candidateToday: Double?): Boolean =
+    calibratedValue == null && candidateToday != null

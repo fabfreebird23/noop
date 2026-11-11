@@ -34,6 +34,25 @@ object ConnectionTrace {
 
 
     /**
+     * The R-R transport line: what a device has banked versus what its unit policy can actually score.
+     *
+     * #2117: a WHOOP 5 window is pinned to one transport, and a window holding no beat on a scorable
+     * channel reads back EMPTY rather than falling back. Everything derived from beats then goes blank
+     * (HRV, respiratory rate) while heart-rate-derived values carry on, which is what a wearer reports as
+     * "HRV stopped working". The analyzer cannot explain it: handed nothing, it honestly reports nInput=0
+     * and has no way to know whether the strap banked nothing or banked beats the policy refused.
+     *
+     * These two facts separate those cases, and the store already computes both. Rides every export for
+     * the same reason the clock-drift line does: the wearer who needs it is the one who did not know to
+     * turn a mode on. Returns null for a device the policy does not apply to, so a WHOOP 4 export is
+     * unchanged.
+     *
+     * Twin of Swift `UniversalTrace.rrTransportLine`.
+     */
+    fun rrTransportLine(
+        strictWhoop5: Boolean,
+
+    /**
      * The CLOCK-DRIFT summary line (#767 / #754 cluster): the strap-reported banked-record window
      * [oldest, newest] against the wall clock, ending in the shared clock VERDICT ([clockVerdict]):
      * FUTURE-DATED (ahead beyond [futureToleranceSeconds]), RTC-EPOCH (a never-set ~1970/71 clock, #987),
@@ -42,6 +61,23 @@ object ConnectionTrace {
      * .connection line. All timestamps are unix seconds in the same wall domain. [oldestUnix] is optional
      * (a half/short range reply gives only the upper bound). Mirrors the Swift formatter exactly.
      */
+        firstRecordedUnix: Long?,
+        firstScorableUnix: Long?,
+    ): String? {
+        if (!strictWhoop5) return null
+        if (firstRecordedUnix == null) return "rrTransport recorded=none scorable=none"
+        val recorded = "recorded=" + isoDate(firstRecordedUnix)
+        // Beats on disk, none the policy will score: the whole history predates transport labelling or
+        // sits on an excluded channel. This is the state that blanks every night at once.
+        if (firstScorableUnix == null) return "rrTransport $recorded scorable=none unscorableHistory=yes"
+        val gapDays = maxOf(
+            0L,
+            Math.round((firstScorableUnix - firstRecordedUnix).toDouble() / 86_400.0),
+        )
+        return "rrTransport $recorded scorable=" + isoDate(firstScorableUnix) +
+            " unscorableHistory=" + (if (gapDays > 0) "yes" else "no") + " gapDays=" + gapDays
+    }
+
     fun clockDriftLine(
         oldestUnix: Long?,
         newestUnix: Long,
@@ -211,20 +247,181 @@ object ConnectionReadout {
     fun clockLatchedLabel(deviceClockUnix: Long?, strapNewestUnix: Long? = null): String {
         val ceiling = ConnectionTrace.RTC_EPOCH_CEILING_UNIX
         if (deviceClockUnix != null) return if (deviceClockUnix < ceiling) "no (RTC reads 1970/71)" else "yes"
-        if (strapNewestUnix != null) return if (strapNewestUnix < ceiling) "no (RTC reads 1970/71)" else "yes"
+        // #1823: this branch has NOT read a clock - it is reached when no correlation exists, which is
+        // every 5/MG. The only evidence is how the strap DATED its records, so say that rather than
+        // claiming a clock reading we never took. Twin of the Swift wording.
+        if (strapNewestUnix != null) return if (strapNewestUnix < ceiling) "no (records dated 1970/71)" else "yes"
         return "no (waiting for the strap clock)"
     }
 
+    /** #1818: at or above this charge the "charge it" remedy is already satisfied, so repeating it is
+     *  noise. Twin of the Swift constant - the two must move together or the platforms give different
+     *  advice for the same strap. */
+    const val RTC_ALREADY_CHARGED_PCT: Double = 95.0
+
     /** #987: a plain-words warning when the strap RTC reads epoch-era (~1970/71), from EITHER signal we
      *  hold (the correlated device clock or the strap's newest banked-record timestamp). null when both
-     *  look sane or neither was seen yet - we never fabricate a fault. Twin of the Swift warning. */
-    fun rtcWarning(deviceClockUnix: Long?, strapNewestUnix: Long?): String? {
+     *  look sane or neither was seen yet - we never fabricate a fault. Twin of the Swift warning.
+     *
+     *  #1818: the remedy is battery-dependent. A flat battery resets the RTC, so on a low strap
+     *  "charge it" is real advice. On an ALREADY-charged strap it is not, and the old copy sent users
+     *  at 100% round a loop they had already run.
+     *
+     *  The charged branch deliberately states only what holds for EVERY strap - that charging again
+     *  will not change it - and asks for a log. It must NOT claim NOOP re-sends the clock on every
+     *  connect: that is true on WHOOP4 (runConnectHandshake calls SET_CLOCK unconditionally, both
+     *  payload forms, #120) but FALSE on a 5/MG, where the clock write is gated behind didBond, and an
+     *  unbondable 5/MG (#1635) is never clocked at all - precisely the strap most likely to be showing
+     *  this warning. Explaining the mechanism in the sentence is how the original bug happened.
+     *  [batteryPct] null (not yet read) keeps the charge advice - we only withdraw it on evidence.
+     *  Callers MUST pass a reading from the CURRENT link and not a last-known charge that outlives it -
+     *  a stale 100% would suppress the advice in the one case it is right, a strap that ran flat and
+     *  reset its RTC. */
+    fun rtcWarning(deviceClockUnix: Long?, strapNewestUnix: Long?, batteryPct: Double? = null): String? {
         val ceiling = ConnectionTrace.RTC_EPOCH_CEILING_UNIX
         val clockBad = deviceClockUnix != null && deviceClockUnix > 0L && deviceClockUnix < ceiling
         val newestBad = strapNewestUnix != null && strapNewestUnix > 0L && strapNewestUnix < ceiling
         if (!clockBad && !newestBad) return null
-        return "Strap clock reads 1970/71 (never set since its last reset), so it is not banking history. " +
-            "Charge the strap to 100% and reconnect so the clock latches."
+        val lead = "Strap clock reads 1970/71 (never set since its last reset), so it is not banking history. "
+        if (batteryPct != null && batteryPct >= RTC_ALREADY_CHARGED_PCT) {
+            return lead +
+                "The strap is already charged, so charging again will not change this. Export a strap " +
+                "log from Test Centre so the clock exchange can be read."
+        }
+        return lead + "Charge the strap to 100% and reconnect so the clock latches."
+    }
+
+    /** #1809: one-line account of a finished BLE link, logged on every disconnect. Twin of the Swift
+     *  formatter.
+     *
+     *  A strap log could not previously answer "did the strap send anything?". Inbound notifications only
+     *  stamped a liveness timestamp that was then discarded, so a reporter chasing a silent strap had to
+     *  infer silence from the fact that every LOGGED line happened to be outgoing - which measures NOOP's
+     *  logging, not the strap. This measures the strap.
+     *
+     *  [realtimeArmed] matters because the #80 marginal-radio fallback only counts a drop when the R10/R11
+     *  burst was actually armed; armed=no says up front that the detector cannot trip for this link,
+     *  however many times the loop repeats.
+     *
+     *  [rssiDbm] answers the question the END STATUS raises and could not previously settle. The dominant
+     *  disconnect in a field log is the supervision timeout, which NOOP itself renders as "the strap went
+     *  out of range or stopped responding" - so the log names range as the leading suspect and then records
+     *  nothing about range. Signal was read once per link, seconds after connect, and never again: a 27
+     *  minute link carried a single reading from its third second, and ten of twenty-one links in the
+     *  report that prompted this (#2332) died without any reading at all.
+     *
+     *  Both halves are nullable, and the pair is printed with its AGE, because a reading is only evidence
+     *  about the drop if it was taken near the drop. A value with no age, or the previous link's value
+     *  carried into this one, is the hazard this whole line exists to avoid: the caller MUST clear its
+     *  stash on teardown, exactly as it clears the hold time, or the epitaph invents the evidence it was
+     *  built to find. `never read on this link` is the honest answer and is printed as one.
+     *
+     *  #2397: [rssiReads], [rssiWorstDbm] and [rssiSumDbm] describe every reading the link took, not
+     *  just the last one. The periodic read landed in #2332 and its value was then discarded on each
+     *  new reading, so a link that took two hundred readings reported one: a field log carried 467 reads
+     *  across three links and two epitaphs naming two numbers. A last value alone cannot separate a link
+     *  that was marginal throughout from one that walked out of range, which is precisely what a
+     *  supervision timeout leaves a reader asking. The mean is computed HERE, from a sum and a count,
+     *  rather than passed in, so both platforms divide the same way on the same inputs.
+     *
+     *  RSSI is NOT clamped. It is negative by nature, so `maxOf(0, ...)` would erase every real reading;
+     *  implausible values are the caller's to reject at the stash, where the read status is known.
+     *
+     *  Milliseconds are printed raw: no float formatting, so the two platforms cannot round apart.
+     *  [upMillis] is Long, not Int: Swift's Int is 64-bit, so an Int here would be the NARROWER type and
+     *  a link held past ~24.8 days would wrap negative and print "up 0ms" - a dead-looking link that was
+     *  in fact the healthiest one we ever had. Rare, silent, and exactly backwards, so use the real twin.
+     *  [rssiAgeMillis] is Long for the same reason and shares the line's units, so a reader can compare it
+     *  with [upMillis] directly instead of converting.
+     *
+     *  Twin of Swift `ConnectionReadout.linkEpitaph`. Declared because the two must print the SAME bytes:
+     *  one strap log per platform describing one drop, and a reader comparing them should be comparing the
+     *  link, not the formatter. */
+    fun linkEpitaph(upMillis: Long, inboundFrames: Int, inboundBytes: Int, cmdChannelFrames: Int,
+                    realtimeArmed: Boolean, ended: String,
+                    rssiDbm: Int?, rssiAgeMillis: Long?,
+                    rssiReads: Int = 0, rssiWorstDbm: Int? = null, rssiSumDbm: Int = 0): String {
+        // #2397: the SHAPE of the link's signal, not just its last reading. Two readings is the floor:
+        // with one, worst and mean are the value already printed and the clause is noise.
+        val shape = if (rssiReads >= 2 && rssiWorstDbm != null) {
+            // Integer division, truncating toward zero on both platforms (Kotlin and Swift agree on
+            // negatives), so the two logs cannot round apart. The mean of a handful of dBm readings is a
+            // shape, not a measurement, and one dB of truncation does not change what it says.
+            "; n=$rssiReads worst=${rssiWorstDbm}dBm mean=${rssiSumDbm / rssiReads}dBm"
+        } else {
+            ""
+        }
+        val signal = when {
+            rssiDbm == null -> "never read on this link"
+            rssiAgeMillis == null -> "${rssiDbm}dBm (age unknown$shape)"
+            else -> "${rssiDbm}dBm (read ${maxOf(0L, rssiAgeMillis)}ms before the drop$shape)"
+        }
+        var line = "Link epitaph: up ${maxOf(0L, upMillis)}ms, inbound ${maxOf(0, inboundFrames)} frames / " +
+            "${maxOf(0, inboundBytes)} bytes (cmd-channel ${maxOf(0, cmdChannelFrames)}), " +
+            "realtime armed=${if (realtimeArmed) "yes" else "no"}, signal=$signal, ended=$ended"
+        if (inboundFrames <= 0) {
+            line += " - the strap sent NOTHING on this link"
+        }
+        return line
+    }
+
+    /**
+     * #1635: what a finished link actually stored, split by PATH.
+     *
+     * The epitaph counts frames. That is right for a silent strap and wrong for one talking over only part
+     * of its surface: an unbonded 5/MG streams heart rate and R-R all night while nothing bond-gated
+     * lands, and the epitaph reports hundreds of healthy inbound frames.
+     *
+     * The split has to be by PATH, not by stream, and an earlier live-only version of this line got that
+     * wrong. `extractStreams` — the realtime decoder — produces only hr, rr, events and battery. Gravity,
+     * respiratory, skin temperature, SpO2 and steps come exclusively from the historical decoder behind
+     * the offload. A live-only tally therefore printed "nothing banked live for: gravity, resp, …" on
+     * EVERY link, bonded or not: a constant wearing the costume of a finding.
+     *
+     * So both paths are counted and named. The offload is where the bond shows: an unbonded strap defers
+     * backfill entirely, so `offload none` is the real signal, and a healthy sync fills it.
+     *
+     * Battery is absent on purpose. It rides the standard 0x2A19 profile, so it banks with or without the
+     * bond and answers nothing here. [offloadSteps] is nullable for the same reason it is on Apple: a
+     * platform that cannot measure a stream omits it rather than reporting a zero that reads as a fault.
+     *
+     * Counts are rows ACCEPTED, so a re-offload of already-stored records reads zero — correct, since the
+     * question is what the database gained. Pure, total and clamped: it runs on the teardown path, where
+     * throwing would cost the report it exists to produce. Twin of the Swift formatter.
+     */
+    fun linkBankedSummary(
+        liveHr: Int, liveRr: Int, offloadChunks: Int,
+        offloadHr: Int, offloadRr: Int, offloadGravity: Int, offloadResp: Int,
+        offloadSkinTemp: Int, offloadSpo2: Int, offloadSteps: Int?,
+    ): String {
+        val live = "live hr=${maxOf(0, liveHr)} rr=${maxOf(0, liveRr)}"
+        val offload = (listOf(
+            "hr" to offloadHr, "rr" to offloadRr, "gravity" to offloadGravity, "resp" to offloadResp,
+            "skinTemp" to offloadSkinTemp, "spo2" to offloadSpo2,
+        ) + listOfNotNull(offloadSteps?.let { "steps" to it })).map { (k, v) -> k to maxOf(0, v) }
+        val offloadTotal = offload.sumOf { it.second }
+        // Three distinguishable states, reported as FACTS rather than verdicts. "No chunks" is not
+        // evidence of a fault on its own: a short or command-only link never reaches backfill, and the
+        // reason it was skipped is already logged next to it ("Backfill: deferred — connect handshake not
+        // done yet (didBond=…)"). Editorialising here — an earlier draft said "offload did NOT run on this
+        // link" — reads as an accusation on a healthy 16-second connect. The epitaph above supplies the
+        // uptime a reader needs to weigh it.
+        //
+        // "Never ran" and "ran with nothing new" are still DIFFERENT and must not share a sentence.
+        // Rows are counted as ACCEPTED, so a reconnect that re-offloads already-stored records banks zero
+        // while the strap plainly handed its history over — `classifyCompletedOffload` already treats that
+        // as `bankedSensorRecords`, not a fault. Only the first case speaks to the bond.
+        if (maxOf(0, offloadChunks) == 0) {
+            return "banked this link: $live | offload none"
+        }
+        if (offloadTotal == 0) {
+            return "banked this link: $live | offload ran ${maxOf(0, offloadChunks)} chunk(s), no new rows"
+        }
+        val body = offload.joinToString(" ") { (k, v) -> "$k=$v" }
+        val empty = offload.filter { it.second == 0 }.map { it.first }
+        if (empty.isEmpty()) return "banked this link: $live | offload $body"
+        return "banked this link: $live | offload $body - nothing banked from the offload for: " +
+            empty.joinToString(", ")
     }
 
     /** #987: freshness label for the "last frame" readout row ("12s ago" / "no frames yet"). [nowUnix]

@@ -167,9 +167,10 @@ object Whoop5EcgProbe {
         val headline: String
             get() = when (this) {
                 is EcgCandidatesArrived ->
-                    "$packets frame(s) matched the ECG structural triage. That is a CANDIDATE, not proof: " +
-                        "the triage is a shape heuristic and unrelated traffic can match it. Confirm against " +
-                        "the raw bytes below before concluding anything about whether the feature is blocked."
+                    "$packets revision-17 ECG packet(s) decoded. The strap IS producing the filtered " +
+                        "trace: each one arrived as type 43 revision 17 with both CRCs intact. What the " +
+                        "samples MEAN is still unvalidated here — check the per-packet progress and presence " +
+                        "below to see whether a reading actually advanced, rather than reading the count alone."
                 is DataRequestRefused ->
                     "DATA REQUEST REFUSED — the firmware returned FAILURE for " +
                         "${commands.joinToString(", ")}, which asked it to produce ECG data: it knows the " +
@@ -203,6 +204,87 @@ object Whoop5EcgProbe {
                     "INCONCLUSIVE — the result codes do not match a known pattern. The raw replies below are " +
                         "the record."
             }
+    }
+
+    /**
+     * How long one run listens, in seconds, chosen by what started it.
+     *
+     * [CAPTURE] is 60 rather than 30 because of @meta1971's field timing in #891: across five MG sessions
+     * the strap's terminal frame (classifier state 2, progress 100) landed 38 to 39 s after the first live
+     * frame, so a 30 s window could not reach a completed reading on ANY strap or firmware. The verdict
+     * sheet landing at 30 s made that worse than a missed deadline: Stop is the next control a person
+     * reaches for, so the window trained people to end the session 8 to 9 s before the classifier would
+     * have answered, and the probe then reported the silence it had caused.
+     *
+     * [SELECT_OR_STOP] stays at 30. Those runs wait for a COMMAND_RESPONSE rather than for a reading, so
+     * the longer window would be dead time in front of an answer that already arrived.
+     *
+     * [TERMINAL_GRACE] is how long a run keeps listening AFTER the terminal frame instead of ending on it,
+     * so that a probe stopping on that frame does not pin the still-unset variability field as the
+     * reading's own. It also means a run that ends early reports early: a terminal frame at 12 s renders
+     * the verdict at 22 s rather than holding the sheet for the rest of the window.
+     *
+     * AN EVIDENCE WINDOW, NOT A GUARANTEE, and 10 s does not cover the measured spread. The first figure
+     * here came from @meta1971's original five MG sessions, where the field cleared 2 to 9 s past the
+     * terminal frame. Their later 16-run series on the same firmware is much wider: the first valid value
+     * landed between 3 s BEFORE and 17 s after the verdict frame in 9 runs, at +113 and +120 s in 2, and
+     * never at all before the recording ended in 5 (those recordings ran 20 to 144 s past the verdict). By
+     * their own count a 10 s window would have caught 4 of the 16 and a 20 s window 9, and their reading
+     * of it is that the delay is not fixed on this firmware.
+     *
+     * The constant stays at 10 regardless, and the honest reason is that no number here is right: 20 s
+     * buys five more runs out of sixteen and still misses the +113 s pair and the five that never filled,
+     * while every second of it is a sheet held shut in front of a reading that is already over. What the
+     * window must not do is let an unset field be reported as a value, and that is a property of the
+     * reader rather than of the duration. An `0xffff` at the end of the grace is UNAVAILABLE: not zero,
+     * and not a reading that failed to complete.
+     */
+    object Window {
+        const val SELECT_OR_STOP = 30
+        const val CAPTURE = 60
+        const val TERMINAL_GRACE = 10
+    }
+
+    /** Cap on the per-packet candidate lines one run records. Each line is rendered into both the report
+     *  and the strap log, so a chatty stream must not grow either without bound. */
+    const val MAX_CANDIDATE_LINES = 12
+
+    /**
+     * Slots a run keeps in reserve for TERMINAL frames once [MAX_CANDIDATE_LINES] is spent.
+     *
+     * R17 arrives at about one frame a second, so a flat cap keeps seconds 1 to 12 and discards everything
+     * after. Per #891 the result, average HR and reason mask populate only on the terminal frame, which
+     * means the flat cap threw away the single frame carrying the answer and kept twelve that could not. A
+     * reserve rather than a bigger cap: the point is not more evidence, it is the RIGHT evidence, and the
+     * ceiling stays bounded at [MAX_CANDIDATE_LINES] + [MAX_TERMINAL_CANDIDATE_LINES].
+     */
+    const val MAX_TERMINAL_CANDIDATE_LINES = 4
+
+    /**
+     * Whether a decoded frame's line is kept, given what the run has already recorded.
+     *
+     * A terminal frame inside the first [MAX_CANDIDATE_LINES] is kept by the ordinary rule and still spends
+     * one reserve slot, so a run can never record more than the ceiling either way.
+     *
+     * Swift twin: `Whoop5EcgProbe.retainsCandidate`.
+     */
+    fun retainsCandidate(linesKept: Int, terminalLinesKept: Int, isTerminal: Boolean): Boolean {
+        if (linesKept < MAX_CANDIDATE_LINES) return true
+        return isTerminal && terminalLinesKept < MAX_TERMINAL_CANDIDATE_LINES
+    }
+
+    /**
+     * Seconds to wait before rendering the verdict once a terminal frame lands, or null to leave the run's
+     * existing deadline alone.
+     *
+     * ONCE per run ([alreadyExtended]), because the strap sends more than one terminal frame: extending on
+     * each would let a terminal stream push the verdict out indefinitely and the report would never render.
+     *
+     * Swift twin: `Whoop5EcgProbe.terminalGraceSeconds`.
+     */
+    fun terminalGraceSeconds(isTerminal: Boolean, alreadyExtended: Boolean): Int? {
+        if (!isTerminal || alreadyExtended) return null
+        return Window.TERMINAL_GRACE
     }
 
     /**
@@ -246,8 +328,9 @@ object Whoop5EcgProbe {
     /**
      * The full report: verdict, per-command outcomes, the ECG-packet tally, and the raw replies.
      *
-     * [candidateFrames] are the type/length lines for frames that passed the structural triage in
-     * [Whoop5Ecg.plausibleFilteredPayload].
+     * [candidateFrames] are the per-packet lines for frames [Whoop5Ecg.r17FromFrame] decoded — the
+     * sequence, progress and presence of each accepted record, which is what tells a clean run apart
+     * from one the electrodes kept dropping.
      */
     fun report(
         steps: List<Step>,
@@ -289,9 +372,9 @@ object Whoop5EcgProbe {
             )
         }
         if (candidateFrames.isEmpty()) {
-            sb.append("Candidate packet types: none — no frame passed the structural triage.\n")
+            sb.append("Revision-17 packets decoded: none — no frame arrived as type 43 revision 17.\n")
         } else {
-            sb.append("Candidate packet types (structural triage only, NOT a confirmed mapping):\n")
+            sb.append("Revision-17 packets decoded (type 43, revision 17, both CRCs checked):\n")
             for (line in candidateFrames) sb.append("  $line\n")
         }
         val replies = steps.mapNotNull { step -> step.replyHex?.let { "  ${step.label}: $it" } }

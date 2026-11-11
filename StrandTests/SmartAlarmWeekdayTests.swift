@@ -27,6 +27,44 @@ final class SmartAlarmWeekdayTests: XCTestCase {
 
     // MARK: nextSmartAlarmDate
 
+    func testDailyScheduleCoversEveryWakeMinuteAndRequiresAStrictlyFutureFire() {
+        let start = 1_781_654_400 // 2026-06-17 00:00 UTC
+        let now = 1_781_699_696   // 2026-06-17 12:34:56 UTC
+        for minute in 0..<1440 {
+            let today = start + minute * 60
+            let expected = today <= now ? today + 86_400 : today
+            let next = AppModel.nextSmartAlarmDate(minutes: minute, weekdays: [],
+                from: Date(timeIntervalSince1970: Double(now)), calendar: cal)
+            XCTAssertEqual(next?.timeIntervalSince1970, Double(expected), "minute \(minute)")
+            let exact = AppModel.nextSmartAlarmDate(minutes: minute, weekdays: [],
+                from: Date(timeIntervalSince1970: Double(today)), calendar: cal)
+            XCTAssertEqual(exact?.timeIntervalSince1970, Double(today + 86_400),
+                           "exact wake minute \(minute) must roll to tomorrow")
+        }
+    }
+
+    func testDailySpringRolloverKeepsLocalWakeTimeAcrossTheShortDay() {
+        var calendar = cal
+        calendar.timeZone = TimeZone(identifier: "America/Chicago")!
+        let now = 1_772_892_000 // 2026-03-07 08:00 CST
+        let expected = 1_772_974_800 // 2026-03-08 08:00 CDT, 23 hours later
+        let next = AppModel.nextSmartAlarmDate(minutes: 8 * 60, weekdays: [],
+            from: Date(timeIntervalSince1970: Double(now)), calendar: calendar)
+        XCTAssertEqual(next?.timeIntervalSince1970, Double(expected))
+        XCTAssertEqual(expected - now, 23 * 3600)
+    }
+
+    func testDailyAutumnRolloverKeepsLocalWakeTimeAcrossTheLongDay() {
+        var calendar = cal
+        calendar.timeZone = TimeZone(identifier: "America/Chicago")!
+        let now = 1_793_451_600 // 2026-10-31 08:00 CDT
+        let expected = 1_793_541_600 // 2026-11-01 08:00 CST, 25 hours later
+        let next = AppModel.nextSmartAlarmDate(minutes: 8 * 60, weekdays: [],
+            from: Date(timeIntervalSince1970: Double(now)), calendar: calendar)
+        XCTAssertEqual(next?.timeIntervalSince1970, Double(expected))
+        XCTAssertEqual(expected - now, 25 * 3600)
+    }
+
     func testEveryDay_emptySet_picksTodayWhenTimeStillAhead() {
         // now = Wed 06:00, wake at 07:00 → same day, 07:00.
         let next = AppModel.nextSmartAlarmDate(minutes: 7 * 60, weekdays: [], from: wed(6, 0), calendar: cal)
@@ -84,6 +122,70 @@ final class SmartAlarmWeekdayTests: XCTestCase {
         let next = AppModel.nextSmartAlarmDate(minutes: 7 * 60, weekdays: [], from: wed(7, 0), calendar: cal)
         XCTAssertNotNil(next)
         XCTAssertGreaterThan(next!, wed(7, 0))
+    }
+
+    // MARK: nextSmartAlarmDate — per-weekday overrides (#1864)
+
+    /// An override on the scanned day moves the fire time to THAT day's override, not the default.
+    /// now = Wed 06:00, default 07:00, only Wednesdays selected (4), Wednesday override 03:30 →
+    /// today 03:30 has passed, so the next Wednesday (7 days later) at 03:30. Without the override
+    /// this would be today 07:00 (still ahead).
+    func testOverrideOnToday_afterTime_rollsToNextWeek() {
+        let next = AppModel.nextSmartAlarmDate(minutes: 7 * 60, weekdays: [4], overrides: [4: 3 * 60 + 30],
+                                               from: wed(6, 0), calendar: cal)
+        XCTAssertEqual(weekday(of: next!), 4, "Wednesday")
+        XCTAssertEqual(next, cal.date(byAdding: .day, value: 7, to: wed(3, 30)))
+    }
+
+    /// An override on the scanned day that is LATER than the default can make today's occurrence still
+    /// pending. now = Wed 06:00, default 07:00, Wednesday override 09:00 → today 09:00 (still ahead).
+    func testOverrideOnToday_beforeOverrideTime_firesTodayAtOverrideTime() {
+        let next = AppModel.nextSmartAlarmDate(minutes: 7 * 60, weekdays: [], overrides: [4: 9 * 60],
+                                               from: wed(6, 0), calendar: cal)
+        XCTAssertEqual(next, wed(9, 0))
+        XCTAssertEqual(weekday(of: next!), 4)
+    }
+
+    /// A day WITHOUT an override falls back to the default time. now = Wed 06:00, default 07:00,
+    /// Tuesday override 03:30 → Wednesday has no override, fires today at 07:00.
+    func testDayWithoutOverrideUsesDefaultTime() {
+        let next = AppModel.nextSmartAlarmDate(minutes: 7 * 60, weekdays: [], overrides: [3: 3 * 60 + 30],
+                                               from: wed(6, 0), calendar: cal)
+        XCTAssertEqual(next, wed(7, 0))
+    }
+
+    /// An override on a weekday the alarm doesn't fire on is ignored. now = Wed 06:00, default 07:00,
+    /// only Wednesdays selected (4), Saturday override 03:30 → today 07:00 (Saturday is skipped).
+    func testOverrideOnDisabledWeekdayIsIgnored() {
+        let next = AppModel.nextSmartAlarmDate(minutes: 7 * 60, weekdays: [4], overrides: [7: 3 * 60 + 30],
+                                               from: wed(6, 0), calendar: cal)
+        XCTAssertEqual(next, wed(7, 0))
+    }
+
+    /// An empty overrides map is byte-for-byte the old path — the default time on every enabled day.
+    func testEmptyOverridesIsByteForByteOldPath() {
+        let without = AppModel.nextSmartAlarmDate(minutes: 7 * 60, weekdays: [4], from: wed(6, 0), calendar: cal)
+        let withEmpty = AppModel.nextSmartAlarmDate(minutes: 7 * 60, weekdays: [4], overrides: [:],
+                                                    from: wed(6, 0), calendar: cal)
+        XCTAssertEqual(without, withEmpty)
+    }
+
+    /// Invalid override entries (day outside 1…7, minute outside [0, 1440)) are dropped, not applied.
+    func testInvalidOverrideEntriesAreDropped() {
+        let next = AppModel.nextSmartAlarmDate(minutes: 7 * 60, weekdays: [], overrides: [0: 3 * 60, 4: -1, 99: 9 * 60],
+                                               from: wed(6, 0), calendar: cal)
+        XCTAssertEqual(next, wed(7, 0), "invalid entries dropped, default 07:00 fires today")
+    }
+
+    /// The reported install: 04:45 on three days and 03:30 on two. The next fire after the default time
+    /// on a non-override day picks the override time on the next override day that is still ahead.
+    func testRealWorldMixedOverrides() {
+        // now = Wed 06:00, default 07:00, Tue=03:30 (3), Fri=04:45 (6)
+        // Wed has no override → default 07:00 today (still ahead).
+        let next = AppModel.nextSmartAlarmDate(minutes: 7 * 60, weekdays: [],
+                                               overrides: [3: 3 * 60 + 30, 6: 4 * 60 + 45],
+                                               from: wed(6, 0), calendar: cal)
+        XCTAssertEqual(next, wed(7, 0))
     }
 
     // MARK: Picker selection rules

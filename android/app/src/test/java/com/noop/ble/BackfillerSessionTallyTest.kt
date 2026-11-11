@@ -3,6 +3,7 @@ package com.noop.ble
 import com.noop.data.InsertCounts
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -123,6 +124,65 @@ class BackfillerSessionTallyTest {
     }
 
     // The recovery hint names the cause + fix, reports days-ahead, and has no em-dash. Byte-identical to Swift.
+    // #1683: the stale counterpart. A strap that stopped banking weeks ago and one that is caught up
+    // produced the SAME "banked no sensor history" line, so neither the user nor a triager could tell
+    // them apart — the reason #1541 stayed open and unactionable.
+
+    @Test fun aCaughtUpOrBrieflyIdleStrapIsNotStale() {
+        val now = 1_700_000_000L
+        assertFalse(Backfiller.isStaleNewestRecord(null, now))          // no reading at all
+        assertFalse(Backfiller.isStaleNewestRecord(0L, now))            // 0 is not a date
+        assertFalse(Backfiller.isStaleNewestRecord(now, now))           // caught up
+        assertFalse(Backfiller.isStaleNewestRecord(now - 86_400L, now)) // one night off-wrist is ordinary
+    }
+
+    @Test fun twoDaysIsTheBoundaryAndQualifies() {
+        val now = 1_700_000_000L
+        assertTrue(Backfiller.isStaleNewestRecord(now - 2L * 86_400L, now))
+    }
+
+    /** A future-dated record belongs to futureRtcLine; this rule must not also claim it. */
+    @Test fun aFutureDatedRecordIsNotStale() {
+        val now = 1_700_000_000L
+        assertFalse(Backfiller.isStaleNewestRecord(now + 86_400L, now))
+    }
+
+    /**
+     * The numbers from the #1683 capture: newest stored record 1785692420 against a wall clock of
+     * 1787820941. The user was told only "banked no sensor history"; this says three weeks.
+     */
+    @Test fun staleRecordLineReportsTheRealCaptureAsTwentyFourDays() {
+        val line = Backfiller.staleRecordLine(1_785_692_420L, 1_787_820_941L)
+        assertTrue(line, line.contains("about 24 day(s) old"))
+        assertTrue(line, line.contains("stopped saving history"))
+        // The part the old advice omitted: charging alone has already been retried every connect.
+        assertTrue(line, line.contains("re-sends the clock on every connect"))
+        // The test that tells the user whether NOOP is even involved.
+        assertTrue(line, line.contains("official WHOOP app"))
+        assertFalse(line.contains("\u2014"))
+    }
+
+    /** States the fact, never the diagnosis: a drawered strap shows the same number innocently. */
+    @Test fun staleRecordLineDoesNotAssertACorruptClock() {
+        val line = Backfiller.staleRecordLine(1_700_000_000L - 20L * 86_400L, 1_700_000_000L)
+        assertFalse(line, line.contains("corrupt"))
+        assertTrue(line, line.contains("If you have worn it"))
+    }
+
+    /**
+     * The banner is what the user READS; the log line needs a capture export. The standing banner omitted
+     * the age entirely and PROMISED that charging "should" work - advice NOOP has effectively retried on
+     * every connect for weeks, since it re-sends SET_CLOCK each time.
+     */
+    @Test fun staleRecordBannerDatesTheSilenceAndPromisesNothing() {
+        val line = Backfiller.staleRecordBanner(1_785_692_420L, 1_787_820_941L)
+        assertTrue(line, line.contains("about 24 day(s) old"))
+        assertTrue(line, line.contains("If you have been wearing it"))
+        assertTrue(line, line.contains("official WHOOP app"))
+        assertFalse(line, line.contains("should start banking again"))
+        assertFalse(line.contains("\u2014"))
+    }
+
     @Test fun futureRtcLineWording() {
         val now = 1_700_000_000L
         val line = Backfiller.futureRtcLine(now + 10L * 86_400L, now)
@@ -130,6 +190,47 @@ class BackfillerSessionTallyTest {
         assertTrue(line.contains("clock (RTC) is corrupt"))
         assertTrue(line.contains("Fully charge"))
         assertFalse(line.contains("\u2014"))
+    }
+
+    // ---- #1754: two distinct empty-offload banners ------------------------------------------
+
+    /**
+     * The no-flash-cursor banner (trim=0xFFFFFFFF) names the clock/charge cause — the existing copy,
+     * now a named constant so the caller's branch reads as a choice between two states.
+     */
+    @Test fun noFlashCursorBannerNamesClockAndCharge() {
+        val line = Backfiller.noFlashCursorBanner
+        assertTrue(line, line.contains("no stored history to hand over"))
+        assertTrue(line, line.contains("clock has lost sync"))
+        assertTrue(line, line.contains("Fully charge it to 100%"))
+        assertFalse(line, line.contains("sensor front-end"))
+    }
+
+    /**
+     * The no-sensor-records banner (valid trim, advancing write pointer, zero rows) does NOT name the
+     * clock — it points at the sensor front-end or power state, and asks for a strap log rather than
+     * promising that charging will fix it.
+     */
+    @Test fun noSensorRecordsBannerDoesNotBlameTheClock() {
+        val line = Backfiller.noSensorRecordsBanner
+        assertTrue(line, line.contains("no sensor records"))
+        assertTrue(line, line.contains("flash cursor is valid and advancing"))
+        assertTrue(line, line.contains("not a clock problem"))
+        assertTrue(line, line.contains("sensor front-end or power"))
+        assertFalse(line, line.contains("clock has lost sync"))
+        assertFalse(line, line.contains("Fully charge it to 100%"))
+    }
+
+    /** The two banners must be distinct strings — a caller choosing between them must not get the same
+     *  copy for both states. */
+    @Test fun theTwoBannersAreDistinct() {
+        assertNotEquals(Backfiller.noFlashCursorBanner, Backfiller.noSensorRecordsBanner)
+    }
+
+    /** No em-dash in either banner (project rule). */
+    @Test fun noEmDashInEitherBanner() {
+        assertFalse(Backfiller.noFlashCursorBanner.contains("\u2014"))
+        assertFalse(Backfiller.noSensorRecordsBanner.contains("\u2014"))
     }
 
     // ---- #1 records-bearing 0xFFFFFFFF END must NOT false-alarm "no banked history" ----

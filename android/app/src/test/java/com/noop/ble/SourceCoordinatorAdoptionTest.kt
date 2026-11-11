@@ -81,7 +81,7 @@ class SourceCoordinatorAdoptionTest {
         override suspend fun deleteStepsFor(deviceId: String) {}
         override suspend fun deletePpgHrFor(deviceId: String) {}
         override suspend fun deletePpgWaveformFor(deviceId: String) {}
-        override suspend fun deleteRawImuFor(deviceId: String) {}
+        override suspend fun deleteEcgWaveformFor(deviceId: String) {}
         override suspend fun deleteV18AuxFor(deviceId: String) {}
         override suspend fun deleteEventsFor(deviceId: String) {}
         override suspend fun deleteBatteryFor(deviceId: String) {}
@@ -97,6 +97,12 @@ class SourceCoordinatorAdoptionTest {
         override suspend fun deleteLiveSessionsFor(deviceId: String) {}
         override suspend fun deleteDismissedWorkoutsFor(deviceId: String) {}
         override suspend fun deleteDismissedSleepsFor(deviceId: String) {}
+        override suspend fun deleteLiftExercisesFor(deviceId: String) {}
+        override suspend fun deleteLiftProgramsFor(deviceId: String) {}
+        override suspend fun deleteLiftProgramItemsFor(deviceId: String) {}
+        override suspend fun deleteLiftSessionsFor(deviceId: String) {}
+        override suspend fun deleteLiftSetsFor(deviceId: String) {}
+        override suspend fun deleteLiftSets(ids: List<String>) {}
         override suspend fun deleteDayOwnershipFor(deviceId: String) {
             owners.entries.removeIf { it.value.deviceId == deviceId }
         }
@@ -114,7 +120,7 @@ class SourceCoordinatorAdoptionTest {
         override suspend fun reKeySteps(from: String, to: String) {}
         override suspend fun reKeyPpgHr(from: String, to: String) {}
         override suspend fun reKeyPpgWaveform(from: String, to: String) {}
-        override suspend fun reKeyRawImu(from: String, to: String) {}
+        override suspend fun reKeyEcgWaveform(from: String, to: String) {}
         override suspend fun reKeyV18Aux(from: String, to: String) {}
         override suspend fun reKeyEvents(from: String, to: String) {}
         override suspend fun reKeyBattery(from: String, to: String) {}
@@ -133,6 +139,11 @@ class SourceCoordinatorAdoptionTest {
         override suspend fun reKeyLiveSessions(from: String, to: String) {}
         override suspend fun reKeyDismissedWorkouts(from: String, to: String) {}
         override suspend fun reKeyDismissedSleeps(from: String, to: String) {}
+        override suspend fun reKeyLiftExercises(from: String, to: String) {}
+        override suspend fun reKeyLiftPrograms(from: String, to: String) {}
+        override suspend fun reKeyLiftProgramItems(from: String, to: String) {}
+        override suspend fun reKeyLiftSessions(from: String, to: String) {}
+        override suspend fun reKeyLiftSets(from: String, to: String) {}
 
         override suspend fun pairedDevice(id: String): PairedDeviceRow? = devices[id]
 

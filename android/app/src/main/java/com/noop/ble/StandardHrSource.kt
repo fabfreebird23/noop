@@ -20,9 +20,12 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import com.noop.data.HrRow
+import com.noop.data.InsertCounts
 import com.noop.data.RrRow
+import com.noop.data.StandardHrMapping
 import com.noop.data.StreamBatch
 import com.noop.polar.PolarModel
+import com.noop.protocol.StandardHrContact
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -57,9 +60,25 @@ class StandardHrSource(
     private val deviceId: String,
     /** Push live HR (bpm) + R-R (ms) into whatever the UI observes. Called on the main looper. */
     private val liveSink: (hr: Int, rr: List<Int>) -> Unit,
-    /** Persist a batch under [deviceId] — wired to `repository.insert`. Called off the main looper is
-     *  fine; the implementation hops to its own IO scope (see [SourceCoordinator]). */
-    private val persist: (StreamBatch, String) -> Unit,
+    /**
+     * Persist a batch under [deviceId] — wired to `repository.insert`. Called off the main looper is
+     * fine; the implementation hops to its own IO scope (see [SourceCoordinator]).
+     *
+     * Reports its OUTCOME through [done], and that is the point of the third parameter. The seam used to
+     * return Unit and the app wired it as `runCatching { repo.insert(...) }` with no onFailure, while
+     * [flush] had already cleared the buffer — so a store that rejected the batch lost those rows in
+     * silence, with the surrounding log reading exactly like a healthy stream. The Swift Collector
+     * re-buffers and retries; this could not, because it was never told.
+     *
+     * [InsertCounts] rather than a bare success flag: a batch offered in full and inserted as zero is
+     * the failure that most looks like success, and only the store's own count distinguishes it.
+     *
+     * The re-buffer is only as good as [done] being called. The live wiring launches on a scope, and a
+     * scope cancelled before the body runs drops the batch with no line — the same loss the old
+     * `runCatching`-with-no-onFailure had, now narrowed to a cancelled teardown rather than every
+     * rejected insert. An implementation that can fail to answer should answer with a failure.
+     */
+    private val persist: (StreamBatch, String, (Result<InsertCounts>) -> Unit) -> Unit,
     /** Diagnostic sink for the connect lifecycle. Wired (via [SourceCoordinator]) to the SAME in-app strap
      *  log the user exports, so the generic-HR path is no longer invisible in a bug report (issue #421).
      *  Every line is prefixed "HR-strap: " so it's distinguishable from WHOOP lines in the shared log.
@@ -79,6 +98,12 @@ class StandardHrSource(
      *  the Test Centre "Polar debug logging" toggle (only shown when a Polar strap is paired). Diagnostic-
      *  only — nothing gates behaviour on it. Default off keeps existing call sites / tests silent. */
     private val polarDebug: () -> Boolean = { false },
+    /**
+     * Whether the per-sample host-received readout is wanted. The app wires this to the Test Centre's HRV and
+     * Connection modes, the modes that exist for it; with none on, the log carries [StandardHrHostReceivedTrace]'s
+     * summary instead. Twin of Swift `Collector.hostReceivedDetail`.
+     */
+    private val hostReceivedDetail: () -> Boolean = { false },
 ) : LiveHrSource {
 
     /** Live instantaneous fitness-sensor metrics surfaced via [sensorSink]. Any field is null when it
@@ -148,10 +173,26 @@ class StandardHrSource(
 
     // MARK: - Sample buffer (flushed in batches off the per-notification hot loop)
 
-    private data class Sample(val hr: Int, val rr: List<Int>, val ts: Long)
+    private data class Sample(
+        val hr: Int,
+        val rr: List<Int>,
+        /** Non-null ONLY when this reading changed the contact state — see [StandardHrMapping.shouldRecordContact]. */
+        val contact: StandardHrContact?,
+        val ts: Long,
+    )
     private val bufferLock = Any()
     private val buffer = ArrayList<Sample>()
     private var lastFlushMs = System.currentTimeMillis()
+    /** The host-received lines, summarised — see [StandardHrHostReceivedTrace]. Recorded under [bufferLock],
+     *  where the per-sample line was already built. */
+    private val hostReceived = StandardHrHostReceivedTrace()
+    /** Consecutive failed inserts, for the run-length the rate-limited failure line reports. Reset by a
+     *  success, exactly like the WHOOP path's counter. */
+    private val insertFailures = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Last emission of [liveInsertFailedLine], for [shouldEmitLiveInsertFailure]'s one-a-minute gap. */
+    @Volatile private var lastInsertFailureLogMs = 0L
+
     private val flushCount = 30
     private val flushIntervalMs = 30_000L
 
@@ -229,7 +270,9 @@ class StandardHrSource(
         loggedFirstHr = false   // a later reconnect should log its first sample again
         loggedFirstSensor = false
         _batteryPct.value = null // a stale charge must not outlive the link
-        flush()
+        flush(StandardHrFlushReason.DISCONNECT)
+        // The stream is ending: write the window so far, or the last minute of it leaves with the link.
+        synchronized(bufferLock) { hostReceived.close() }.forEach { log(it) }
         clearSensorState()       // a stale speed/cadence/power panel must not outlive the link
     }
 
@@ -243,31 +286,111 @@ class StandardHrSource(
 
     // MARK: - Buffer / persistence
 
-    private fun enqueue(hr: Int, rr: List<Int>) {
-        val shouldFlush = synchronized(bufferLock) {
-            buffer.add(Sample(hr, rr, System.currentTimeMillis() / 1000L))
-            buffer.size >= flushCount ||
+    /** Last contact state put in the buffer. Advanced at ENQUEUE, which is safe because the change point
+     *  travels in the buffer until it persists: a failed flush re-buffers the sample carrying it. */
+    private var lastEnqueuedContact: StandardHrContact? = null
+
+    private fun enqueue(hr: Int, rr: List<Int>, contact: StandardHrContact) {
+        val ts = System.currentTimeMillis() / 1000L
+        val shouldFlush: Boolean
+        val hostLines: List<String>
+        synchronized(bufferLock) {
+            val record = StandardHrMapping.shouldRecordContact(lastEnqueuedContact, contact)
+            if (record) lastEnqueuedContact = contact
+            buffer.add(Sample(hr, rr, if (record) contact else null, ts))
+            // Twin of Collector.ingestStandardHR's host-received line. Gates on THIS sample match
+            // rowsOf / Swift ingest; pending is the gated contents of the raw buffer. Cadence still
+            // trips on buffer.size so we do not move the filter (#1770).
+            val acceptedHr = if (hr in 30..220) 1 else 0
+            val acceptedRr = rr.count { it in 250..3000 }
+            val (pendingHr, pendingRr) = rowsOf(buffer)
+            // One line a minute, not one a second: a refusal is written at once, the routine ones are
+            // counted, and the full per-sample readout comes back while a Test Centre mode is on
+            // ([hostReceivedDetail]). Twin of Collector.ingestStandardHR.
+            hostLines = hostReceived.record(
+                StandardHrHostReceivedTrace.Sample(
+                    hostUnixSeconds = ts.toInt(),
+                    acceptedHrRows = acceptedHr, acceptedRrRows = acceptedRr,
+                    rejectedHrRows = 1 - acceptedHr, rejectedRrRows = rr.size - acceptedRr,
+                    pendingHrRows = pendingHr.size, pendingRrRows = pendingRr.size,
+                ),
+                detailed = hostReceivedDetail(),
+            )
+            shouldFlush = buffer.size >= flushCount ||
                 System.currentTimeMillis() - lastFlushMs >= flushIntervalMs
         }
+        hostLines.forEach { log(it) }
         if (shouldFlush) flush()
     }
 
-    private fun flush() {
+    /**
+     * The rows a set of buffered samples would offer, applying the SAME gates in one place.
+     *
+     * Mirrors `StandardHRMapping`: HrRow + RrRow only, HR range-gated so an off-wrist 0 is dropped, R-R
+     * gated to plausible beat-to-beat ms — matching `ingestStandardHr`. Shared with the re-buffer path
+     * deliberately: a pending count that applied different gates from the offered count would report two
+     * numbers that cannot be compared, in the one line whose job is comparing them.
+     */
+    private fun rowsOf(samples: List<Sample>): Pair<List<HrRow>, List<RrRow>> {
+        val hrRows = ArrayList<HrRow>()
+        val rrRows = ArrayList<RrRow>()
+        for (s in samples) {
+            if (s.hr in 30..220) hrRows.add(HrRow(s.ts, s.hr))
+            for (r in s.rr) if (r in 250..3000) rrRows.add(RrRow(s.ts, r))
+        }
+        return hrRows to rrRows
+    }
+
+    private fun flush(reason: StandardHrFlushReason = StandardHrFlushReason.CADENCE) {
         val snapshot = synchronized(bufferLock) {
             lastFlushMs = System.currentTimeMillis()
             if (buffer.isEmpty()) return
             val s = ArrayList(buffer); buffer.clear(); s
         }
-        // Mirror StandardHRMapping: HrRow + RrRow only. HR is range-gated (off-wrist 0/garbage dropped);
-        // R-R is gated to physiologically plausible beat-to-beat ms, matching ingestStandardHr.
-        val hrRows = ArrayList<HrRow>()
-        val rrRows = ArrayList<RrRow>()
-        for (s in snapshot) {
-            if (s.hr in 30..220) hrRows.add(HrRow(s.ts, s.hr))
-            for (r in s.rr) if (r in 250..3000) rrRows.add(RrRow(s.ts, r))
+        val (hrRows, rrRows) = rowsOf(snapshot)
+        val contactEvents = snapshot.mapNotNull { s ->
+            s.contact?.let { StandardHrMapping.contactEvent(s.ts, it) }
         }
-        if (hrRows.isNotEmpty() || rrRows.isNotEmpty()) {
-            persist(StreamBatch(hr = hrRows, rr = rrRows), deviceId)
+        if (hrRows.isEmpty() && rrRows.isEmpty() && contactEvents.isEmpty()) return
+        log(standardHrFlushAttemptLine(reason.raw, hrRows.size, rrRows.size))
+        persist(StreamBatch(hr = hrRows, rr = rrRows, events = contactEvents), deviceId) { result ->
+            result.fold(
+                onSuccess = { counts ->
+                    insertFailures.set(0)
+                    log(standardHrFlushSucceededLine(reason.raw, hrRows.size, rrRows.size, counts.hr, counts.rr))
+                },
+                onFailure = { t ->
+                    // Put the batch BACK, at the front, so the next flush retries it in order — the Swift
+                    // Collector's `insert(contentsOf:at:0)`. Without this the rows were already gone the
+                    // moment the snapshot was taken.
+                    val (pendingHr, pendingRr) = synchronized(bufferLock) {
+                        buffer.addAll(0, snapshot)
+                        val (h, r) = rowsOf(buffer)
+                        h.size to r.size
+                    }
+                    val runLength = insertFailures.incrementAndGet()
+                    log(standardHrRebufferedForRetryLine(
+                        reason = reason.raw,
+                        attemptedHrRows = hrRows.size, attemptedRrRows = rrRows.size,
+                        pendingHrRows = pendingHr, pendingRrRows = pendingRr,
+                        consecutiveFailures = runLength,
+                    ))
+                    // Rate-limited, and the SAME helper the WHOOP live path uses, so one strap log carries
+                    // one shape of insert failure however it arrived.
+                    val nowMs = System.currentTimeMillis()
+                    if (shouldEmitLiveInsertFailure(lastInsertFailureLogMs, nowMs)) {
+                        lastInsertFailureLogMs = nowMs
+                        log(liveInsertFailedLine(
+                            transport = "standard-hr",
+                            throwableName = t.javaClass.simpleName,
+                            message = t.message,
+                            hrFrames = hrRows.size,
+                            rrFrames = rrRows.size,
+                            consecutiveFailures = runLength,
+                        ))
+                    }
+                },
+            )
         }
     }
 
@@ -280,7 +403,7 @@ class StandardHrSource(
             val firstSight = seen.put(address, device) == null   // null → not seen before this scan
             val name = result.scanRecord?.deviceName ?: runCatching { device.name }.getOrNull()
                 ?: "Heart Rate Strap"
-            if (firstSight) log("HR-strap: found $name ($address) rssi ${result.rssi}")
+            if (firstSight) log("HR-strap: found ${logSafeDeviceName(name)} ($address) rssi ${result.rssi}")
             val strap = DiscoveredStrap(address = address, name = name, rssi = result.rssi)
             _discovered.value = upsertByProximity(_discovered.value, strap)
             // Replay a connect intent that arrived before the device was discovered.
@@ -324,7 +447,7 @@ class StandardHrSource(
                     loggedPolarIdentity = false
                     loggedFirstSensor = false
                     _batteryPct.value = null // a stale charge must not outlive the link
-                    flush()
+                    flush(StandardHrFlushReason.DISCONNECT)
                     clearSensorState()
                     if (gatt === g) { runCatching { g.close() }; gatt = null }
                     // Hardening: status 133 is Android's infamous generic GATT_ERROR on connect — almost
@@ -529,7 +652,7 @@ class StandardHrSource(
         }
         // Surface live HR on the main looper (the UI's StateFlow expects main-thread updates).
         handler.post { guardedCallback("live-sink") { liveSink(parsed.hr, parsed.rr) } }
-        enqueue(parsed.hr, parsed.rr)
+        enqueue(parsed.hr, parsed.rr, parsed.contact)
     }
 
     companion object {

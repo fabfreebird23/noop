@@ -66,6 +66,8 @@ object RawSensorExport {
         to: Long,
         limit: Int = 200_000,
     ): Map<String, Int> {
+        out.write(HEADER); out.write("\n")
+        if (from > to) return emptyMap()
         // index: 0 hr_bpm,1 rr_ms,2 grav_x,3 grav_y,4 grav_z,5 step_counter,6 ppg_bpm,7 ppg_conf,
         //        8 spo2_red,9 spo2_ir,10 skintemp_raw,11 resp_raw,12 band_sleep_state,13 event_kind,14 event_payload
         val rows = ArrayList<LineRow>()
@@ -75,11 +77,11 @@ object RawSensorExport {
         counts["hr"] = hr.size
         for (s in hr) rows += LineRow(s.ts, line("hr", s.ts, 0 to n(s.bpm)))
 
-        val rr = repo.rrIntervals(deviceId, from, to, limit)
+        val rr = repo.rawRrIntervalsForDevice(deviceId, from, to, limit)
         counts["rr"] = rr.size
         for (s in rr) rows += LineRow(s.ts, line("rr", s.ts, 1 to n(s.rrMs)))
 
-        val grav = repo.gravitySamples(deviceId, from, to, limit)
+        val grav = repo.gravitySamplesForDevice(deviceId, from, to, limit)
         counts["gravity"] = grav.size
         for (s in grav) rows += LineRow(s.ts, line("gravity", s.ts, 2 to n(s.x), 3 to n(s.y), 4 to n(s.z)))
 
@@ -118,7 +120,6 @@ object RawSensorExport {
 
         // Stable sort by ts asc (a stream's intra-ts order is its query's secondary key).
         rows.sortBy { it.ts }
-        out.write(HEADER); out.write("\n")
         for (r in rows) { out.write(r.line); out.write("\n") }
         return counts
     }

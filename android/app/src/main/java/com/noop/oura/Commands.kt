@@ -27,8 +27,12 @@ object OuraCommands {
 
     // The SpO2 feature id. Per OURA_PROTOCOL.md s7.1.
     const val featureSpO2 = 0x04
-    // The real-steps feature id. Server-flag-gated (activity/real_steps, default off), so it is never
-    // emitted for an offline NOOP-only ring. Per OURA_PROTOCOL.md s7.1 / s7.3 [open_oura-feat].
+    // The real-steps feature id (`activity/real_steps`). Nominally server-flag-gated per
+    // OURA_PROTOCOL.md s7.1/s7.3 [open_oura-feat], but on-device 2026-08-25 real-steps status reads
+    // came back enabled (status=1) from BOTH an authenticated Oura-app session and NOOP's own fully
+    // offline, unauthenticated read of the same ring - the gate is ring-side state, not tied to which
+    // client asks or whether that client is cloud-authenticated. Do not assume "off for NOOP" without
+    // checking a live read.
     const val featureRealSteps = 0x0b
 
     // MARK: - Pre-auth / identity (unauthenticated OK)
@@ -53,9 +57,21 @@ object OuraCommands {
 
     // MARK: - Notifications / state
 
-    /** SetNotification (enable all): `1c 01 3f`. `00`=none, `3f`/`bf`=all. Per OURA_PROTOCOL.md s4.1. */
-    fun enableAllNotifications(): OuraCommand =
-        OuraCommand("notify_all", intArrayOf(0x1C, 0x01, 0x3F))
+    /** The SetNotification mask NOOP has always sent: `3f`. `3f`/`bf`=all per OURA_PROTOCOL.md s4.1. */
+    const val NOTIFICATION_MASK_DEFAULT = 0x3F
+    /** The SetNotification mask the official app sends (`ff`, 08-25 HCI capture). Its only known
+     *  difference from `3f` is the two high bits, and whether those are what makes the ring pack ~10
+     *  packets per notification (OURA_PROTOCOL.md s2.3, the 9x drain) is the open A/B. Test Centre only. */
+    const val NOTIFICATION_MASK_FULL = 0xFF
+
+    /** SetNotification (enable all): `1c 01 <mask>`, `3f` by default. `00`=none, `3f`/`bf`=all. Per
+     *  OURA_PROTOCOL.md s4.1. A non-default mask carries its value in the label (`notify_all(ff)`) so the
+     *  `-> notify_all` strap-log line shows which session shape an A/B ran under. Twin of Swift's
+     *  `enableAllNotifications(mask:)`. */
+    fun enableAllNotifications(mask: Int = NOTIFICATION_MASK_DEFAULT): OuraCommand {
+        val label = if (mask == NOTIFICATION_MASK_DEFAULT) "notify_all" else "notify_all(%02x)".format(mask)
+        return OuraCommand(label, intArrayOf(0x1C, 0x01, mask))
+    }
 
     /** SetNotification (disable): `1c 01 00`. Per OURA_PROTOCOL.md s4.1. */
     fun disableNotifications(): OuraCommand =
@@ -168,9 +184,11 @@ object OuraCommands {
         OuraCommand("spo2_status", intArrayOf(0x2F, 0x02, 0x20, featureSpO2))
 
     /**
-     * Read the real-steps feature status, `2f 02 20 0b` (READ verb, not enable). The `0x21` reply confirms
-     * the server-flag gate (`activity/real_steps`, default off) from the ring itself. Read-only diagnostic.
-     * [open_oura-feat]
+     * Read the real-steps feature status, `2f 02 20 0b` (READ verb, not enable). The `0x21` reply reports
+     * the ring's own real_steps gate state - NOT reliably "off" for an offline ring: on-device
+     * 2026-08-25 this read back status=1 (enabled) from NOOP's own unauthenticated connection, matching
+     * the real Oura app's read of the same ring byte-for-byte. Read-only diagnostic either way - never
+     * enables anything, never writes a mode. [open_oura-feat]
      */
     fun realStepsReadStatus(): OuraCommand =
         OuraCommand("realsteps_status", intArrayOf(0x2F, 0x02, 0x20, featureRealSteps))

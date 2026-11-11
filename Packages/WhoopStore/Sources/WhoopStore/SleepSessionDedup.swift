@@ -120,6 +120,19 @@ public enum SleepSessionDedup {
                 dropped.sorted { $0.startTs < $1.startTs })
     }
 
+    /// The bank-recency witness the post-upsert heal may hand `dedupe` for ONE device id's rows.
+    ///
+    /// `keptStarts` are the `startTs` of the sessions the analyze pass just banked under `computedId`. They
+    /// witness recency ONLY there: on a day scored from a device-provided hypnogram (an Oura ring) the pass's
+    /// sessions are that device's own stored rows with `startTs` copied verbatim, so the same keys name the
+    /// row the pass READ in the device's own table — the stalest row of the night by the time the heal runs,
+    /// not the freshest. Handing them to that sweep ranked the read row above every fuller re-serve banked
+    /// while the pass was in flight, and the heal deleted the full night. Every id but `computedId` therefore
+    /// gets no witness and falls back to longest-wins, the read-side default. Twin of Kotlin's `healWitness`.
+    public static func healWitness(for healId: String, computedId: String, keptStarts: Set<Int>) -> Set<Int> {
+        healId == computedId ? keptStarts : []
+    }
+
     // MARK: - #1284 residual 3: generation-side 0x49-onset keying (at-persist, no schema migration)
 
     /// The grid (seconds) the 0x49 onset is rounded to before it becomes a session's `startTs`. The ring
@@ -137,6 +150,28 @@ public enum SleepSessionDedup {
     public static func keyedStart(onsetUnixSeconds: Int, gridSeconds: Int = onsetKeyGridSeconds) -> Int {
         let g = max(1, gridSeconds)
         return ((onsetUnixSeconds + g / 2) / g) * g
+    }
+
+    /// Guards the onset rekey against `OuraHypnogramBurst.codesWithTimes`'s own safety net: that
+    /// assembler silently falls back to the UNCLIPPED lay when clipping to the ring's `0x49` onset
+    /// would empty the burst entirely (a mis-paired window's onset landing after every real code) —
+    /// "so a mis-paired window can never empty the night." The caller has no signal that fallback
+    /// fired, and blindly re-keying `startTs` to that onset anyway wrote a NEGATIVE-DURATION session
+    /// (item 22, 2026-09-12: `startTs` 16 min after its own `endTs` on a 2-minute nap, because the
+    /// matched `0x49` window's onset was ~16 min later than the only two codes the ring actually wrote).
+    ///
+    /// A clip that genuinely bound leaves `mapped.startTs >= onset` by construction — the surviving
+    /// codes are exactly those with `ts >= onset`, so the first one can only sit at or after it. A clip
+    /// the fallback ignored leaves `mapped.startTs < onset` just as reliably, since EVERY written code
+    /// was earlier than onset (that is precisely why clipping to it would have emptied the burst).
+    /// Also rejects the rarer case where 30 s grid-rounding pushes a nearly-adjacent onset to or past
+    /// `endTs`, which would otherwise mint a zero/negative-duration session on its own.
+    ///
+    /// Returns the keyed start to bank, or `nil` to keep `mapped.startTs` unchanged (no rekey).
+    public static func safeKeyedStart(onset: Int, mapped: CachedSleepSession) -> Int? {
+        guard onset <= mapped.startTs else { return nil }
+        let keyed = keyedStart(onsetUnixSeconds: onset)
+        return keyed < mapped.endTs ? keyed : nil
     }
 
     /// Decide, at persist time, whether a freshly reconstructed `candidate` night should be banked and

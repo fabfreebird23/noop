@@ -4,7 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 /**
- * Range-chip gating for the Vital Signs detail (#943, ryanbr). filterVitalPoints windows off the
+ * Range-chip gating for the Vital Signs detail (#943, ryanbr). filterVitalReadings windows off the
  * LATEST reading, so with short history every window returns the same full point set and all the
  * chips drew byte-identical charts. A range only shows something NEW once the data span EXCEEDS the
  * previous range's window, so the unlocked chips form a contiguous prefix with W always available
@@ -15,17 +15,20 @@ import org.junit.Test
  */
 class VitalRangeGatingTest {
 
-    private fun dailyPoints(count: Int, start: String = "2026-01-01"): List<Pair<String, Double>> {
+    private fun dailyReadings(count: Int, start: String = "2026-01-01"): List<VitalReading> {
         val first = java.time.LocalDate.parse(start)
-        return (0 until count).map { first.plusDays(it.toLong()).toString() to 60.0 + it }
+        return (0 until count).map { VitalReading(first.plusDays(it.toLong()).toString(), 60.0 + it, "source-$it") }
     }
+
+    private fun historySpan(readings: List<VitalReading>): Long =
+        vitalHistorySpanDays(readings.map { it.day to it.value })
 
     // ── span math ───────────────────────────────────────────────────────────────
 
     @Test fun spanIsLastMinusFirstInEpochDays() {
-        assertEquals(9L, vitalHistorySpanDays(dailyPoints(10)))
-        assertEquals(0L, vitalHistorySpanDays(dailyPoints(1)))
-        assertEquals(0L, vitalHistorySpanDays(emptyList()))
+        assertEquals(9L, historySpan(dailyReadings(10)))
+        assertEquals(0L, historySpan(dailyReadings(1)))
+        assertEquals(0L, historySpan(emptyList()))
     }
 
     @Test fun unparseableBoundsFallBackToZeroSpan() {
@@ -113,27 +116,67 @@ class VitalRangeGatingTest {
     @Test fun lockedRangeWouldHaveDrawnTheSamePointsAsItsPredecessor() {
         // 10 daily points, span 9: W (7 points) differs from 2W (all 10), so 2W is unlocked;
         // 3W returns the identical set as 2W, so 3W is locked.
-        val points = dailyPoints(10)
-        val unlocked = unlockedVitalRanges(vitalHistorySpanDays(points))
+        val readings = dailyReadings(10)
+        val unlocked = unlockedVitalRanges(historySpan(readings))
         assertEquals(
             listOf(VitalDetailRange.WEEK, VitalDetailRange.TWO_WEEK, VitalDetailRange.ALL),
             unlocked,
         )
-        assertEquals(7, filterVitalPoints(points, VitalDetailRange.WEEK).size)
-        assertEquals(10, filterVitalPoints(points, VitalDetailRange.TWO_WEEK).size)
+        assertEquals(7, filterVitalReadings(readings, VitalDetailRange.WEEK).size)
+        assertEquals(10, filterVitalReadings(readings, VitalDetailRange.TWO_WEEK).size)
         assertEquals(
-            filterVitalPoints(points, VitalDetailRange.TWO_WEEK),
-            filterVitalPoints(points, VitalDetailRange.THREE_WEEK),
+            filterVitalReadings(readings, VitalDetailRange.TWO_WEEK),
+            filterVitalReadings(readings, VitalDetailRange.THREE_WEEK),
         )
     }
 
     @Test fun filterWindowsOffTheLatestReadingInclusive() {
         // The WEEK window is latestDate-6..latestDate, so exactly the last 7 daily points survive.
-        val points = dailyPoints(30)
-        val week = filterVitalPoints(points, VitalDetailRange.WEEK)
+        val readings = dailyReadings(30)
+        val week = filterVitalReadings(readings, VitalDetailRange.WEEK)
         assertEquals(7, week.size)
-        assertEquals(points.takeLast(7), week)
+        assertEquals(readings.takeLast(7), week)
         // The new 3W window: the last 21 daily points.
-        assertEquals(21, filterVitalPoints(points, VitalDetailRange.THREE_WEEK).size)
+        assertEquals(readings.takeLast(21), filterVitalReadings(readings, VitalDetailRange.THREE_WEEK))
+    }
+
+    @Test fun everyRangeKeepsTheExpectedDailyReadings() {
+        val readings = dailyReadings(400)
+        VitalDetailRange.entries.forEach { range ->
+            val expected = range.days?.let { readings.takeLast(it.toInt()) } ?: readings
+            assertEquals(expected, filterVitalReadings(readings, range))
+        }
+    }
+
+    @Test fun sparseWindowUsesCalendarDaysAndRetainsSourceAndValue() {
+        val readings = listOf(
+            VitalReading("2026-01-01", 55.0, "old"),
+            VitalReading("2026-01-23", 56.0, "before-cutoff"),
+            VitalReading("2026-01-24", 57.0, "at-cutoff"),
+            VitalReading("2026-01-29", 58.0, "apple-health"),
+            VitalReading("2026-01-30", 59.0, "my-whoop-noop"),
+        )
+        assertEquals(readings.takeLast(3), filterVitalReadings(readings, VitalDetailRange.WEEK))
+        assertEquals(readings, filterVitalReadings(readings, VitalDetailRange.ALL))
+    }
+
+    @Test fun invalidInteriorDateIsExcludedWhenLatestDateParses() {
+        val readings = listOf(
+            VitalReading("bad-day", 55.0, "unknown"),
+            VitalReading("2026-01-30", 59.0, "my-whoop"),
+        )
+        assertEquals(readings.takeLast(1), filterVitalReadings(readings, VitalDetailRange.WEEK))
+    }
+
+    @Test fun invalidLatestDateFallsBackToReadingCount() {
+        val readings = dailyReadings(10) + VitalReading("bad-day", 70.0, "unknown")
+        assertEquals(readings.takeLast(7), filterVitalReadings(readings, VitalDetailRange.WEEK))
+        assertEquals(readings, filterVitalReadings(readings, VitalDetailRange.ALL))
+    }
+
+    @Test fun emptyHistoryStaysEmptyInEveryRange() {
+        VitalDetailRange.entries.forEach { range ->
+            assertEquals(emptyList<VitalReading>(), filterVitalReadings(emptyList(), range))
+        }
     }
 }

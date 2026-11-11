@@ -51,7 +51,34 @@ struct LiveView: View {
     @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
     private var effortScale: EffortScale { UnitPrefs.resolveEffortScale(effortScaleRaw) }
 
-    private var activeConnection: Bool { live.connected && live.bonded }
+    /// Whether the ACTIVE registry device is a WHOOP, resolved once and handed to the leaves.
+    private var activeIsWhoop: Bool {
+        LiveConsoleReadout.activeIsWhoop(
+            devices: model.deviceRegistry?.devices ?? [],
+            activeId: model.deviceRegistry?.activeDeviceId,
+        )
+    }
+
+    /// Whether the ACTIVE registry device is an Oura ring (#2305) — the ring-only affordances below.
+    private var activeIsOura: Bool {
+        LiveConsoleReadout.activeIsOura(
+            devices: model.deviceRegistry?.devices ?? [],
+            activeId: model.deviceRegistry?.activeDeviceId,
+        )
+    }
+
+    /// The live ring's link phase, mirrored off the Oura source (#2305). Meaningful only under
+    /// `activeIsOura`; `.disconnected` otherwise.
+    private var ringPhase: OuraLiveSource.LinkPhase { model.ouraLinkPhase }
+
+    /// A trusted WHOOP link, for the console readouts and the bond-only controls.
+    ///
+    /// Gated on the active device actually BEING a WHOOP (#2075). `LiveState` is one object that every
+    /// live source writes into, so `connected && bonded` stays true for a bonded strap while an Oura
+    /// ring is the device on screen. That showed the WHOOP pill, the WHOOP charge and live WHOOP-only
+    /// controls under the ring's name, and made the pill's own ring branch unreachable, because this one
+    /// is tested first.
+    private var activeConnection: Bool { activeIsWhoop && live.connected && live.bonded }
 
     /// A non-WHOOP live source (the Oura ring) that is connected and actively streaming live HR. It
     /// authenticates and streams but never reaches a WHOOP encrypted bond, so `bonded` stays false and
@@ -99,7 +126,12 @@ struct LiveView: View {
                 // an offline user saw only inert copy up top. Gated purely on `!live.connected`, so it
                 // disappears the instant the radio connects. Shared with macOS — it reuses `scanButton`,
                 // which the wide layout already renders in `controls`.
-                if !live.connected { offlineConnectCallout }
+                // WHOOP only (#2305): under a ring this card named the ring over a button that ran a
+                // WHOOP scan — the #2303 reporter's Re-scan ran a full 5/MG handshake with the ring active.
+                if activeIsWhoop, !live.connected { offlineConnectCallout }
+                // The ring's own above-the-fold affordance: its link phase and a reconnect, shown until
+                // `auth OK` — the same "no link yet" slot the WHOOP callout fills.
+                if activeIsOura, ringPhase != .authenticated { ringConnectCallout }
                 bodyConsole
                 // Low-bandwidth fallback note (#80): the radio couldn't sustain the WHOOP 4 R10/R11 raw
                 // realtime burst, so live HR is riding the standard BLE Heart-Rate profile instead. Live HR
@@ -113,8 +145,17 @@ struct LiveView: View {
                 // Show the strap picker whenever we're not actively streaming, so a user with both a
                 // WHOOP 4 and a 5/MG can switch between them. (It used to hide once `bonded`, which is
                 // sticky across disconnects — so after the first pairing the picker vanished for good.)
-                if !activeConnection { modelPicker }
-                controls
+                // WHOOP only (#2305): `activeConnection` is false for a ring BY CONSTRUCTION, so without
+                // the brand gate the WHOOP picker was shown MORE readily under a ring than under a strap.
+                if activeIsWhoop, !activeConnection { modelPicker }
+                // Scan / Buzz / Disconnect are the WHOOP path (`model.scan` → `BLEManager.connect`, the
+                // explicit user-connect that bypasses the #1881 active-device gate on purpose). A ring
+                // gets its own row; any other brand keeps the Devices row alone.
+                if activeIsWhoop {
+                    controls
+                } else if activeIsOura {
+                    ringControls
+                }
                 manageDevicesRow
                 LiveLogCard()
             }
@@ -186,7 +227,8 @@ struct LiveView: View {
                         SourceBadge("SYNCING \(live.syncChunksThisSession)", tint: StrandPalette.metricCyan)
                     }
                     Spacer(minLength: 8)
-                    LiveHeaderStats(activeConnection: activeConnection, deviceName: activeDeviceName)
+                    LiveHeaderStats(activeConnection: activeConnection, activeIsWhoop: activeIsWhoop,
+                                    deviceName: activeDeviceName)
                 }
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 12) {
@@ -199,7 +241,8 @@ struct LiveView: View {
                         }
                         Spacer(minLength: 0)
                     }
-                    LiveHeaderStats(activeConnection: activeConnection, deviceName: activeDeviceName)
+                    LiveHeaderStats(activeConnection: activeConnection, activeIsWhoop: activeIsWhoop,
+                                    deviceName: activeDeviceName)
                 }
             }
         }
@@ -259,16 +302,16 @@ struct LiveView: View {
         card {
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .center, spacing: NoopMetrics.space6) {
-                    LiveHeartReadout(hrMax: model.profile.hrMax)
+                    LiveHeartReadout(activeIsWhoop: activeIsWhoop, activeIsOura: activeIsOura, hrMax: model.profile.hrMax)
                         .frame(minWidth: 260, maxWidth: 340)
                     Divider().overlay(StrandPalette.hairline)
-                    LivePhysiology()
+                    LivePhysiology(activeIsWhoop: activeIsWhoop)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 VStack(alignment: .leading, spacing: 18) {
-                    LiveHeartReadout(hrMax: model.profile.hrMax)
+                    LiveHeartReadout(activeIsWhoop: activeIsWhoop, activeIsOura: activeIsOura, hrMax: model.profile.hrMax)
                     Divider().overlay(StrandPalette.hairline)
-                    LivePhysiology()
+                    LivePhysiology(activeIsWhoop: activeIsWhoop)
                 }
             }
         }
@@ -282,7 +325,7 @@ struct LiveView: View {
     private var signalTrustRail: some View {
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("Signal Trust", overline: "Proof that the console is current")
-            LiveSignalTrustRail(activeConnection: activeConnection)
+            LiveSignalTrustRail(activeConnection: activeConnection, activeIsWhoop: activeIsWhoop)
         }
     }
 
@@ -361,28 +404,44 @@ struct LiveView: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
                     Circle().fill(StrandPalette.metricRose).frame(width: 8, height: 8)
-                    Text("RECORDING WORKOUT").font(StrandFont.overline)
-                        .tracking(StrandFont.overlineTracking).foregroundStyle(StrandPalette.metricRose)
+                    // "RECORDING" is a factual claim, and while paused nothing IS being recorded — the
+                    // sample capture drops every reading. So the label swaps rather than gaining a tag
+                    // beside it, which would leave the card asserting both at once. Reuses the "Paused"
+                    // string #1533 already localized. (The Today card says "IN PROGRESS", which stays
+                    // true while paused, so it keeps its label and takes the tag instead.)
+                    Text(w.isPaused ? "Paused" : "RECORDING WORKOUT").font(StrandFont.overline)
+                        .tracking(StrandFont.overlineTracking)
+                        .foregroundStyle(w.isPaused ? StrandPalette.textSecondary : StrandPalette.metricRose)
                     Spacer()
                     // Re-render once a second so the elapsed clock ticks without a manual Timer.
-                    TimelineView(.periodic(from: .now, by: 1)) { _ in
-                        Text(Self.elapsed(since: w.start)).font(StrandFont.number(17)).monospacedDigit()
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(ActiveWorkoutClock.clock(Int(w.elapsed(at: context.date))))
+                            .font(StrandFont.number(17)).monospacedDigit()
                             .foregroundStyle(StrandPalette.textPrimary)
                     }
                 }
                 // Live HR / avg / peak / effort — the leaf owns LiveState + the active workout so the
                 // 1 Hz stat refresh re-renders only these tiles, plus a liquid effort tube under them.
                 ActiveWorkoutLive(workout: w, effortScale: effortScale)
+                // The card used to offer End and nothing else, so the only IRREVERSIBLE control was the
+                // one reachable without opening the live view, while Pause — the reversible one — was
+                // not. Pause/Resume is one toggle (a paused session has exactly one sensible action), and
+                // End moves to its own row so a destructive tap is not adjacent to a routine one.
                 HStack(spacing: NoopMetrics.rowSpacing) {
+                    NoopButton(w.isPaused ? "Resume" : "Pause",
+                               systemImage: w.isPaused ? "play.fill" : "pause.fill",
+                               kind: .secondary, fullWidth: true) {
+                        model.toggleWorkoutPause()
+                    }
                     // Re-open the full live workout screen (#238) after it's been dismissed.
                     NoopButton("Open live view", systemImage: "rectangle.expand.vertical",
                                kind: .secondary, fullWidth: true) {
                         showLiveWorkout = true
                     }
-                    NoopButton("End workout", systemImage: "stop.circle.fill",
-                               kind: .destructive, fullWidth: true) {
-                        confirmingEndWorkout = true
-                    }
+                }
+                NoopButton("End workout", systemImage: "stop.circle.fill",
+                           kind: .destructive, fullWidth: true) {
+                    confirmingEndWorkout = true
                 }
             }
         }
@@ -399,11 +458,6 @@ struct LiveView: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 4)
-    }
-
-    private static func elapsed(since start: Date) -> String {
-        let s = max(0, Int(Date().timeIntervalSince(start)))
-        return String(format: "%d:%02d", s / 60, s % 60)
     }
 
     private func reconnectGuideBanner(_ guide: String) -> some View {
@@ -632,6 +686,58 @@ struct LiveView: View {
         #endif
     }
 
+    // MARK: - Ring controls (#2305)
+
+    /// The ring's above-the-fold card while it is not yet authenticated: the honest phase line and the
+    /// only ring reconnect in the app. Same slot and shape as `offlineConnectCallout`, which is WHOOP-only.
+    @ViewBuilder private var ringConnectCallout: some View {
+        card {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                        .foregroundStyle(StrandPalette.accent)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(LiveRingCopy.status(ringPhase, streaming: false))
+                            .font(StrandFont.headline)
+                            .foregroundStyle(StrandPalette.textPrimary)
+                        Text("Reconnect drops the current link, if any, and connects to the ring again. To pair or switch bands, open Devices.")
+                            .font(StrandFont.subhead)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 0)
+                }
+                ringReconnectButton
+            }
+        }
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
+            .strokeBorder(StrandPalette.accent.opacity(0.30), lineWidth: 1))
+    }
+
+    /// The ring's row in the `controls` slot: one primary action. No Buzz (the ring has no haptic) and no
+    /// Disconnect (a stopped ring source would not reconnect for the night; Devices is where a ring is
+    /// deactivated).
+    private var ringControls: some View {
+        VStack(alignment: .leading, spacing: NoopMetrics.rowSpacing) {
+            Text(LiveRingCopy.status(ringPhase, streaming: ringStreaming))
+                .font(StrandFont.footnote)
+                .foregroundStyle(StrandPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ringReconnectButton
+        }
+    }
+
+    /// Drops the current ring link, if any, and connects again — `OuraLiveSource.reconnect()` through the
+    /// coordinator, so it can only reach the ring that is the live source. Enabled in every phase: a ring
+    /// parked in `.authenticating` (#2303) is exactly the case this exists for.
+    private var ringReconnectButton: some View {
+        NoopButton("Reconnect ring", systemImage: "arrow.clockwise",
+                   kind: .primary, fullWidth: true) {
+            model.reconnectOuraRing()
+        }
+    }
+
     // The connect / buzz / disconnect controls, all routed through the unified NOOP button system:
     // a filled primary for the lead Scan action, a secondary surface for Buzz, and the destructive
     // role for Disconnect — sentence-case, single line, optical-centred at controlHeight.
@@ -698,12 +804,24 @@ struct LiveView: View {
 private struct LiveHeaderStats: View {
     @EnvironmentObject private var live: LiveState
     let activeConnection: Bool
+    /// Resolved by the parent (#2075), so the charge below can belong to the device being named.
+    let activeIsWhoop: Bool
     let deviceName: String
     /// #218: an Oura ring streams live HR WITHOUT a WHOOP bond, so `activeConnection` (which needs the bond)
     /// is false for it and the wear stat read "—" mid-stream. A live HR stream is itself the wear signal
     /// (Oura only emits PPG HR while worn). `streamingLiveHR` is Oura-only, so this never widens WHOOP.
     private var ringStreaming: Bool { live.connected && live.streamingLiveHR }
     private var liveLink: Bool { activeConnection || ringStreaming }
+
+    /// The ACTIVE device's charge (#2075). A non-WHOOP active device never falls back to the strap's
+    /// number: an em dash says "not reported", where the strap's charge under the ring's name is a
+    /// confident lie, and was exactly what the report saw.
+    private var batteryLabel: String {
+        LiveConsoleReadout.batteryPercent(
+            activeIsWhoop: activeIsWhoop, whoopPct: live.batteryPct, ringPct: live.ouraBatteryPct,
+        ).map { "\($0)%" } ?? "—"
+    }
+
     /// A streaming Oura ring is definitionally worn (PPG needs skin contact), and `worn` isn't reset on a
     /// source switch — so a stale `worn=false` from a prior WHOOP WRIST_OFF must not read "Off wrist"
     /// mid-stream. For WHOOP `ringStreaming` is always false, so this is just `live.worn`. #218.
@@ -719,7 +837,7 @@ private struct LiveHeaderStats: View {
     var body: some View {
         HStack(spacing: 16) {
             stat(String(localized: "Device"), deviceName)
-            stat(String(localized: "Battery"), live.batteryPct.map { "\(Int($0))%" } ?? "—")
+            stat(String(localized: "Battery"), batteryLabel)
             stat(String(localized: "Worn"), liveLink ? (wornNow ? String(localized: "Yes") : String(localized: "No")) : "—")
             stat(String(localized: "Last sync"), lastSyncLabel)
         }
@@ -746,13 +864,17 @@ private struct LiveHeaderStats: View {
 /// re-renders only this leaf. The vessel replaces the old flat pulse-ring, the count-up number replaces
 /// the CountUpText numeral.
 private struct LiveHeartReadout: View {
+    /// Resolved by the parent (#2075); this leaf does not re-derive it.
+    let activeIsWhoop: Bool
+    /// Resolved by the parent (#2305), same reason.
+    let activeIsOura: Bool
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var live: LiveState
     let hrMax: Int
 
     /// Smoothed, spike-filtered live HR from AppModel (median over a short window).
     private var displayHR: Int? { model.bpm }
-    private var activeConnection: Bool { live.connected && live.bonded }
+    private var activeConnection: Bool { activeIsWhoop && live.connected && live.bonded }
 
     /// The live HR zone for the focal readout's colour world (presentation only). 0 = below Zone 1.
     private var liveZone: Int {
@@ -833,6 +955,10 @@ private struct LiveHeartReadout: View {
     private var signalTrustSummary: String {
         if activeConnection && live.encryptedBond { return String(localized: "Encrypted stream: deep controls and history sync available.") }
         if activeConnection { return String(localized: "Live heart rate is flowing; full strap controls need an encrypted bond.") }
+        // A ring reads its OWN phase (#2305, #2304): `live.connected` here is whichever source last
+        // wrote it, and under a ring parked in the nonce handshake it read "Connected, waiting for a
+        // streaming state" for an hour (#2303). The ring's phase is what the console should say.
+        if activeIsOura { return LiveRingCopy.status(model.ouraLinkPhase, streaming: live.connected && live.streamingLiveHR) }
         if live.connected { return String(localized: "Connected, waiting for a streaming state.") }
         // The actionable "Scan and connect…" CTA now lives in `offlineConnectCallout` above the fold, so
         // this caption stays a calm empty-state descriptor rather than a second, competing CTA.
@@ -845,13 +971,13 @@ private struct LiveHeartReadout: View {
 /// this leaf, never the whole console.
 private struct LivePhysiology: View {
     @EnvironmentObject private var live: LiveState
+    /// Resolved by the parent (#2075). Passed rather than observed so this leaf keeps owning only
+    /// LiveState, which is what makes the ~1 Hz R-R / frame notifies re-render it alone.
+    let activeIsWhoop: Bool
 
-    private var activeConnection: Bool { live.connected && live.bonded }
+    private var activeConnection: Bool { activeIsWhoop && live.connected && live.bonded }
     /// Oura ring actively streaming live HR — trusted stream without a WHOOP bond (see LiveView.ringStreaming).
     private var ringStreaming: Bool { live.connected && live.streamingLiveHR }
-
-    /// The liquid heart pink (matches LiquidThread's default + the mockup #ff6b81).
-    private let liquidHeart = Color(.sRGB, red: 1, green: 107 / 255, blue: 129 / 255, opacity: 1)
 
     var body: some View {
         VStack(alignment: .leading, spacing: NoopMetrics.space4) {
@@ -967,6 +1093,15 @@ private struct LiveSignalTrustRail: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var live: LiveState
     let activeConnection: Bool
+    /// Resolved by the parent (#2075): the battery tile below must describe the ACTIVE device.
+    let activeIsWhoop: Bool
+
+    /// The ACTIVE device's charge, or nil when it has not reported one.
+    private var activeBatteryPct: Int? {
+        LiveConsoleReadout.batteryPercent(
+            activeIsWhoop: activeIsWhoop, whoopPct: live.batteryPct, ringPct: live.ouraBatteryPct,
+        )
+    }
 
     private var displayHR: Int? { model.bpm }
     /// Oura ring actively streaming live HR — trusted stream without a WHOOP bond (see LiveView.ringStreaming).
@@ -1003,7 +1138,7 @@ private struct LiveSignalTrustRail: View {
     }
 
     private var batteryTint: Color {
-        guard let pct = live.batteryPct else { return StrandPalette.textTertiary }
+        guard let pct = activeBatteryPct.map({ Double($0) }) else { return StrandPalette.textTertiary }
         if pct <= 15 { return StrandPalette.metricRose }
         if pct <= 30 { return StrandPalette.statusWarning }
         return StrandPalette.accent
@@ -1050,11 +1185,14 @@ private struct LiveSignalTrustRail: View {
                   tint: live.backfilling ? StrandPalette.metricCyan : StrandPalette.textSecondary,
                   frac: live.backfilling ? 0.6 : (live.lastSyncedAt == nil ? nil : 1)),
             .init(title: String(localized: "Battery"),
-                  value: live.batteryPct.map { "\(Int($0))%" } ?? String(localized: "Unknown"),
-                  detail: live.charging == true ? String(localized: "Charging") : String(localized: "Last reported by strap"),
+                  value: activeBatteryPct.map { "\($0)%" } ?? String(localized: "Unknown"),
+                  // "by strap" only when a strap is what reported it (#2075).
+                  detail: live.charging == true ? String(localized: "Charging")
+                          : activeIsWhoop ? String(localized: "Last reported by strap")
+                          : String(localized: "Last reported by the ring"),
                   icon: "battery.75percent",
                   tint: batteryTint,
-                  frac: live.batteryPct.map { max(0.02, min(1, $0 / 100)) }),
+                  frac: activeBatteryPct.map { max(0.02, min(1, Double($0) / 100)) }),
             // Wear is only trustworthy on a live link: `worn` defaults true (LiveState) and is only
             // updated by WRIST_ON/OFF events, so while OFFLINE it would otherwise read a false-green
             // "On wrist". Gate the value AND tint on a live link (triage fix for PR#191).
@@ -1107,10 +1245,37 @@ private struct ActiveWorkoutLive: View {
     }
 }
 
-/// The strap log + export controls + Test Centre link. Owns LiveState so the streaming log lines
-/// re-render only this card. Wrapped in the liquid frosted card style.
+/// The strap log + export controls + Test Centre link. Wrapped in the liquid frosted card style.
+///
+/// This observes `LiveState` rather than scoping anything: a published change there invalidates every
+/// observer, so what this card controls is the COST of its own re-evaluation, not whether it happens.
 private struct LiveLogCard: View {
+    /// How many trailing lines the card RENDERS. The buffer stays `LiveState.maxLogLines` (5,000) and Copy /
+    /// Save / the export still read all of it, so nothing is lost by drawing less.
+    ///
+    /// #2521: this card used to render the whole buffer in a non-lazy `VStack`, so every appended line built
+    /// and diffed up to 5,000 rows while the visible viewport is 200pt, about fifteen lines. A history drain
+    /// plus a re-score burst emits hundreds of lines a minute, and the 80%-of-a-core CPU limit is per
+    /// process, so that cost landed on the main thread and the app was killed with `cpu_resource_fatal`
+    /// while it was not even frontmost.
+    private static let renderedTailLines = 200
+
     @EnvironmentObject private var live: LiveState
+    @EnvironmentObject private var model: AppModel
+    /// Backgrounded, nothing is on screen to keep current, and a `LiveState` publish still re-evaluates this
+    /// body because an `ObservableObject` invalidates every observer on ANY published change, not only the
+    /// property a view reads. So what is cut is the COST of that re-evaluation, which is what the CPU limit
+    /// measures: roughly fifteen built rows instead of five thousand, and none at all here.
+    ///
+    /// Not free, to be exact about what remains: the header, the `Divider` and the `NavigationLink` are still
+    /// built per line, and `NavigationLink(destination:)` constructs `TestCentreView()` eagerly, which
+    /// evaluates its `@State` defaults (three `UserDefaults` reads). Microseconds against the five thousand
+    /// `Text` views this removes, but the place to look first if a background cost survives this.
+    ///
+    /// Gated on `.background` rather than `!= .active` deliberately: `.inactive` is also when iOS takes the
+    /// app-switcher snapshot, and blanking the log there would be visible for no benefit. The kill needs
+    /// sustained non-frontmost CPU, which is `.background`.
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage(CardAppearancePrefs.opacityKey) private var cardOpacityPercent = CardAppearancePrefs.defaultPercent
     private var cardOpacity: Double { max(0, min(1, Double(cardOpacityPercent) / 100)) }
 
@@ -1127,24 +1292,11 @@ private struct LiveLogCard: View {
                 Button("Save…") { saveStrapLog() }
                     .buttonStyle(.plain).font(StrandFont.mono).foregroundStyle(StrandPalette.accent)
             }
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(live.log.enumerated()), id: \.offset) { idx, line in
-                            Text(line).font(StrandFont.mono)
-                                .foregroundStyle(StrandPalette.textSecondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(idx)
-                        }
-                    }
-                }
-                #if os(iOS)
-                .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-                #endif
-                .frame(height: 200)
-                .onChangeCompat(of: live.log.count) { _ in
-                    if let last = live.log.indices.last { proxy.scrollTo(last, anchor: .bottom) }
-                }
+            if scenePhase == .background {
+                // Same height so returning to the app does not shift the card's layout.
+                Color.clear.frame(height: 200)
+            } else {
+                logScroller
             }
 
             // Users look on Live first when something's wrong (#507/#509), so link straight into the
@@ -1168,6 +1320,46 @@ private struct LiveLogCard: View {
         .background(NoopPanelSurface(cornerRadius: 22, surfaceOpacity: cardOpacity))
     }
 
+    /// The tail of the log, lazily.
+    ///
+    /// The slice comes from `LiveState.renderedTail`, which snapshots the buffer so a lazily-realized row
+    /// cannot index a trimmed array. Its indices are ABSOLUTE positions in `live.log`, which is what makes
+    /// them usable as identity: BETWEEN trims, appending a line leaves every other row's id alone, so SwiftUI adds one row
+    /// and drops one instead of re-identifying the list. A trim still renumbers, because `Array.removeFirst`
+    /// shifts every element down, but that is once per `LiveState.trimSlack` lines and now touches 200 ids
+    /// rather than rebuilding 5,000 rows.
+    ///
+    /// The old `id: \.offset` over `Array(live.log.enumerated())` paid on every line instead: a fresh
+    /// 5,000-element array allocated per body evaluation, and a non-lazy `VStack` that built every row even
+    /// though the 200pt viewport shows about fifteen.
+    ///
+    /// `scrollTo` still addresses the true last index, which is always inside the tail.
+    private var logScroller: some View {
+        let tail = LiveState.renderedTail(live.log, tailLines: Self.renderedTailLines)
+        return ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(tail.indices, id: \.self) { idx in
+                        Text(tail[idx]).font(StrandFont.mono)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .id(idx)
+                    }
+                }
+            }
+            #if os(iOS)
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            #endif
+            .frame(height: 200)
+            // On `logRevision`, not `log.count` (#2547). The revision is monotonic and ticks exactly once per
+            // coalesced publish; the count plateaus while the ring trims, so it can stay equal across an
+            // append and skip a scroll.
+            .onChangeCompat(of: live.logRevision) { _ in
+                if let last = live.log.indices.last { proxy.scrollTo(last, anchor: .bottom) }
+            }
+        }
+    }
+
     // MARK: - Strap-log export (issue #17 — let macOS users share the log for bug reports)
 
     // The strap-log text builder lives on LiveState (`exportableLogText()`) so the macOS Settings
@@ -1177,8 +1369,14 @@ private struct LiveLogCard: View {
     }
 
     private func saveStrapLog() {
-        FileExport.exportText(live.exportableLogText(),
-                              suggestedName: FileExport.timestampedName("noop-strap-log", ext: "txt"))
+        Task {
+            // Settings (#507) and Test Centre fetch these extras before exporting; without them this
+            // site wrote a same-named file silently missing the "Strap & data" + funnel sections, so
+            // which button someone pressed changed what a triager received.
+            let extra = await DebugDataDiagnostics.dynamicLines(repo: model.repo)
+            FileExport.exportText(live.exportableLogText(extraHeaderLines: extra),
+                                  suggestedName: FileExport.timestampedName("noop-strap-log", ext: "txt"))
+        }
     }
 }
 
@@ -1249,5 +1447,23 @@ private struct SignalTrustTile: View {
         .background(NoopPanelSurface(cornerRadius: 20, surfaceOpacity: cardOpacity))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(tile.title): \(tile.value). \(tile.detail)")
+    }
+}
+
+// MARK: - Ring status copy (#2305)
+
+/// One line per ring link phase, shared by the console centrepiece caption, the above-the-fold callout
+/// and the controls row so the three never disagree about what the ring is doing.
+enum LiveRingCopy {
+    static func status(_ phase: OuraLiveSource.LinkPhase, streaming: Bool) -> String {
+        switch phase {
+        case .disconnected:   return String(localized: "Ring not connected.")
+        case .connecting:     return String(localized: "Connecting to the ring…")
+        case .authenticating: return String(localized: "Connected, authenticating…")
+        case .authenticated:
+            return streaming
+                ? String(localized: "Live heart rate is flowing from the ring.")
+                : String(localized: "Connected, waiting for live heart rate.")
+        }
     }
 }

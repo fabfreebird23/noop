@@ -96,6 +96,37 @@ final class SleepSessionDedupTests: XCTestCase {
         XCTAssertEqual(result.kept.map(\.startTs), [long.startTs])
     }
 
+    // MARK: - Heal witness: the computed bank-recency witness must not reach a provided device's rows
+
+    func testHealWitnessIsHandedOnlyToTheComputedId() {
+        let kept: Set<Int> = [midnight - 2 * 3600, midnight + 15 * 3600]
+        XCTAssertEqual(SleepSessionDedup.healWitness(for: "my-whoop-noop", computedId: "my-whoop-noop",
+                                                     keptStarts: kept), kept)
+        XCTAssertEqual(SleepSessionDedup.healWitness(for: "oura-Y12", computedId: "my-whoop-noop",
+                                                     keptStarts: kept), [])
+        XCTAssertEqual(SleepSessionDedup.healWitness(for: "oura-Y12", computedId: "my-whoop-noop",
+                                                     keptStarts: []), [])
+    }
+
+    func testRingSweepKeepsTheFullerReserveBankedWhileThePassWasInFlight() {
+        // 09-19/20 (iOS 11.8.0): the pass READ the ring's 22:20 → 03:57 row, iOS suspended it, and by the
+        // time its heal ran the ring had re-served the night out to 08:21. The read row's startTs is in
+        // `keptStarts` (the pass banked it verbatim under computedId). Handed to the ring's own sweep as the
+        // witness, it outranked the full night and the heal deleted 598 min in favour of 337 — the wake
+        // time the user saw was 04:48. With `healWitness` the ring id gets no witness: longest wins.
+        let read = session(start: midnight - 2 * 3600 + 53, end: midnight + 3 * 3600 + 57 * 60)   // 337 min
+        let full = session(start: midnight - 2 * 3600 + 231, end: midnight + 8 * 3600 + 21 * 60)  // 598 min
+        let keptStarts: Set<Int> = [read.startTs]
+        let ringWitness = SleepSessionDedup.healWitness(for: "oura-Y12", computedId: "my-whoop-noop",
+                                                        keptStarts: keptStarts)
+        let healed = SleepSessionDedup.dedupe([read, full], freshStarts: ringWitness)
+        XCTAssertEqual(healed.kept.map(\.startTs), [full.startTs], "the fuller re-serve survives the heal")
+        XCTAssertEqual(healed.dropped.map(\.startTs), [read.startTs])
+        // The regression, pinned so it cannot creep back: the leaked witness keeps the stale read row.
+        let leaked = SleepSessionDedup.dedupe([read, full], freshStarts: keptStarts)
+        XCTAssertEqual(leaked.kept.map(\.startTs), [read.startTs])
+    }
+
     func testUserEditedSessionIsNeverDropped() {
         // A hand-corrected night outranks everything, including a fresh re-detection.
         let edited = session(start: midnight - 8 * 3600, end: midnight, edited: true)
@@ -270,6 +301,42 @@ final class SleepSessionDedupTests: XCTestCase {
         XCTAssertEqual(SleepSessionDedup.keyedStart(onsetUnixSeconds: 990, gridSeconds: 60), 1020)   // +30 rounds up
         XCTAssertEqual(SleepSessionDedup.keyedStart(onsetUnixSeconds: 989, gridSeconds: 60), 960)    // just under → down
         XCTAssertEqual(SleepSessionDedup.keyedStart(onsetUnixSeconds: 1234, gridSeconds: 0), 1234)   // grid clamp ≥1 = identity
+    }
+
+    /// Item 22, 2026-09-12: a real captured negative-duration nap. Two written codes span
+    /// 14:24:17→14:26:17 (`mapped`), but the closest-matched `0x49` window's onset landed at
+    /// ~14:41:xx — ~16 min AFTER `mapped.endTs` — because `codesWithTimes`'s own clip-would-empty
+    /// fallback had silently returned the unclipped burst. The unguarded `keyedStart` call rounded
+    /// that onset to exactly 14:42:00 and wrote it as `startTs`, 943 s after `endTs`. `safeKeyedStart`
+    /// must refuse the rekey here and return nil (keep `mapped.startTs` unchanged).
+    func testSafeKeyedStartRefusesTheItem22NegativeDurationRegression() {
+        let mappedStart = 1_789_215_857   // 14:24:17 local — matches the captured stagesJSON
+        let mappedEnd = 1_789_215_977     // 14:26:17 local
+        let mismatchedOnset = 1_789_216_910   // ~14:41:50 — the mis-paired window's onset, after endTs
+        let mapped = session(start: mappedStart, end: mappedEnd)
+        XCTAssertNil(SleepSessionDedup.safeKeyedStart(onset: mismatchedOnset, mapped: mapped))
+    }
+
+    /// The ordinary, intended case: the assembler's clip genuinely bound, so the onset sits at or
+    /// just before the first surviving code (a few epochs, per `persistHypnogramBurst`'s own doc
+    /// comment) — `safeKeyedStart` should key `startTs` to the rounded onset as designed.
+    func testSafeKeyedStartAppliesTheRekeyWhenTheClipGenuinelyBound() {
+        let onset = 1_789_215_800   // precedes mapped.startTs, as a bound clip guarantees
+        let mapped = session(start: 1_789_215_857, end: 1_789_215_977)
+        let keyed = SleepSessionDedup.safeKeyedStart(onset: onset, mapped: mapped)
+        XCTAssertEqual(keyed, SleepSessionDedup.keyedStart(onsetUnixSeconds: onset))
+        XCTAssertLessThan(keyed!, mapped.endTs)
+    }
+
+    /// A second, smaller-magnitude failure mode `safeKeyedStart` also has to catch: the onset passes
+    /// the first guard (`onset <= mapped.startTs`, so the clip genuinely bound), but 30 s grid-rounding
+    /// pushes it to or past `endTs` on a very short (20 s) session — refuse rather than mint a
+    /// zero/negative-duration session.
+    func testSafeKeyedStartRefusesWhenRoundingWouldReachOrPassEndTs() {
+        let mapped = session(start: 1_000_000, end: 1_000_020)   // 20 s session
+        let onset = 999_995   // <= mapped.startTs (clip bound), but keyedStart(999_995, 60) = 1_000_020 == endTs
+        XCTAssertEqual(SleepSessionDedup.keyedStart(onsetUnixSeconds: onset), mapped.endTs)
+        XCTAssertNil(SleepSessionDedup.safeKeyedStart(onset: onset, mapped: mapped))
     }
 
     func testPlanBankSameBucketFullerStoredRowSuppressesAPartialReserve() {

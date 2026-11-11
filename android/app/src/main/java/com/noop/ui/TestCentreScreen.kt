@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.automirrored.filled.DirectionsWalk
 import androidx.compose.material.icons.filled.Science
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material3.AlertDialog
@@ -65,7 +66,6 @@ import com.noop.testcentre.TestDomain
 import com.noop.testcentre.TestMode
 import com.noop.testcentre.TestModeRegistry
 import com.noop.testcentre.TestReportFlow
-import com.noop.testcentre.TestReportLink
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
@@ -80,7 +80,7 @@ import kotlin.math.roundToInt
  * scheduled-export / experimental controls on the same bindings the Settings cards use. No em-dash.
  */
 @Composable
-fun TestCentreScreen(vm: AppViewModel) {
+fun TestCentreScreen(vm: AppViewModel, onOpenGroundTruthCollector: () -> Unit = {}) {
     val context = LocalContext.current
     val testCentre = remember { TestCentre.from(context) }
     // CAPTURE-D: a UI scope to emit the data-volume line off the toggle-on path (a store read, so it can't
@@ -97,6 +97,26 @@ fun TestCentreScreen(vm: AppViewModel) {
     // Match the Settings `showFiveMGControls` gate exactly: pref OR a live-detected 5/MG this session, so a
     // 5/MG connected before its pref is written still sees the experimental block. (SettingsScreen.kt:346.)
     val is5MG = selectedModelName == WhoopModel.WHOOP5_MG.name || live.whoop5Detected
+    val puffinExperiment = remember { PuffinExperiment.from(context) }
+    var protocolProbes by remember { mutableStateOf(puffinExperiment.isEnabled) }
+    var passiveRawCapture by remember { mutableStateOf(puffinExperiment.isCaptureEnabled) }
+    var deepData by remember { mutableStateOf(puffinExperiment.isDeepDataEnabled) }
+    var broadcastHr by remember { mutableStateOf(puffinExperiment.broadcastHr) }
+    var explicitBond by remember { mutableStateOf(puffinExperiment.explicitBond) }
+    var unbondedOffload by remember { mutableStateOf(puffinExperiment.unbondedOffload) }
+    var clearStaleBond by remember { mutableStateOf(puffinExperiment.clearStaleBond) }
+    var ecgRawData by remember { mutableStateOf(puffinExperiment.ecgRawData) }
+    var ecgProbe by remember { mutableStateOf(puffinExperiment.ecgEnabled) }
+    // Local state, NOT a direct read of vm.ble.ecgMayBeRunning: that property is backed by
+    // SharedPreferences, so reading it in composition is a disk read on every recomposition, and it
+    // publishes nothing, so Stop would not become available after Start until some unrelated state
+    // changed. Seeded once and updated on the two actions that move it.
+    var ecgMayBeRunning by remember { mutableStateOf(vm.ble.ecgMayBeRunning) }
+    val r22DisableReport by vm.ble.r22DisableReport.collectAsStateWithLifecycle()
+    val ecgGateReport by vm.ble.ecgRawDataGate.collectAsStateWithLifecycle()
+    val ecgVariant by vm.ble.whoop5VariantFlow.collectAsStateWithLifecycle()
+    var rawCaptureBusy by remember { mutableStateOf(false) }
+    var rawAndLogBusy by remember { mutableStateOf(false) }
 
     // A report awaiting the mandatory review-before-share gate (spec section 12). Non-null shows the
     // review dialog; confirming runs TestReportFlow.run.
@@ -140,10 +160,35 @@ fun TestCentreScreen(vm: AppViewModel) {
             blurb = "Each test logs extra detail for one part of the app while you wear the strap, then bundles it for a bug report.",
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                TestCentreLayout.visibleModes(is5MG).forEach { mode ->
+                val modes = TestCentreLayout.visibleModes(is5MG)
+                // Resolve each mode's active flag ONCE. `active()` is a pref read, and for UNIVERSAL it
+                // falls through to anyActive(), which sweeps every domain doing one each. The row below
+                // needs the same answer, so asking twice per recomposition would spend on this screen
+                // what the rest of this is saving.
+                val modesWithActive = modes.map { it to testCentre.active(it.domain) }
+                val anyRowObservesLog = modesWithActive.any { (m, on) ->
+                    TestCentreLiveRefreshPolicy.sources(m, on).observeLogRevision
+                }
+                // ONE archive snapshot for the screen, not one per row.
+                //
+                // Each active row used to call this itself, and every call is a fresh ArrayList of the
+                // WHOLE archive (previous sessions included, read from disk) built under a lock on the
+                // main thread, every 250ms. Then each row ran the domain Regex over all of it to find
+                // its own lines. With the archive at ~21k lines that is a per-row full-archive copy plus
+                // a per-row full-archive scan, per tick, while the strap is connected and writing
+                // hardest — which is exactly when this screen is open. The cost scaled with total
+                // history rather than with anything on screen, so it grew every session.
+                //
+                // Nothing is truncated: readouts like "Reconnects this run" count from these lines, so a
+                // bounded tail would quietly change what they report.
+                val logSnapshot =
+                    if (anyRowObservesLog) rememberActiveLogSnapshot(vm.ble) else TestCentreLogSnapshot.EMPTY
+                modesWithActive.forEach { (mode, isActive) ->
                     TestModeRow(
                         mode = mode,
-                        active = testCentre.active(mode.domain),
+                        active = isActive,
+                        sharedLogLines = logSnapshot.lines,
+                        domainLogLines = logSnapshot.byDomain[mode.id].orEmpty(),
                         startedAtSeconds = testCentre.startedAt(mode.domain),
                         live = live,
                         activeStrapId = activeStrapId,
@@ -181,6 +226,228 @@ fun TestCentreScreen(vm: AppViewModel) {
 
         // --- Section 2: Diagnostic tools ---
         DiagnosticToolsCard(vm)
+
+        SettingsSectionTC(
+            icon = Icons.AutoMirrored.Filled.DirectionsWalk,
+            title = stringResource(R.string.ground_truth_title),
+            blurb = stringResource(R.string.ground_truth_test_centre_desc),
+        ) {
+            NoopButton(
+                text = stringResource(R.string.ground_truth_open),
+                kind = NoopButtonKind.Secondary,
+                fullWidth = true,
+                onClick = onOpenGroundTruthCollector,
+            )
+        }
+
+        if (is5MG) {
+            SettingsSectionTC(
+                icon = Icons.Filled.Science,
+                title = stringResource(R.string.raw_diag_title),
+                blurb = "Developer tools for protocol research. These are separate from the bounded Raw Data Collector above.",
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    DeveloperToggleRow(
+                        title = stringResource(R.string.raw_diag_protocol_probes),
+                        detail = stringResource(R.string.raw_diag_protocol_probes_detail),
+                        checked = protocolProbes,
+                        onCheckedChange = {
+                            protocolProbes = it
+                            puffinExperiment.isEnabled = it
+                        },
+                    )
+                    DeveloperToggleRow(
+                        title = stringResource(R.string.raw_diag_broadcast_hr),
+                        detail = "Writes the reversible WHOOP 5/MG advertising flag for Garmin, Zwift, and gym equipment.",
+                        checked = broadcastHr,
+                        onCheckedChange = {
+                            broadcastHr = it
+                            puffinExperiment.broadcastHr = it
+                            vm.ble.setBroadcastHr(it)
+                        },
+                    )
+                    DeveloperToggleRow(
+                        title = stringResource(R.string.raw_diag_pair),
+                        detail = "Experimental explicit Android bonding. Normal 5/MG support does not " +
+                            "require this switch. A strap that refuses pairing defers its handshake for one " +
+                            "connect while this is on, so leave it off unless you are testing #1635.",
+                        checked = explicitBond,
+                        onCheckedChange = {
+                            explicitBond = it
+                            puffinExperiment.explicitBond = it
+                        },
+                    )
+                    DeveloperToggleRow(
+                        title = stringResource(R.string.raw_diag_unbonded_offload),
+                        detail = "Subscribes the puffin notify characteristics on a link with no " +
+                            "CLIENT_HELLO, then asks the strap a read-only GET_CLOCK. If it answers, the " +
+                            "clock is set and history is requested. Once per link, and never again on a " +
+                            "strap that refuses. Takes effect on the next connect, not this one. " +
+                            "Leave it off unless you are testing #1635.",
+                        checked = unbondedOffload,
+                        onCheckedChange = {
+                            unbondedOffload = it
+                            puffinExperiment.unbondedOffload = it
+                        },
+                    )
+                    DeveloperToggleRow(
+                        title = stringResource(R.string.raw_diag_clear_stale_bond),
+                        detail = "When a bonded fast-path connect keeps dropping before it reaches a " +
+                            "session, the phone is holding a pairing the strap no longer honours. NOOP " +
+                            "already shows the forget-and-re-pair guide at two failures; with this on it " +
+                            "does that step for you at five, once, and only until the strap bonds again. " +
+                            "It cannot make a strap that refuses pairing pair. Leave it off unless you " +
+                            "are testing #1635.",
+                        checked = clearStaleBond,
+                        onCheckedChange = {
+                            clearStaleBond = it
+                            puffinExperiment.clearStaleBond = it
+                        },
+                    )
+                    DeveloperToggleRow(
+                        title = stringResource(R.string.raw_diag_r22),
+                        detail = "Accepted writes have not been shown to enable a separate live stream. Not required for normal sync or raw capture.",
+                        checked = deepData,
+                        onCheckedChange = {
+                            deepData = it
+                            puffinExperiment.isDeepDataEnabled = it
+                        },
+                    )
+                    if (deepData) {
+                        NoopButton(
+                            text = stringResource(R.string.raw_diag_r22_enable),
+                            kind = NoopButtonKind.Secondary,
+                            fullWidth = true,
+                            enabled = live.encryptedBond && live.worn,
+                            onClick = { vm.ble.enableWhoop5DeepData() },
+                        )
+                    }
+                    NoopButton(
+                        text = stringResource(R.string.raw_diag_r22_clear),
+                        kind = NoopButtonKind.Secondary,
+                        fullWidth = true,
+                        enabled = live.encryptedBond && r22DisableReport != WhoopBleClient.WAITING_DEVICE_CONFIG_PROBE,
+                        onClick = { vm.ble.disableWhoop5DeepData() },
+                    )
+                    r22DisableReport?.let {
+                        Text(it, style = NoopType.caption, color = Palette.textSecondary)
+                    }
+                    DeveloperToggleRow(
+                        title = stringResource(R.string.raw_diag_ecg),
+                        detail = "MG-only protocol research. This is instrumentation, not a medical ECG feature.",
+                        checked = ecgRawData,
+                        onCheckedChange = {
+                            ecgRawData = it
+                            puffinExperiment.ecgRawData = it
+                        },
+                    )
+                    if (ecgRawData) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            NoopButton(
+                                text = stringResource(R.string.raw_diag_ecg_on),
+                                kind = NoopButtonKind.Secondary,
+                                enabled = live.bonded && ecgVariant.isMG,
+                                onClick = { vm.ble.setEcgRawDataGate(true) },
+                            )
+                            NoopButton(
+                                text = stringResource(R.string.raw_diag_ecg_off),
+                                kind = NoopButtonKind.Secondary,
+                                enabled = live.bonded && ecgVariant.isMG,
+                                onClick = { vm.ble.setEcgRawDataGate(false) },
+                            )
+                        }
+                        ecgGateReport?.let {
+                            Text(it.summary, style = NoopType.caption, color = Palette.textSecondary)
+                        }
+                    }
+                    // The MG ECG turn-on probe. Its own toggle, NOT folded into the raw-data gate above:
+                    // that one writes a persistent device-config value on the strap, this one sends three
+                    // session commands, and one switch for both would let a persistent write ride in on
+                    // consent given for a session probe.
+                    DeveloperToggleRow(
+                        title = stringResource(R.string.raw_diag_ecg_probe),
+                        detail = "Sends the three MG ECG session toggles and listens for 30 s. Hold both " +
+                            "clasp electrodes with your other hand for the whole window, or the trace is " +
+                            "flat by design. Instrumentation, not a medical ECG feature.",
+                        checked = ecgProbe,
+                        onCheckedChange = {
+                            ecgProbe = it
+                            puffinExperiment.ecgEnabled = it
+                        },
+                    )
+                    if (ecgProbe || ecgMayBeRunning) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            NoopButton(
+                                text = stringResource(R.string.raw_diag_ecg_probe_start),
+                                kind = NoopButtonKind.Secondary,
+                                enabled = live.bonded && ecgVariant.isMG && !ecgMayBeRunning,
+                                onClick = { vm.ble.ecgStartCapture(); ecgMayBeRunning = vm.ble.ecgMayBeRunning },
+                            )
+                            // Offered whenever a capture may be running, even with the toggle off: the OFF
+                            // path outlives the opt-in, or a wearer who switches this off mid-capture could
+                            // never stop the strap.
+                            NoopButton(
+                                text = stringResource(R.string.raw_diag_ecg_probe_stop),
+                                kind = NoopButtonKind.Secondary,
+                                enabled = live.bonded && ecgVariant.isMG,
+                                onClick = { vm.ble.ecgStopCapture(); ecgMayBeRunning = vm.ble.ecgMayBeRunning },
+                            )
+                        }
+                        if (ecgMayBeRunning) {
+                            Text(
+                                stringResource(R.string.raw_diag_ecg_probe_running),
+                                style = NoopType.caption, color = Palette.textSecondary,
+                            )
+                        }
+                    }
+                    DeveloperToggleRow(
+                        title = stringResource(R.string.raw_diag_passive),
+                        detail = "Records frames that already arrive during history sync. It does not start IMU or any other sensor and may create large files.",
+                        checked = passiveRawCapture,
+                        onCheckedChange = {
+                            passiveRawCapture = it
+                            puffinExperiment.isCaptureEnabled = it
+                        },
+                    )
+                    NoopButton(
+                        text = stringResource(R.string.raw_diag_share),
+                        leadingIcon = Icons.Filled.Upload,
+                        kind = NoopButtonKind.Secondary,
+                        fullWidth = true,
+                        enabled = !rawCaptureBusy,
+                        onClick = {
+                            rawCaptureBusy = true
+                            scope.launch {
+                                try {
+                                    LogExport.shareWhoop5Capture(context, live.whoop5Detected, live.encryptedBond)
+                                } finally {
+                                    rawCaptureBusy = false
+                                }
+                            }
+                        },
+                    )
+                    NoopButton(
+                        text = stringResource(R.string.raw_diag_export_log),
+                        leadingIcon = Icons.Filled.Upload,
+                        kind = NoopButtonKind.Secondary,
+                        fullWidth = true,
+                        enabled = !rawAndLogBusy,
+                        onClick = {
+                            rawAndLogBusy = true
+                            scope.launch {
+                                try {
+                                    LogExport.shareRawAndLog(
+                                        context, vm.ble.exportLogText(), live.whoop5Detected, live.encryptedBond,
+                                    )
+                                } finally {
+                                    rawAndLogBusy = false
+                                }
+                            }
+                        },
+                    )
+                }
+            }
+        }
 
         // --- Section 3: Export and auto-export ---
         ExportCard(
@@ -230,6 +497,26 @@ fun TestCentreScreen(vm: AppViewModel) {
     }
 }
 
+@Composable
+private fun DeveloperToggleRow(
+    title: String,
+    detail: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Text(title, style = NoopType.subhead, color = Palette.textPrimary)
+            Text(detail, style = NoopType.caption, color = Palette.textSecondary)
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
 /** A report staged for the mandatory review gate: the profile, its title, the already-redacted entries
  *  and the gate built over them. The Kotlin gate keeps its entries private, so we hold them here too to
  *  hand TestReportFlow.run the same list it reviews. [modeInactive] (#1002): the selected profile's test
@@ -276,6 +563,10 @@ private suspend fun buildPending(
         if (f.exists()) dbBytes += f.length()
     }
     val rows = vm.repo.storageRowCounts()
+    // #1911: bytes beside the counts, reusing the counts just read rather than a second COUNT(*) pass over
+    // thirteen tables - each is a full scan on the large stores this report is pulled from.
+    val rowBytes = com.noop.data.StorageFootprint(
+        com.noop.data.WhoopDatabase.get(context)).byteEstimates(rows)
     var rawBytes = 0L
     for (name in listOf(
         com.noop.ble.WhoopBleClient.WHOOP5_CAPTURE_FILE,
@@ -289,6 +580,7 @@ private suspend fun buildPending(
             dbBytes = dbBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
             rows = rows,
             rawCaptureBytes = rawBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            rowBytes = rowBytes,
         )
     } else {
         null
@@ -306,6 +598,10 @@ private suspend fun buildPending(
 private fun TestModeRow(
     mode: TestMode,
     active: Boolean,
+    /** The screen's ONE archive snapshot; empty when no visible row needs it. */
+    sharedLogLines: List<String>,
+    /** This mode's lines, already filtered out of [sharedLogLines] in the screen's single pass. */
+    domainLogLines: List<String>,
     startedAtSeconds: Long?,
     live: LiveState,
     activeStrapId: String,
@@ -317,11 +613,12 @@ private fun TestModeRow(
     var on by remember { mutableStateOf(active) }
     val elapsed = startedAtSeconds?.let { (System.currentTimeMillis() / 1000.0) - it }
     val refreshSources = TestCentreLiveRefreshPolicy.sources(mode, on)
-    // An active row observes the log's own revision, coalesced during bursty offloads. An inactive row
-    // creates no collector and never snapshots/export-formats the log.
+    // The snapshot arrives from the screen, which takes it once for every row. An inactive row still
+    // reads nothing: `observeLogRevision` is false for it, so it passes an empty list on to its
+    // consumers exactly as before.
     // #1468 follow-up: LINES, not a joined string. Both consumers below immediately work line-wise, so the
     // string this replaced was built (and re-split) on every 250 ms tick for nothing.
-    val logLines = if (refreshSources.observeLogRevision) rememberActiveLogLines(vm.ble) else emptyList()
+    val logLines = if (refreshSources.observeLogRevision) sharedLogLines else emptyList()
     // #965: HONEST per-mode captured-day count for a guided row (distinct days THIS mode produced its own
     // trace on), read from the same log the report exports, so each active mode accumulates its OWN count
     // instead of every guided row sharing one elapsed number. null for a toggle mode (no "K of N") / when off.
@@ -357,6 +654,7 @@ private fun TestModeRow(
             TestCentreLiveReadoutPanel(
                 mode = mode,
                 logLines = logLines,
+                domainLogLines = if (refreshSources.observeLogRevision) domainLogLines else null,
                 live = live,
                 is5MG = is5MG,
                 activeStrapId = activeStrapId,
@@ -365,8 +663,11 @@ private fun TestModeRow(
         }
         Row {
             Spacer(Modifier.weight(1f))
+            // "Share", not "Report", to match the strap-log button below and the preview sheet this
+            // opens, whose own copy already reads "Nothing leaves this phone until you tap Share".
+            // Reuses the Share string this screen already carries, so no new copy and no new locales.
             TextButton(onClick = onReport) {
-                Text(uiString(R.string.l10n_test_centre_screen_report_ee45c303), color = Palette.accent, style = NoopType.body)
+                Text(uiString(R.string.l10n_test_centre_screen_share_09ca55ca), color = Palette.accent, style = NoopType.body)
             }
         }
     }
@@ -379,6 +680,8 @@ private fun TestModeRow(
 private fun TestCentreLiveReadoutPanel(
     mode: TestMode,
     logLines: List<String>,
+    /** Pre-filtered for this mode by the screen's single pass; null falls back to filtering here. */
+    domainLogLines: List<String>?,
     live: LiveState,
     is5MG: Boolean,
     activeStrapId: String,
@@ -407,10 +710,10 @@ private fun TestCentreLiveReadoutPanel(
         val now = System.currentTimeMillis() / 1_000
         val from = now - 60 * 60
         hrSamples = runCatching {
-            vm.repo.hrSamples(activeStrapId, from, now, limit = 10_000)
+            vm.repo.hrSamplesForDevice(activeStrapId, from, now, limit = 10_000)
         }.getOrDefault(emptyList())
         gravitySamples = runCatching {
-            vm.repo.gravitySamples(activeStrapId, from, now, limit = 10_000)
+            vm.repo.gravitySamplesForDevice(activeStrapId, from, now, limit = 10_000)
         }.getOrDefault(emptyList())
     }
 
@@ -442,6 +745,7 @@ private fun TestCentreLiveReadoutPanel(
         active = true,
         snapshot = TestCentreLiveSnapshot(
             logLines = logLines,
+            domainLogLines = domainLogLines,
             nowUnix = nowUnix,
             connected = live.connected,
             batteryPct = live.batteryPct,
@@ -475,10 +779,29 @@ private fun boundedRevision(flow: StateFlow<Long>, coalesceMs: Long): Long {
     return revision
 }
 
+/** The archive snapshot plus its per-domain grouping, taken together so both share one revision. */
+private data class TestCentreLogSnapshot(
+    val lines: List<String>,
+    val byDomain: Map<String, List<String>>,
+) {
+    companion object { val EMPTY = TestCentreLogSnapshot(emptyList(), emptyMap()) }
+}
+
+/**
+ * The archive, and every domain's lines from one pass over it, keyed on the log's REVISION.
+ *
+ * Keyed on the revision and not on the lines: `remember` compares keys with `equals`, and a List
+ * compares element by element, so keying on a 21k-line snapshot walks all of it on any recomposition
+ * where the size happens to match. A Long is the cheap key, and the grouping belongs in the same
+ * `remember` as the copy it is derived from, or the two can be recomputed at different moments.
+ */
 @Composable
-private fun rememberActiveLogLines(ble: WhoopBleClient): List<String> {
+private fun rememberActiveLogSnapshot(ble: WhoopBleClient): TestCentreLogSnapshot {
     val revision = boundedRevision(ble.logRevision, coalesceMs = 250)
-    return remember(ble, revision) { ble.exportLogLines() }
+    return remember(ble, revision) {
+        val lines = ble.exportLogLines()
+        TestCentreLogSnapshot(lines, TestCentreLiveReadouts.tagLinesByDomain(lines))
+    }
 }
 
 @Composable
@@ -496,6 +819,7 @@ private fun DiagnosticToolsCard(vm: AppViewModel) {
     // #1284 residual 3: the experimental Oura onset-keying toggle, shown only when an Oura ring is paired.
     var ouraPaired by remember { mutableStateOf(false) }
     var ouraOnsetKeying by remember { mutableStateOf(NoopPrefs.ouraOnsetKeying(context)) }
+    var ouraNotifyMaskFull by remember { mutableStateOf(NoopPrefs.ouraNotifyMaskFull(context)) }
     LaunchedEffect(Unit) {
         val paired = runCatching { vm.pairedDevices() }.getOrDefault(emptyList())
         polarIdentity = PolarModel.debugIdentification(paired.firstOrNull { PolarModel.isPolar(it.model) }?.model)
@@ -587,6 +911,14 @@ private fun DiagnosticToolsCard(vm: AppViewModel) {
                         "'onset-key(#1284)' lines.",
                     checked = ouraOnsetKeying,
                     onCheckedChange = { ouraOnsetKeying = it; vm.setOuraOnsetKeying(it) },
+                )
+                // Packed-notification A/B (OURA_PROTOCOL.md s2.3). Takes effect at the NEXT connect only;
+                // nothing is written until then and nothing persists on the ring.
+                ToggleRowTC(
+                    title = stringResource(R.string.oura_notify_mask_full_title),
+                    description = stringResource(R.string.oura_notify_mask_full_desc),
+                    checked = ouraNotifyMaskFull,
+                    onCheckedChange = { ouraNotifyMaskFull = it; vm.setOuraNotifyMaskFull(it) },
                 )
             }
             // #1121 Detailed capture: an adb-like rolling on-device log, no computer needed. Off by default.
@@ -939,9 +1271,7 @@ private fun ReportReviewDialog(
                     // for the very thing being reported. Warn plainly, with the fix, BEFORE the user
                     // ships a report a maintainer can't act on. Twin of the Swift review-sheet warning.
                     Text(
-                        uiString(R.string.l10n_test_centre_screen_heads_up_this_test_mode_is_8b82ed69) +
-                            "useful report, turn the mode on, reproduce the problem while wearing the " +
-                            "strap, then report again.",
+                        uiString(R.string.l10n_test_centre_screen_heads_up_this_test_mode_is_8b82ed69),
                         style = NoopType.footnote, color = Palette.statusWarning,
                         modifier = Modifier.padding(bottom = 8.dp),
                     )

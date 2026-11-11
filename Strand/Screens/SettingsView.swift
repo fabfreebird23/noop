@@ -35,12 +35,10 @@ struct SettingsView: View {
     @State private var backupAlertTitle = ""
     @State private var backupAlertMessage = ""
     @State private var showBackupAlert = false
-
-    /// Opt-in WHOOP 5/MG protocol experiments (off by default). See [PuffinExperiment].
-    @AppStorage(PuffinExperiment.defaultsKey) private var puffinExperiments = false
-
-    /// Opt-in WHOOP 5/MG raw-frame capture to a file (off by default). See [PuffinFrameRecorder].
-    @AppStorage(PuffinFrameRecorder.enabledKey) private var puffinCapture = false
+    /// #1807: a restore refused ONLY for size is recoverable, so it gets its own two-button alert rather
+    /// than the shared single-OK one every other backup outcome uses.
+    @State private var showOversizeRestoreConfirm = false
+    @State private var oversizeRestoreMessage = ""
 
     /// Opt-in WHOOP 5/MG "R22" deep-data unlock (off by default) — the one probe that writes a
     /// persistent feature flag to the strap. See [PuffinExperiment.deepDataKey]. (#174)
@@ -53,85 +51,16 @@ struct SettingsView: View {
     /// connected, and a write to bonded hardware is not something a toggle should do unannounced.
     @State private var confirmingDeepDataDisable = false
 
-    /// Opt-in "Broadcast heart rate" (off by default) — makes the strap advertise its HR as a standard
-    /// BLE sensor for Garmin/Zwift/gym kit. See [PuffinExperiment.broadcastHrKey]. (#181)
-    @AppStorage(PuffinExperiment.broadcastHrKey) private var broadcastHrEnabled = false
-
-    /// #891 opt-in: writes the device-config key `enable_raw_data_w_ecg` on an attested WHOOP MG. A
-    /// persistent strap write, so it gets its own deliberate switch like #174 and #181.
-    /// See [PuffinExperiment.ecgRawDataKey].
-    @AppStorage(PuffinExperiment.ecgRawDataKey) private var ecgRawDataEnabled = false
-
     /// #103 opt-in: surfaces the WHOOP 5/MG `spo2_candidate_82` nightly mean in the Blood Oxygen tile
     /// as a "strap estimate (unverified)" fallback when no calibrated `spo2Pct` exists. Display-only —
     /// writes nothing to the strap. See [PuffinExperiment.spo2CandidateDisplayKey].
     @AppStorage(PuffinExperiment.spo2CandidateDisplayKey) private var spo2CandidateDisplayEnabled = false
+    @AppStorage(AppModel.ouraAllDayLiveHRKey) private var ouraAllDayLiveHREnabled = false   // item 27
 
-    /// #463 opt-in: score the intraday stress timeline against a PERSONAL cross-day baseline
-    /// (`.baselineRelative`) instead of the day's own calm hours. Default off — the r≈0.6 margin is
-    /// single-subject so far. Display-only; never feeds recovery/illness. See
-    /// [PuffinExperiment.stressPersonalBaselineKey].
-    @AppStorage(PuffinExperiment.stressPersonalBaselineKey) private var stressPersonalBaselineEnabled = false
     /// #1545 opt-in: score Effort with Banister's exponential TRIMP instead of Edwards' heart-rate zones.
     /// Default OFF — it re-scores the whole window against a different recipe. See
     /// [PuffinExperiment.banisterEffortKey].
     @AppStorage(PuffinExperiment.banisterEffortKey) private var banisterEffortEnabled = false
-
-    /// True when the connected strap has positively attested itself a WHOOP MG. The variant is published as
-    /// its label string (`LiveState.whoop5Variant`); "MG" is `Whoop5Variant.mg.label`. nil / not-yet-
-    /// identified / a plain 5.0 is not an MG.
-    private var ecgVariantIsMG: Bool { live.whoop5Variant == Whoop5Variant.mg.label }
-
-    /// The #891 ECG-gate buttons need the same encrypted bond the R22 writes do (a config write over the
-    /// live-HR-only link silently fails, #269) AND a strap that has positively attested itself an MG. Not
-    /// wear-gated: this stores a value, it does not start an on-wrist stream.
-    private var ecgGateReady: Bool {
-        #if os(macOS)
-        return false
-        #else
-        return live.encryptedBond && ecgVariantIsMG
-        #endif
-    }
-
-    /// The reason line under the #891 buttons. Each case names the ONE thing that is missing.
-    private var ecgGateReason: String {
-        #if os(macOS)
-        return String(localized: "The ECG gate needs an iPhone or Android. A Mac can't form the encrypted bond a 5/MG requires.")
-        #else
-        if !live.encryptedBond {
-            return String(localized: "Needs the full encrypted bond: close the official WHOOP app and pair the strap to NOOP first (a live-HR-only link can't carry a config write).")
-        }
-        if !ecgVariantIsMG {
-            // A nil / non-MG variant lands here too, and deliberately: an unattested strap is not an MG.
-            return String(localized: "Waiting for your strap to identify itself as an MG. Only a WHOOP MG has ECG electrodes, so NOOP won't write this key to anything else.")
-        }
-        return String(localized: "One tap writes the key; NOOP then reads it back off the strap and reports the value it actually stores — the write's own \"success\" is not treated as proof.")
-        #endif
-    }
-
-    /// Icon per read-back verdict. Only a confirmed read-back gets the success mark.
-    private func ecgGateIcon(_ v: EcgRawDataGateReport.Verdict) -> String {
-        switch v {
-        case .confirmed: return "checkmark.seal.fill"
-        case .unchanged: return "xmark.seal.fill"
-        case .pending:   return "ellipsis"
-        default:         return "questionmark.circle"
-        }
-    }
-
-    /// Tint per read-back verdict. Anything that isn't a confirmed read-back is never shown as positive.
-    private func ecgGateTint(_ v: EcgRawDataGateReport.Verdict) -> Color {
-        switch v {
-        case .confirmed: return StrandPalette.statusPositive
-        case .unchanged: return StrandPalette.statusWarning
-        default:         return StrandPalette.textSecondary
-        }
-    }
-
-    /// WHOOP MG ECG ("Labrador") experiment. Unlocks the gated, user-initiated ECG probe on the Devices
-    /// card. Default off; with it off the four ECG opcodes are dropped by the command allowlist, so no
-    /// ECG byte can reach a strap. See [PuffinExperiment.ecgKey].
-    @AppStorage(PuffinExperiment.ecgKey) private var ecgEnabled = false
 
     /// Opt-in "Continuous HRV capture" (off by default) — holds the dense realtime stream armed 24/7 so
     /// the strap banks beat-to-beat R-R for better overnight HRV/recovery/sleep, at a battery cost.
@@ -166,11 +95,23 @@ struct SettingsView: View {
     /// WHOOP 4.0) regardless of this switch. See [PuffinExperiment.motionAwareWakeKey].
     @AppStorage(PuffinExperiment.motionAwareWakeKey) private var motionAwareWakeEnabled = false
 
-    // Imperial/Metric display preference (D#103). Stored data is always SI; this only changes how
-    // distances/weights/heights/temperatures are SHOWN — and lets the profile fields below take
-    // imperial entry. Temperature has a separate override so °C/°F can be picked independently.
+    // Display preferences. `units.system` remains the body-measurement choice for compatibility;
+    // exercise distance/pace can override it independently. Stored data is always SI.
+    /// #1821: Clock format. Defaults to `.system`, so upgrading changes nobody's displayed times.
+    /// #1841: shared with Android by name and meaning; each platform keeps its own store. Default FALSE
+    /// on Apple (Android defaults true) because the system behaviour may not fire on our
+    /// `NavigationStack(path:)` tabs — see RootTabView.
+    /// The Coach master switch, under the same `noop.` key Android writes. Default ON, so nothing changes
+    /// for an install that never opens this row. Read by `RootTabView` (the tab), Today (the launcher card)
+    /// and `CoachBriefScheduler` (the daily background brief).
+    @AppStorage("noop.coachEnabled") private var coachEnabled = true
+    @AppStorage("noop.bottomBarAutoHide") private var bottomBarAutoHide = false
+    @AppStorage(ClockFormatPreference.defaultsKey)
+    private var clockFormatRaw = ClockFormatPreference.system.rawValue
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
+    @AppStorage(UnitPrefs.distanceSystemKey) private var distanceSystemRaw = ""
     @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
+    @AppStorage(UnitPrefs.skinTempDisplayKey) private var skinTempDisplayRaw = ""   // #1846
     // Effort display scale (#268). Display-only — Effort stays stored 0–100, this only chooses whether
     // it's shown on NOOP's 0–100 axis or WHOOP's 0–21 Day Strain axis.
     @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
@@ -178,6 +119,10 @@ struct SettingsView: View {
     @AppStorage(UnitPrefs.hrvWindowKey) private var hrvWindowRaw = HrvWindow.whole.rawValue
     // Live-HR Live Activity (Lock Screen + Dynamic Island), iOS only (#336). Default on.
     @AppStorage(UnitPrefs.liveActivityKey) private var liveActivityEnabled = true
+    // Strap-sync Live Activity, iOS only. Separate from the live-HR one on purpose. Default on.
+    @AppStorage(UnitPrefs.syncLiveActivityKey) private var syncLiveActivityEnabled = true
+    @AppStorage(UnitPrefs.liftLiveActivityKey) private var liftLiveActivityEnabled = true
+    @AppStorage(DayCycleMode.storageKey) private var dayCycleModeRaw = DayCycleMode.sleepOnset.rawValue
     // Alternate app icon (iOS only) — false = Titanium (primary AppIcon), true = Blue Titanium
     // ("AppIcon-Navy"). Display-only preference; the live switch goes through setAlternateIconName.
     @AppStorage("appIcon.alt") private var useNavyIcon = false
@@ -224,6 +169,10 @@ struct SettingsView: View {
     /// verbatim with the Android twin (SharedPreferences "workoutKeepScreenOn").
     @AppStorage("workoutKeepScreenOn") private var workoutKeepScreenOn = false
 
+    /// Opt-in "Keep screen on while syncing" (default OFF, iOS only). `SyncKeepAwake` holds the screen awake
+    /// for as long as a strap history sync runs while this is on.
+    @AppStorage(ScreenIdle.strapSyncKeepAwakeKey) private var syncKeepScreenOn = false
+
     /// The strap model the user last picked (same key the scan pickers write). Gates the WHOOP 4.0-only
     /// rename control in the strap card — renaming uses the Harvard command set, which a 5/MG doesn't share.
     @AppStorage("selectedWhoopModel") private var selectedWhoopModelRaw = WhoopModel.whoop4.rawValue
@@ -244,20 +193,17 @@ struct SettingsView: View {
     }
 
     private var unitSystem: UnitSystem { UnitSystem(rawValue: unitSystemRaw) ?? .metric }
-    private var temperatureUnit: TemperatureUnit {
-        UnitPrefs.resolveTemperature(system: unitSystem, override: temperatureRaw)
+    private var distanceUnitSystem: UnitSystem {
+        UnitPrefs.resolveDistance(system: unitSystem, override: distanceSystemRaw)
+    }
+    private var distanceSystemBinding: Binding<String> {
+        Binding(get: { distanceUnitSystem.rawValue }, set: { distanceSystemRaw = $0 })
     }
 
     /// Raw-sensor CSV export (experimental diagnostic, #308/#276/#322). Holds the last-written file so
     /// macOS can "Reveal in Finder" after a share, mirroring the puffin-capture export.
     @State private var rawCsvBusy = false
     @State private var lastRawCsvURL: URL?
-
-    /// #646/#651: the "Export raw + log" button's zip build now runs off the main actor, so a second tap
-    /// mid-export would fire a second `exportPair` — two staged zips, two save panels / stacked share
-    /// sheets (see the `present(activityItems:)` #455 comment). Same disable-while-busy guard as
-    /// `rawCsvBusy` above.
-    @State private var rawAndLogBusy = false
 
     /// Passive WHOOP 5/MG optical experiment: the picker writes local timestamp markers into the
     /// durable deep-buffer JSONL. It never calls a BLE write path.
@@ -294,6 +240,9 @@ struct SettingsView: View {
 
     /// User-initiated GitHub release check behind the About "Check for updates" button.
     @StateObject private var updateChecker = UpdateChecker()
+    /// #1659. Default comes from `UpdateAvailability.defaultEnabled` so the toggle and the launch check
+    /// cannot disagree about what "unset" means.
+    @AppStorage(UpdateWatch.Keys.enabled) private var autoCheckUpdates = UpdateAvailability.defaultEnabled
     @Environment(\.openURL) private var openURL
 
     /// Whether the "Advanced" disclosure (Recovery, Test Centre, experimental probes, Backup &
@@ -316,8 +265,14 @@ struct SettingsView: View {
                 unitsCard.staggeredAppear(index: 1)
                 appearanceCard.staggeredAppear(index: 2)
                 strapCard.staggeredAppear(index: 3)
+                #if os(iOS)
+                liveNotificationsCard.staggeredAppear(index: 3)
+                #endif
                 streakCard.staggeredAppear(index: 4)
                 featuresCard.staggeredAppear(index: 5)
+                #if os(iOS)
+                syncCard.staggeredAppear(index: 6)
+                #endif
 
                 // Lower-frequency sections collapse behind a single default-closed disclosure so the
                 // screen opens at ~6 sections instead of 11. Nothing is removed; every section here
@@ -344,6 +299,15 @@ struct SettingsView: View {
             Button("OK", role: .cancel) { }
         } message: {
             Text(backupAlertMessage)
+        }
+        // Title and buttons reuse catalogue strings that already carry all nine locales, rather than
+        // minting new copy that would ship English everywhere until someone translated it. The message
+        // below is where the specifics live. (#1807)
+        .alert("Backup problem", isPresented: $showOversizeRestoreConfirm) {
+            Button("Restore") { runImport(allowOversize: true) }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text(oversizeRestoreMessage)
         }
         .confirmationDialog("Recalibrate your Charge baseline?",
                             isPresented: $showRecalibrateConfirm, titleVisibility: .visible) {
@@ -513,6 +477,27 @@ struct SettingsView: View {
                         }
                     }
                 }
+                rowDivider
+                FormRow(label: "Day cycle") {
+                    Picker("Day starts", selection: Binding(
+                        get: { DayCycleMode.persisted(dayCycleModeRaw) },
+                        set: { mode in
+                            dayCycleModeRaw = mode.rawValue
+                            Task { await model.intelligence.analyzeRecent(); await model.repo.refresh() }
+                        }
+                    )) {
+                        Text("Main sleep").tag(DayCycleMode.sleepOnset)
+                        Text("00:00").tag(DayCycleMode.midnight)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+                Text(dayCycleModeRaw == DayCycleMode.midnight.rawValue
+                     ? "Uses a conventional local calendar day from 00:00 to 00:00."
+                     : "Default. Steps and in-progress Effort restart at the beginning of detected main sleep. Naps do not start a new day; missing sleep falls back to local midnight.")
+                    .font(StrandFont.footnote)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
                 rowDivider
                 // Step calibration (#139/#132): daily steps = @57 counter ticks ÷ this divisor.
                 // 1.0 = raw pass-through until the true 5/MG tick rate is known. The divisor goes
@@ -938,31 +923,41 @@ struct SettingsView: View {
 
     // MARK: - Units
 
-    /// Imperial/Metric display toggle + a separate temperature override. Display-only — nothing stored
-    /// changes, NOOP keeps everything in SI and converts at the point of display.
+    /// Independent body and exercise-distance unit choices plus temperature and Effort overrides.
+    /// Display-only — nothing stored changes; NOOP keeps everything in SI.
     private var unitsCard: some View {
         SettingsSection(
             icon: "ruler",
             title: "Units",
-            blurb: "Choose how distances, weights, heights, temperatures and Effort are shown. Your data is always stored the same way. This only changes the display."
+            blurb: "Choose body measurements and exercise distance separately. Your data is always stored the same way; these settings only change its display."
         ) {
             VStack(spacing: 0) {
-                FormRow(label: "Measurement system") {
-                    Picker("Measurement system", selection: $unitSystemRaw) {
+                FormRow(label: "Body measurements") {
+                    Picker("Body measurements", selection: $unitSystemRaw) {
                         Text("Metric").tag(UnitSystem.metric.rawValue)
                         Text("Imperial").tag(UnitSystem.imperial.rawValue)
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
                     .tint(StrandPalette.accent)
-                    .accessibilityLabel("Measurement system")
+                    .accessibilityLabel("Body measurement units")
+                }
+                rowDivider
+                FormRow(label: "Exercise distance & pace") {
+                    Picker("Exercise distance & pace", selection: distanceSystemBinding) {
+                        Text("Kilometres").tag(UnitSystem.metric.rawValue)
+                        Text("Miles").tag(UnitSystem.imperial.rawValue)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .tint(StrandPalette.accent)
+                    .accessibilityLabel("Exercise distance and pace units")
                 }
                 rowDivider
                 FormRow(label: "Temperature") {
-                    // Three-way: "Match" follows the system above; °C / °F pin it explicitly. Stored as
-                    // an empty string ("match") or the TemperatureUnit raw value.
+                    // Three-way: "Follow body" follows body measurements; °C / °F pin it explicitly.
                     Picker("Temperature", selection: $temperatureRaw) {
-                        Text("Match").tag("")
+                        Text("Follow body").tag("")
                         Text("°C").tag(TemperatureUnit.celsius.rawValue)
                         Text("°F").tag(TemperatureUnit.fahrenheit.rawValue)
                     }
@@ -970,6 +965,20 @@ struct SettingsView: View {
                     .pickerStyle(.menu)
                     .tint(StrandPalette.accent)
                     .accessibilityLabel("Temperature unit")
+                }
+                rowDivider
+                FormRow(label: "Skin temperature") {
+                    // #1846: lead with a temperature ("33.5 °C") or with the move from your own baseline
+                    // ("-0.1 Δ°C"). Only a PREFERENCE — a night that measured just one of the two still
+                    // shows that one, so the choice can never blank a card.
+                    Picker("Skin temperature", selection: $skinTempDisplayRaw) {
+                        Text("Temperature").tag("")
+                        Text("vs baseline").tag(SkinTempDisplay.Kind.deviation.rawValue)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .tint(StrandPalette.accent)
+                    .accessibilityLabel("Skin temperature display")
                 }
                 rowDivider
                 // Effort scale (#268) — show NOOP's native 0–100 Effort or WHOOP's 0–21 Day Strain axis.
@@ -984,6 +993,34 @@ struct SettingsView: View {
                     .tint(StrandPalette.accent)
                     .accessibilityLabel("Effort scale")
                 }
+
+                // #1545: directly under the Effort SCALE row on purpose. It shipped in the experimental
+                // block beside the SpO2 and stress-baseline toggles, where the person who asked for it
+                // could not find it. The two are different concepts — that row is the display AXIS,
+                // this the computation RECIPE — but a user asking "how is my Effort worked out" reaches
+                // for the same place for both, and each row's caption separates them.
+                // MARK: #1545 Effort scale — Banister exponential TRIMP instead of Edwards zones.
+                Divider().overlay(StrandPalette.hairline)
+
+                Toggle(isOn: $banisterEffortEnabled) {
+                    Text("Effort: exponential intensity scale")
+                        .font(StrandFont.subhead)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .tint(StrandPalette.accent)
+                .onChangeCompat(of: banisterEffortEnabled) { _ in
+                    // Re-score immediately on the flip. The recipe changes stored Effort for EVERY day in
+                    // the window, so without this the user waits up to 30 min for the next analyze loop
+                    // while the screen still shows scores from the recipe they just turned off — and the
+                    // toggle's own copy promises the history is re-scored. Same pattern as the SpO2
+                    // candidate and HRV-window toggles (analyzeRecent → refresh).
+                    Task { await model.intelligence.analyzeRecent(); await model.repo.refresh() }
+                }
+                Text("Scores Effort on an exponential intensity curve (Banister TRIMP) instead of the default heart-rate zones (Edwards). The default earns nothing below half of your heart-rate reserve, so an hour of lifting — where hard sets average out against the rests — can score close to zero. The exponential curve has no floor and weights short, hard efforts far more heavily. Re-scores your history, and both scales reach the same maximum. Off by default.")
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -1078,6 +1115,60 @@ struct SettingsView: View {
                     .foregroundStyle(StrandPalette.textTertiary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, NoopMetrics.space1)
+                rowDivider
+                // #1821: sits with Language rather than in Units because it is an app-owned display
+                // CONVENTION, not a unit of measurement — and like Language it offers "System default",
+                // which here means the device's own 24-Hour Time switch rather than the region default.
+                // Unlike Language this needs no relaunch: the formatter caches per resolved template.
+                FormRow(label: "Clock") {
+                    Picker("Clock", selection: $clockFormatRaw) {
+                        Text("System default").tag(ClockFormatPreference.system.rawValue)
+                        Text("12-hour").tag(ClockFormatPreference.twelveHour.rawValue)
+                        Text("24-hour").tag(ClockFormatPreference.twentyFourHour.rawValue)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .tint(StrandPalette.accent)
+                    .accessibilityLabel("Clock")
+                    // #1829: the resolved clock is memoised, so the write has to drop the memo or the
+                    // picker would appear to do nothing until the app restarted.
+                    .onChangeCompat(of: clockFormatRaw) { _ in AppClock.invalidate() }
+                }
+                rowDivider
+                // The Coach master switch. Offered on BOTH platforms, not only where the bottom bar is: it
+                // does not hide chrome, it turns the AI off, and macOS reaches the same Coach from its
+                // sidebar. With this off the tab (or sidebar row) goes, the Today launcher card goes, and
+                // the daily brief is cancelled -- the brief being the surface that would otherwise keep
+                // calling a provider from the background with no UI to reveal it. The saved provider key is
+                // kept, so this is a flip rather than a re-setup.
+                FormRow(label: "AI Coach") {
+                    Toggle("", isOn: $coachEnabled)
+                        .labelsHidden()
+                        .tint(StrandPalette.accent)
+                        .accessibilityLabel("AI Coach")
+                }
+                .onChangeCompat(of: coachEnabled) { on in
+                    // Switching the AI off has to TAKE DOWN what the brief already published, not just stop the
+                    // next one: the widget renders the last brief it was given, so without this a wearer would
+                    // still be looking at AI output on their home screen after turning the AI off.
+                    CoachBriefScheduler.applyMasterSwitch(on)
+                }
+                #if os(iOS)
+                rowDivider
+                // #1841: the same preference Android drives its own bar with, by name and meaning. Here
+                // the SYSTEM owns the behaviour — iOS 26 minimises the tab bar to a pill on scroll rather
+                // than sliding it away — so this asks for the platform's reading of the intent rather
+                // than reproducing ours. Below iOS 26 the modifier is inert and the row simply does
+                // nothing, which is why it is not offered there.
+                if #available(iOS 26.0, *) {
+                    FormRow(label: "Hide bar when scrolling") {
+                        Toggle("", isOn: $bottomBarAutoHide)
+                            .labelsHidden()
+                            .tint(StrandPalette.accent)
+                            .accessibilityLabel("Hide bar when scrolling")
+                    }
+                }
+                #endif
                 rowDivider
                 // Theme presets — one-tap bundles coordinating accent + chart world + backdrop + card
                 // opacity. Derived (no stored value): tweaking any control below flips this to Custom.
@@ -1375,21 +1466,6 @@ struct SettingsView: View {
                     strapNameControl
                 }
 
-                #if os(iOS)
-                rowDivider
-                // MARK: Live Activity — show live HR on the Lock Screen + Dynamic Island (#336).
-                Toggle(isOn: $liveActivityEnabled) {
-                    Text("Live heart rate in Dynamic Island")
-                        .font(StrandFont.subhead)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                }
-                .toggleStyle(.switch)
-                .tint(StrandPalette.accent)
-                Text("Shows your live heart rate on the Lock Screen and in the Dynamic Island while the strap is connected. Turn it off to keep your live HR out of the Dynamic Island. (Any one already showing clears within a moment.)")
-                    .font(StrandFont.caption)
-                    .foregroundStyle(StrandPalette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-                #endif
             }
         }
     }
@@ -1443,10 +1519,27 @@ struct SettingsView: View {
     }
 
     private var strapStatusDetail: String {
-        if live.bonded && live.connected {
+        // encryptedBond, not bonded — see LiveState.connectionStatusLabel. Saying "is paired" for a
+        // live-HR-only link contradicts both LiveView's pill and the buzz/alarm rows on this same screen,
+        // which correctly refuse and explain that they need the full encrypted bond.
+        //
+        // A live-HR link falls through to the pairing hint when one is set, and otherwise to "Finishing
+        // the secure pairing handshake…", which is accurate HERE because this platform still retries the
+        // CLIENT_HELLO on every connect. The #1635 suppression is now ported here too, so once it latches
+        // nothing is finishing any more and the old fall-through would describe a handshake that is no
+        // longer being attempted. The `bonded && connected` arm below is that fix, matching the Android
+        // twin (`SettingsLogic.strapStatusLine`).
+        if live.encryptedBond && live.connected {
             return String(localized: "Your strap is paired and sending data. Open Live for a real-time heart rate.")
         }
+        // An actionable hint outranks the generic arm: the suppression hint names the one action that
+        // restores the handshake, which "not fully paired" alone does not.
         if live.connected, let hint = live.pairingHint { return hint }
+        // Live HR over the UNBONDED standard profile (#69). True whenever the handshake is suppressed or
+        // simply has not landed, and the honest description either way.
+        if live.bonded && live.connected {
+            return String(localized: "Live heart rate is streaming, but your strap is not fully paired. The encrypted pairing is what carries motion, skin temperature, SpO₂ and respiratory rate — without it, sleep is staged from heart rate alone. Buzz, alarms and history sync need it too.")
+        }
         if live.connected { return String(localized: "Connected. Finishing the secure pairing handshake…") }
         if live.bonded { return String(localized: "Previously paired but not currently connected. Re-scan to reconnect.") }
         return String(localized: "No strap connected. Put your WHOOP nearby and tap Re-scan to pair.")
@@ -1465,6 +1558,48 @@ struct SettingsView: View {
     /// or an early reading that anchored too high). It writes now (epoch SECONDS) to BOTH the
     /// `noop.hrvBaselineEpoch` and `noop.recoveryBaselineEpoch` settings the recovery engine reads, then
     /// kicks a recompute the same way the sleep-edit path does (analyzeRecent → refresh). History stays.
+    #if os(iOS)
+    /// NOOP's live notifications — its Live Activities, on the Lock Screen and in the Dynamic Island — one switch
+    /// each: the live heart rate, a Lift Log session, a strap sync. These three are every Live Activity the app has.
+    /// A switch only decides whether its notification is SHOWN: the heart rate is still measured, recorded and
+    /// scored, a session still runs and buzzes, a sync still runs, with any of them off.
+    private var liveNotificationsCard: some View {
+        SettingsSection(
+            icon: "bell.badge",
+            title: "Live notifications",
+            blurb: "Shown on the Lock Screen and in the Dynamic Island. A switch only hides one: NOOP still measures and records everything."
+        ) {
+            VStack(alignment: .leading, spacing: NoopMetrics.rowSpacing) {
+                liveNotificationSwitch("Live heart rate", isOn: $liveActivityEnabled,
+                                       detail: "While the strap is connected.")
+                rowDivider
+                liveNotificationSwitch("Lift Log session", isOn: $liftLiveActivityEnabled,
+                                       detail: "Your set, rest and heart rate, and the Lock Screen light-up on a double-tap.")
+                rowDivider
+                liveNotificationSwitch("Strap sync", isOn: $syncLiveActivityEnabled,
+                                       detail: "Progress while NOOP pulls history from the strap.")
+            }
+        }
+    }
+
+    private func liveNotificationSwitch(_ title: LocalizedStringKey, isOn: Binding<Bool>,
+                                        detail: LocalizedStringKey) -> some View {
+        VStack(alignment: .leading, spacing: NoopMetrics.space1) {
+            Toggle(isOn: isOn) {
+                Text(title)
+                    .font(StrandFont.subhead)
+                    .foregroundStyle(StrandPalette.textPrimary)
+            }
+            .toggleStyle(.switch)
+            .tint(StrandPalette.accent)
+            Text(detail)
+                .font(StrandFont.caption)
+                .foregroundStyle(StrandPalette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+    #endif
+
     private var recoveryCard: some View {
         SettingsSection(
             icon: "heart.text.square",
@@ -1532,7 +1667,7 @@ struct SettingsView: View {
     // MARK: - Features (opt-in trackers)
 
     /// Opt-in, manual-first feature toggles (default OFF). Hydration tracking gates the water-log card on
-    /// the Today dashboard and its detail screen — nothing is shown or stored until it's enabled.
+    /// the Today dashboard and its detail screen, plus Apple Health water imports on iOS.
     private var featuresCard: some View {
         SettingsSection(
             icon: "drop.fill",
@@ -1549,10 +1684,17 @@ struct SettingsView: View {
                 .tint(StrandPalette.accent)
                 .accessibilityHint("Adds a water-log card to your dashboard")
 
-                Text("Adds a simple fluid log with a daily goal that adjusts to your effort. Tap to add a sip, cup or bottle and watch a progress ring fill. On \(Platform.deviceNounPhrase) only. Nothing is synced.")
+                Text("Adds a fluid log and an effort-adjusted daily goal. Log a sip, cup or bottle to fill your progress ring. Data stays on this device.")
                     .font(StrandFont.caption)
                     .foregroundStyle(StrandPalette.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                #if os(iOS)
+                Text("Also imports water from Apple Health when connected and allowed to read water data. Drinks logged in NOOP are not written to Apple Health.")
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                #endif
 
                 rowDivider
 
@@ -1565,7 +1707,12 @@ struct SettingsView: View {
                 .tint(StrandPalette.accent)
                 .accessibilityHint("Offers to save a workout when it spots sustained elevated heart rate")
 
-                Text("After a sync, NOOP looks over your recent heart rate for a sustained, raised stretch that looks like exercise and offers to save it. It only ever suggests. Nothing is saved until you tap Save, and you can dismiss any suggestion. Deliberately conservative, so the odd workout may be missed. On \(Platform.deviceNounPhrase) only.")
+                Text("After a sync, NOOP looks over your recent heart rate for a sustained, raised stretch that looks like exercise and offers to save it. It only ever suggests. Nothing is saved until you tap Save, and you can dismiss any suggestion. Turning this off stops future suggestions but keeps your existing workout history. Deliberately conservative, so the odd workout may be missed. On \(Platform.deviceNounPhrase) only.")
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Skips sessions that overlap a saved or imported workout, including workouts from Apple Health.")
                     .font(StrandFont.caption)
                     .foregroundStyle(StrandPalette.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1604,6 +1751,36 @@ struct SettingsView: View {
             }
         }
     }
+
+    #if os(iOS)
+    // MARK: - Sync (iOS)
+
+    /// Behaviour while a strap history sync runs. Its own section rather than a row under Features, which holds
+    /// optional trackers. `SyncKeepAwake` reads the same key.
+    private var syncCard: some View {
+        SettingsSection(
+            icon: "arrow.triangle.2.circlepath",
+            title: "Sync",
+            blurb: "How NOOP behaves while it pulls stored history from your strap."
+        ) {
+            VStack(alignment: .leading, spacing: NoopMetrics.space2 + 2) {
+                Toggle(isOn: $syncKeepScreenOn) {
+                    Text("Keep screen on while syncing")
+                        .font(StrandFont.subhead)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .tint(StrandPalette.accent)
+                .accessibilityHint("Stops the screen locking while your strap's history syncs")
+
+                Text("Holds the screen awake while NOOP pulls stored history from your strap, so you can watch a long sync finish without the phone locking. Only applies while a sync is running and NOOP is open. The screen sleeps normally the rest of the time. It uses a bit more battery while the screen stays on.")
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+    #endif
 
     // MARK: - Backup & restore
 
@@ -1681,11 +1858,15 @@ struct SettingsView: View {
 
     /// Entry point used by `body`. The 5/MG probe card only renders for a 5/MG (see `showFiveMGControls`,
     /// #22); the raw-sensor CSV diagnostic is split into its own card so it stays available on every
-    /// model — a 4.0 owner still needs the export to share decoded streams.
+    /// model — a 4.0 owner still needs the export to share decoded streams. The SpO2 candidate card is
+    /// split out the same way (see `spo2CandidateCard`'s comment) — it is NOT WHOOP-5/MG-specific.
     @ViewBuilder private var experimentalCard: some View {
         liquidTodayCard
         liveSessionsCard
-        if showFiveMGControls { fiveMGCard }
+        // WHOOP 5/MG protocol research now lives in Test Centre. Everyday Settings no longer carries
+        // a second copy; the persisted keys and reversible disable actions remain unchanged there.
+        if showFiveMGControls || model.repo.activeDeviceIsOura { spo2CandidateCard }
+        if model.repo.activeDeviceIsOura { ouraAllDayLiveHRCard }   // item 27
         sleepStagingCard
         rawSensorDiagnosticsCard
     }
@@ -1782,430 +1963,66 @@ struct SettingsView: View {
         }
     }
 
-    /// The R22 "send enable sequence" button is structurally impossible on macOS — a Mac can't form the
-    /// encrypted bond a 5/MG needs to accept the write (BLEManager forms a live-HR-only link there), so it
-    /// stays disabled regardless of bond/wear state (#587). On iOS/Android it gates on the real bond + wear.
-    private var deepDataButtonDisabled: Bool {
-        #if os(macOS)
-        return true
-        #else
-        return !live.encryptedBond || !live.worn
-        #endif
-    }
-
-    /// The reason line under the R22 button. macOS gets an explicit "needs an iPhone/Android" message
-    /// rather than the misleading "needs the full encrypted bond" one (a Mac can never get that bond).
-    private var deepDataButtonReason: String {
-        #if os(macOS)
-        return String(localized: "Deep data (R22) needs an iPhone or Android. A Mac can't form the encrypted bond a 5/MG requires.")
-        #else
-        if !live.encryptedBond {
-            return String(localized: "Needs the full encrypted bond: close the official WHOOP app and pair the strap to NOOP first (a live-HR-only link can't carry the unlock).")
-        }
-        return live.worn
-            ? String(localized: "Wear the strap, tap once, then let it sync and share your strap log.")
-            : String(localized: "Put the strap on first. The deep stream is on-wrist only.")
-        #endif
-    }
-
-    /// How many flags the enable sequence actually writes. Read from the sequence rather than restated, so
-    /// the card cannot drift from it again — it said "15" for the whole life of the 16-flag sequence (#174).
-    private var r22FlagCount: Int { Whoop5Config.enableR22Sequence.count }
-
-    /// The disable button is gated like the enable one MINUS the wear check: the on-wrist requirement exists
-    /// because the R22 *stream* is on-wrist gated, and nothing about clearing a stored flag needs the strap
-    /// worn. Making a user strap it back on to turn a feature off would be the wrong trade.
-    private var deepDataDisableButtonDisabled: Bool {
-        #if os(macOS)
-        return true
-        #else
-        return !live.encryptedBond || live.r22DisableReport == BLEManager.deviceConfigProbeWaiting
-        #endif
-    }
-
-    /// The reason line under the disable button. Says what the run will do and, crucially, what it can and
-    /// cannot establish — the off value is inferred from the sibling namespace, so the read-back is the
-    /// evidence, and a cleared flag is still not the same as observed behaviour reverting.
-    private var deepDataDisableButtonReason: String {
-        #if os(macOS)
-        return String(localized: "Turning deep data back off needs an iPhone or Android. A Mac can't form the encrypted bond a 5/MG requires.")
-        #else
-        if !live.encryptedBond {
-            return String(localized: "Needs the full encrypted bond: close the official WHOOP app and pair the strap to NOOP first (a live-HR-only link can't carry the write).")
-        }
-        return String(localized: "Writes the off value to all 16 flags and reads each one back, so you see what the strap stores rather than just that it acked. The off value is inferred from the flag NOOP already turns off this way for Garmin broadcast — it has never been seen on an R22 flag, so NOOP tries one flag first and stops if the strap refuses it. Clearing the flags is not the same as watching the deep records stop: check that by syncing afterwards.")
-        #endif
-    }
-
-    private var fiveMGCard: some View {
+    /// SpO2 candidate display (#103/queue-11a) — split out of the WHOOP 5/MG research card
+    /// `fiveMGCard` (2026-08-23; #1709 removed that card's call site and #2417 its body): the toggle's
+    /// own copy has covered Oura since `89c8533b` ("Blood Oxygen: strap estimate (WHOOP 5/MG, Oura)"),
+    /// but it stayed nested inside the WHOOP-5/MG-only card, gated by `showFiveMGControls` — so an
+    /// Oura-only install (no WHOOP 5/MG ever connected) could never reach it. `metricSeries` confirmed
+    /// zero `spo2_candidate` rows ever written on such an install despite pass-2 scoring running daily,
+    /// and a full screenshot sweep of Settings confirmed the section never renders. Same split as
+    /// `rawSensorDiagnosticsCard` just below (#22) — this card shows for a 5/MG OR an active Oura
+    /// device, not just a 5/MG.
+    private var spo2CandidateCard: some View {
         SettingsSection(
-            icon: "flask.fill",
-            title: "Experimental · WHOOP 5 / MG",
-            blurb: "Live heart rate already works on a WHOOP 5/MG strap. These probes go further and try to coax more out of it. They are guesses, off by default, and only ever touch a 5/MG strap. WHOOP 4.0 is never affected."
+            icon: "lungs.fill",
+            title: "Experimental · Blood Oxygen",
+            blurb: "Surfaces a device-conditional, unverified SpO₂ estimate in the Blood Oxygen tile when no calibrated reading exists."
         ) {
             VStack(alignment: .leading, spacing: NoopMetrics.rowSpacing) {
-                Toggle(isOn: $puffinExperiments) {
-                    Text("Try WHOOP 5/MG protocol probes")
-                        .font(StrandFont.subhead)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                }
-                .toggleStyle(.switch)
-                .tint(StrandPalette.accent)
-                Text("On a 5/MG connection NOOP will send a puffin realtime-stream request after the handshake, and log what comes back. If you have a 5/MG strap, turning this on and sharing your strap log helps map the protocol. No effect on WHOOP 4.0.")
-                    .font(StrandFont.caption)
-                    .foregroundStyle(StrandPalette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                rowDivider
-
-                // MARK: R22 deep-data unlock — the one probe that writes to the strap.
-                Toggle(isOn: $deepDataEnabled) {
-                    Text("Unlock WHOOP 5/MG deep data (R22)")
-                        .font(StrandFont.subhead)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                }
-                .toggleStyle(.switch)
-                .tint(StrandPalette.accent)
-                // #174: turning the switch OFF used to write nothing — it only hid the enable button, so the
-                // strap kept every flag the enable sequence set while the UI implied it had been undone.
-                // Now it offers the real undo. Turning it ON still writes nothing until the button is tapped.
-                .onChangeCompat(of: deepDataEnabled) { on in if !on { confirmingDeepDataDisable = true } }
-                Text("WHOOP 5/MG straps hand a fresh app only live heart rate. The official app switches on the deeper streams (high-rate HR + motion + history) by writing a set of feature flags, a sequence two independent projects have documented. With this on, the button below sends that exact sequence to your strap. Unlike everything else here it does write to the strap — and it is reversible: \u{201C}Turn deep data back off\u{201D} writes the off value to the same flags and then reads every one of them back, so you see what the strap actually stores rather than just that it acked. Experimental: it may do nothing on your firmware. iPhone/Android only. A Mac can't write to a 5/MG.")
-                    .font(StrandFont.caption)
-                    .foregroundStyle(StrandPalette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if deepDataEnabled {
-                    NoopButton("Send enable sequence to strap", systemImage: "bolt.badge.automatic", kind: .primary) {
-                        model.ble.enableWhoop5DeepData()
-                    }
-                    .disabled(deepDataButtonDisabled)
-                    Text(deepDataButtonReason)
-                        .font(StrandFont.caption)
-                        .foregroundStyle(StrandPalette.textTertiary)
-
-                    // #174: the undo. Offered whenever the flags may be set — which is any time the opt-in
-                    // has been on, not only right after a send, because the flags persist across launches
-                    // and the app has no record of what a previous install wrote.
-                    NoopButton("Turn deep data back off", systemImage: "bolt.slash", kind: .secondary) {
-                        model.ble.disableWhoop5DeepData()
-                    }
-                    .disabled(deepDataDisableButtonDisabled)
-                    Text(deepDataDisableButtonReason)
-                        .font(StrandFont.caption)
-                        .foregroundStyle(StrandPalette.textTertiary)
-
-                    // Live R22 telemetry (#174): proof of what the strap is doing right now.
-                    // The threshold and the number are both driven off the sequence itself — they were
-                    // hardcoded to 15 while the sequence carried 16, so the card declared success one flag
-                    // early and named a count that had already drifted.
-                    if live.r22FlagsAccepted > 0 {
-                        Label(live.r22FlagsAccepted >= r22FlagCount
-                              ? "Strap accepted all \(r22FlagCount) R22 flags"
-                              : "Strap accepted \(live.r22FlagsAccepted)/\(r22FlagCount) R22 flags…",
-                              systemImage: live.r22FlagsAccepted >= r22FlagCount ? "checkmark.seal.fill" : "ellipsis")
-                            .font(StrandFont.caption)
-                            .foregroundStyle(live.r22FlagsAccepted >= r22FlagCount ? StrandPalette.statusPositive : StrandPalette.textSecondary)
-                    }
-                    if live.deepPacketsThisSession > 0 {
-                        Label(live.deepPacketsThisSession == 1
-                              ? "1 type-0x2F historical-offload frame seen outside our sync. These are history (e.g. another app pulling the strap's backlog), not a live R22 stream (#494)."
-                              : "\(live.deepPacketsThisSession) type-0x2F historical-offload frames seen outside our sync. These are history (e.g. another app pulling the strap's backlog), not a live R22 stream (#494).",
-                              systemImage: "clock.arrow.circlepath")
-                            .font(StrandFont.caption)
-                            .foregroundStyle(StrandPalette.textSecondary)
-                    } else if live.r22FlagsAccepted >= r22FlagCount {
-                        Text("Flags accepted, but the enable sequence doesn't start a separate live stream. The deep records arrive as part of the normal history sync (#494).")
-                            .font(StrandFont.caption)
-                            .foregroundStyle(StrandPalette.textTertiary)
-                    }
-
-                }
-
-                // #174: the disable run's per-key result. Shown verbatim because the interesting part is
-                // the read-back table, not a green tick — a write that acked SUCCESS but did not move
-                // the stored value renders here as "unchanged", which is the case worth seeing.
-                //
-                // OUTSIDE the `if deepDataEnabled` block on purpose. The commonest way to reach a disable
-                // run is flipping the switch OFF and confirming, which means the pref is already false while
-                // the run is walking its plan — so nesting this inside that block hid the progress line and
-                // the whole read-back table for exactly the run a user is most likely to start. The report
-                // is about what is on the STRAP, which outlives the app's opt-in: it stays legible (and
-                // dismissable) whatever the switch says.
-                if let report = live.r22DisableReport {
-                    if report == BLEManager.deviceConfigProbeWaiting {
-                        Label("Clearing R22 flags and reading each one back\u{2026}", systemImage: "ellipsis")
-                            .font(StrandFont.caption)
-                            .foregroundStyle(StrandPalette.textSecondary)
-                    } else {
-                        Text(report)
-                            .font(StrandFont.caption.monospaced())
-                            .foregroundStyle(StrandPalette.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .textSelection(.enabled)
-                        NoopButton("Dismiss disable report", systemImage: "xmark", kind: .secondary) {
-                            model.ble.clearR22DisableReport()
-                        }
-                    }
-                }
-
-                rowDivider
-
-                // MARK: Broadcast HR — make the strap a standard BLE HR sensor (Garmin/Zwift/gym).
-                Toggle(isOn: $broadcastHrEnabled) {
-                    Text("Broadcast strap HR (Garmin/ANT)")
-                        .font(StrandFont.subhead)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                }
-                .toggleStyle(.switch)
-                .tint(StrandPalette.accent)
-                .onChangeCompat(of: broadcastHrEnabled) { on in model.ble.setBroadcastHr(on) }
-                Text("Makes your WHOOP 5.0/MG advertise its heart rate as a standard Bluetooth HR sensor, so a Garmin (Edge/watch), Zwift or gym equipment can use it during a workout. Applied on the next connection (and immediately if connected); writes the strap's whoop_live_hr_in_adv_ind_pkt flag. Reversible. iPhone-side only. A Mac can't write to a 5/MG.")
-                    .font(StrandFont.caption)
-                    .foregroundStyle(StrandPalette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                // #573: leaving broadcast on keeps the strap radio advertising continuously, which drains
-                // the strap faster — make that visible and persistent so it isn't left on by accident.
-                if broadcastHrEnabled {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "antenna.radiowaves.left.and.right")
-                            .foregroundStyle(StrandPalette.statusWarning)
-                            .accessibilityHidden(true)
-                        Text("Broadcast HR is ON. Your strap is advertising its heart rate continuously, which keeps its radio hot and drains the battery faster. Turn it off when you're not using it with another device.")
-                            .font(StrandFont.caption)
-                            .foregroundStyle(StrandPalette.statusWarning)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityElement(children: .combine)
-                }
-
-                // MARK: #103 SpO₂ strap estimate display — surface the @82 candidate as a fallback.
-                Divider().overlay(StrandPalette.hairline)
-
                 Toggle(isOn: $spo2CandidateDisplayEnabled) {
-                    Text("Blood Oxygen: strap estimate (WHOOP 5/MG)")
+                    Text("Blood Oxygen: strap estimate (WHOOP 5/MG, Oura)")
                         .font(StrandFont.subhead)
                         .foregroundStyle(StrandPalette.textPrimary)
                 }
                 .toggleStyle(.switch)
                 .tint(StrandPalette.accent)
                 .onChangeCompat(of: spo2CandidateDisplayEnabled) { _ in
-                    // Re-score immediately so the @82 candidate is computed and persisted on this
+                    // Re-score immediately so the candidate is computed and persisted on this
                     // toggle flip — without this the user waits up to 15 min for the next analyze
                     // loop, and the Blood Oxygen tile stays blank in the meantime. Same pattern as
                     // the HRV window toggle above (analyzeRecent → refresh).
                     Task { await model.intelligence.analyzeRecent(); await model.repo.refresh() }
                 }
-                Text("Your WHOOP 5.0/MG sends a strap-computed SpO₂ percentage (the @82 candidate byte) every second. An 8-night independent validation tracked it at corr +0.99 against the WHOOP app, but two nights on the original test device moved the OPPOSITE direction — device/firmware variance is unresolved. Turning this on surfaces the nightly mean in the Blood Oxygen tile as \"strap estimate (unverified)\" when no calibrated import exists. It never feeds recovery or illness scoring. WHOOP 4.0 has no @82 stream, so this does nothing there.")
+                Text("Your WHOOP 5.0/MG sends a strap-computed SpO₂ percentage (the @82 candidate byte) every second — an 8-night independent validation tracked it at corr +0.99 against the WHOOP app, but two nights on the original test device moved the OPPOSITE direction, so device/firmware variance is unresolved. An Oura ring's own SpO₂ reading runs high on the wire (over 100% on a fifth to a half of samples on a clean night); this instead surfaces the ring's mean with each sample capped at 100% first, which has matched the Oura app's own displayed value on every full night checked against it so far, though only a few nights. Turning this on surfaces whichever applies to your device as \"strap estimate (unverified)\" in the Blood Oxygen tile when no calibrated import exists. It never feeds recovery or illness scoring. WHOOP 4.0 has no @82 stream, so this does nothing there.")
                     .font(StrandFont.caption)
                     .foregroundStyle(StrandPalette.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
 
-                // MARK: #463 Personal daytime-stress baseline — score today's timeline vs a personal
-                //       cross-day baseline instead of the day's own calm hours. Off by default.
-                Divider().overlay(StrandPalette.hairline)
-
-                Toggle(isOn: $stressPersonalBaselineEnabled) {
-                    Text("Stress: personal daytime baseline")
+    /// Item 27: keep the Oura ring in daytime-HR mode while the screen is off during the DAY. The ring
+    /// produces daytime heart rate (and the beats behind windowed rMSSD) only while a client holds that
+    /// mode, so the screen-keyed suspend that protects the night suite also empties a pocketed-phone day.
+    /// ON stands the hold down only for the learned night band; OFF is today's behaviour. Oura-only.
+    private var ouraAllDayLiveHRCard: some View {
+        SettingsSection(
+            icon: "waveform.path.ecg",
+            title: "Experimental · Oura ring all-day heart rate",
+            blurb: "Oura ring only. Keeps your ring measuring heart rate through the day, standing it down only for your night. A WHOOP strap is not affected."
+        ) {
+            VStack(alignment: .leading, spacing: NoopMetrics.rowSpacing) {
+                Toggle(isOn: $ouraAllDayLiveHREnabled) {
+                    Text("Oura ring: all-day heart rate & HRV")
                         .font(StrandFont.subhead)
                         .foregroundStyle(StrandPalette.textPrimary)
                 }
                 .toggleStyle(.switch)
                 .tint(StrandPalette.accent)
-                Text("Scores your hour-by-hour stress timeline against YOUR own cross-day baseline (how your days usually run, Oura-style) instead of the day's own calm hours. Needs a few worn days; until then it stays on the default. The high-stress cutoff is tuned from a single-subject reference so far, so it's an alternative lens rather than the default. HR-only, and it never feeds recovery or illness scoring. Off by default.")
+                Text("Your Oura ring only measures daytime heart rate while NOOP keeps it in that mode, and NOOP stops asking whenever the screen has been off for five minutes — which protects the ring's own sleep tracking at night, but also leaves a pocketed phone's day blank on the Heart Rate and HRV charts. On, NOOP keeps asking through the day and stops only for your usual night, learned from your sleep history (an hour before your typical bedtime to an hour after your usual wake), so the night is unchanged. Costs ring battery: the ring runs its own optical sensor all day. Until enough nights are learned it behaves as if off. Off by default.")
                     .font(StrandFont.caption)
                     .foregroundStyle(StrandPalette.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
-
-                // MARK: #1545 Effort scale — Banister exponential TRIMP instead of Edwards zones.
-                Divider().overlay(StrandPalette.hairline)
-
-                Toggle(isOn: $banisterEffortEnabled) {
-                    Text("Effort: exponential intensity scale")
-                        .font(StrandFont.subhead)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                }
-                .toggleStyle(.switch)
-                .tint(StrandPalette.accent)
-                .onChangeCompat(of: banisterEffortEnabled) { _ in
-                    // Re-score immediately on the flip. The recipe changes stored Effort for EVERY day in
-                    // the window, so without this the user waits up to 30 min for the next analyze loop
-                    // while the screen still shows scores from the recipe they just turned off — and the
-                    // toggle's own copy promises the history is re-scored. Same pattern as the SpO2
-                    // candidate and HRV-window toggles (analyzeRecent → refresh).
-                    Task { await model.intelligence.analyzeRecent(); await model.repo.refresh() }
-                }
-                Text("Scores Effort on an exponential intensity curve (Banister TRIMP) instead of the default heart-rate zones (Edwards). The default earns nothing below half of your heart-rate reserve, so an hour of lifting — where hard sets average out against the rests — can score close to zero. The exponential curve has no floor and weights short, hard efforts far more heavily. Re-scores your history, and both scales reach the same maximum. Off by default.")
-                    .font(StrandFont.caption)
-                    .foregroundStyle(StrandPalette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                // MARK: #891 ECG raw-data gate — the second device-config key this app may write, MG-only.
-                Divider().overlay(StrandPalette.hairline)
-
-                Toggle(isOn: $ecgRawDataEnabled) {
-                    Text("ECG raw-data gate (WHOOP MG only)")
-                        .font(StrandFont.subhead)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                }
-                .toggleStyle(.switch)
-                .tint(StrandPalette.accent)
-                Text("Your strap listed its own device-config keys, and one of them is enable_raw_data_w_ecg. On an MG with no ECG subscription it reads '0' — while all three ECG commands answer SUCCESS and send no data at all (#891). This is the leading guess for what's holding ECG shut. Nobody knows whether flipping it actually produces ECG data: finding out is the point, and \"still nothing\" is a useful answer worth posting to #891.")
-                    .font(StrandFont.caption)
-                    .foregroundStyle(StrandPalette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if ecgRawDataEnabled {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(StrandPalette.statusWarning)
-                            .accessibilityHidden(true)
-                        Text("This writes a setting that STAYS ON YOUR STRAP until you change it back — it isn't an app preference, and closing NOOP won't undo it. \"Turn gate off\" below writes '0' again, in one tap. Only this one key is ever written; the other six your strap listed are never touched.")
-                            .font(StrandFont.caption)
-                            .foregroundStyle(StrandPalette.statusWarning)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityElement(children: .combine)
-
-                    NoopButton("Turn gate on (write '1')", systemImage: "waveform.path.ecg", kind: .primary) {
-                        model.ble.setEcgRawDataGate(true)
-                    }
-                    .disabled(!ecgGateReady)
-                    NoopButton("Turn gate off (write '0')", systemImage: "arrow.uturn.backward", kind: .secondary) {
-                        model.ble.setEcgRawDataGate(false)
-                    }
-                    .disabled(!ecgGateReady)
-                    Text(ecgGateReason)
-                        .font(StrandFont.caption)
-                        .foregroundStyle(StrandPalette.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    // The read-back — the ONLY thing reported as a result. The write's own ack is in the
-                    // strap log for the record and is deliberately not surfaced as an outcome here.
-                    if let report = live.ecgRawDataGate {
-                        Label(report.summary, systemImage: ecgGateIcon(report.verdict))
-                            .font(StrandFont.caption)
-                            .foregroundStyle(ecgGateTint(report.verdict))
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-
-                Divider().overlay(StrandPalette.hairline)
-
-                // MARK: WHOOP MG ECG (Labrador) — MG-only, writes ECG control commands. NOT medical.
-                Toggle(isOn: $ecgEnabled) {
-                    Text("WHOOP MG ECG capture (experimental)")
-                        .font(StrandFont.subhead)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                }
-                .toggleStyle(.switch)
-                .tint(StrandPalette.accent)
-                // Turning the switch off also tells the strap to stop, so a stream can't be left running
-                // by a user who simply flips the toggle back. `ecgStopCapture` is deliberately reachable
-                // with the opt-in already off (see BLEManager.ecgStopOverride). When the strap isn't a
-                // connected MG the send can't happen — the Devices "Stop" control then stays offered via
-                // `ecgMayBeRunning` so there is still a route once the link is back.
-                // `reportsResult: false`: switching a setting off must not pop the Devices result sheet.
-                .onChangeCompat(of: ecgEnabled) { on in if !on { model.ecgStopCapture(reportsResult: false) } }
-                Text("The WHOOP MG has ECG electrodes in its clasp. This unlocks a gated, hand-run probe on the Devices screen that asks the strap to start its ECG subsystem and logs whatever comes back. MG only — a plain WHOOP 5.0 has no electrodes, and NOOP will refuse to send unless your strap identifies itself as an MG. Nobody has confirmed a strap honours these commands, so it may simply do nothing. Turn on “Record puffin frames to a file” below first if you want a complete byte-level capture to share.")
-                    .font(StrandFont.caption)
-                    .foregroundStyle(StrandPalette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if ecgEnabled {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(StrandPalette.statusWarning)
-                            .accessibilityHidden(true)
-                        Text("NOOP is not a medical device and this is not an ECG test. Anything the strap reports here — including any heart-rhythm classification it happens to send — is unvalidated instrumentation for protocol research, not a measurement and not a diagnosis. Never use it to make a decision about your health. If you have symptoms or are worried about your heart, talk to a doctor.")
-                            .font(StrandFont.caption)
-                            .foregroundStyle(StrandPalette.statusWarning)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityElement(children: .combine)
-                }
-
-                Toggle(isOn: $puffinCapture) {
-                    Text("Record puffin frames to a file")
-                        .font(StrandFont.subhead)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                }
-                .toggleStyle(.switch)
-                .tint(StrandPalette.accent)
-                Text("Saves every raw 5/MG frame (with a timestamp and the live heart rate) to a JSON file you can share to help map the biometric layout. This only records frames the strap already sent (it never writes to your strap), so it is safe to leave on. Export the file and attach it to a protocol-mapping issue.")
-                    .font(StrandFont.caption)
-                    .foregroundStyle(StrandPalette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if puffinCapture {
-                    rowDivider
-                    Text("Optical block experiment")
-                        .font(StrandFont.subhead)
-                        .foregroundStyle(StrandPalette.textPrimary)
-                    Text("Mark the start of each physical phase while wearing or handling the strap. NOOP aligns the marker to the timestamp inside delayed history buffers, then the offline analyzer compares block activation, header bytes and raw ADC changes. It does not assume a wavelength or calculate SpO₂/BP.")
-                        .font(StrandFont.caption)
-                        .foregroundStyle(StrandPalette.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: NoopMetrics.space3) {
-                        NoopButton("Mark phase…", systemImage: "flag.fill", kind: .primary) {
-                            showOpticalPhasePicker = true
-                        }
-                        NoopButton("Export experiment…", systemImage: "square.and.arrow.up", kind: .secondary) {
-                            exportOpticalExperiment()
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    if !opticalPhaseStatus.isEmpty {
-                        Text(opticalPhaseStatus)
-                            .font(StrandFont.caption)
-                            .foregroundStyle(StrandPalette.textSecondary)
-                    }
-                }
-
-                if live.puffinCaptureCount > 0 {
-                    Text(live.puffinCaptureCount == 1
-                         ? "1 frame captured this session."
-                         : "\(live.puffinCaptureCount) frames captured this session.")
-                        .font(StrandFont.caption)
-                        .foregroundStyle(StrandPalette.textSecondary)
-                    HStack(spacing: NoopMetrics.space3) {
-                        NoopButton("Export frames…", systemImage: "square.and.arrow.up", kind: .primary) {
-                            exportPuffinCaptures()
-                        }
-
-                        #if os(macOS)
-                        NoopButton("Reveal in Finder", systemImage: "folder", kind: .secondary) {
-                            revealPuffinCaptures()
-                        }
-                        #endif
-                        Spacer(minLength: 0)
-                    }
-                    // One-tap "matched pair" export (#510): hands a reporter BOTH the raw capture file
-                    // and the strap log together (timestamped, same minute) so a protocol-mapping issue
-                    // arrives with the frames AND the context that produced them.
-                    Button {
-                        exportRawAndLog()
-                    } label: {
-                        if rawAndLogBusy {
-                            HStack(spacing: NoopMetrics.space1 + 2) {
-                                ProgressView().controlSize(.small)
-                                Text("Exporting…")
-                            }
-                        } else {
-                            Label("Export raw + log", systemImage: "square.and.arrow.up.on.square")
-                        }
-                    }
-                    .buttonStyle(NoopButtonStyle(.secondary))
-                    .disabled(rawAndLogBusy)
-                    Text("Saves the raw capture and the strap log together as a matched pair. Attach both to a protocol-mapping issue.")
-                        .font(StrandFont.caption)
-                        .foregroundStyle(StrandPalette.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
             }
         }
     }
@@ -2256,7 +2073,8 @@ struct SettingsView: View {
     }
 
     /// Export the last 24h of decoded sensor streams for the connected strap to a CSV, then save (macOS
-    /// NSSavePanel) or share (iOS share sheet) — the same pattern as exportPuffinCaptures().
+    /// NSSavePanel) or share (iOS share sheet). This is the only exporter left on this screen: the Puffin
+    /// capture export that shared the shape went with the research card in #2417.
     ///
     /// The strap id comes from `repo.deviceId`, NOT `model.deviceId`. The latter is a hardcoded
     /// `let "my-whoop"`; the former is seeded with it and then re-pointed to the registry's active strap
@@ -2316,36 +2134,6 @@ struct SettingsView: View {
         }
     }
 
-    /// Flush the in-flight capture, then copy it to a user-chosen location (save panel on macOS) or
-    /// hand it to the system share sheet (iOS).
-    private func exportPuffinCaptures() {
-        Task { @MainActor in
-            await model.ble.flushPuffinCaptures()
-            guard let src = live.puffinCaptureURL else { return }
-            // Suggest a friendly, timestamped name so a reporter saving several captures gets sortable,
-            // non-colliding files (#510) — e.g. noop-raw-capture-260617-1042.json.
-            let suggested = FileExport.timestampedName("noop-raw-capture", ext: "json")
-            #if os(macOS)
-            let panel = NSSavePanel()
-            panel.allowedContentTypes = [.json]
-            panel.nameFieldStringValue = suggested
-            panel.canCreateDirectories = true
-            guard panel.runModal() == .OK, let dest = panel.url else { return }
-            let fm = FileManager.default
-            do {
-                if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
-                try fm.copyItem(at: src, to: dest)
-            } catch {
-                backupAlertTitle = String(localized: "Export failed")
-                backupAlertMessage = error.localizedDescription
-                showBackupAlert = true
-            }
-            #else
-            FileExport.exportFile(at: src, suggestedName: suggested)
-            #endif
-        }
-    }
-
     private func markOpticalPhase(_ phase: PuffinOpticalExperimentPhase) {
         if model.ble.markWhoop5OpticalPhase(phase) {
             opticalPhaseStatus = String(localized: "Marked: \(phase.displayName)")
@@ -2354,61 +2142,7 @@ struct SettingsView: View {
         }
     }
 
-    /// Export the durable JSONL used by the optical comparison CLI. Closing its append handle first
-    /// makes the user-selected copy complete; logging reopens lazily on the next buffer or marker.
-    private func exportOpticalExperiment() {
-        guard let src = model.ble.whoop5OpticalExperimentURL() else {
-            backupAlertTitle = String(localized: "Nothing to export")
-            backupAlertMessage = String(localized: "No WHOOP 5/MG deep buffers or phase markers have been recorded yet.")
-            showBackupAlert = true
-            return
-        }
-        FileExport.exportFile(
-            at: src,
-            suggestedName: FileExport.timestampedName("noop-whoop5-optical-experiment", ext: "jsonl"))
-    }
-
-    /// One-tap matched-pair export (#510): export the raw puffin capture AND the strap log together,
-    /// both stamped with the same `yyMMdd-HHmm` minute so they're obviously a pair. Reuses the existing
-    /// export utilities — `FileExport.exportPair` shares both files in one iOS share sheet, and saves
-    /// each via its own NSSavePanel on macOS (no new file plumbing).
-    ///
-    /// #646/#651: `exportPair` is now async (its file read + zip build run off the main actor), so this
-    /// launches it in a `Task` — the button action itself stays synchronous from the caller's perspective.
-    /// `rawAndLogBusy` disables the button for the duration: without it a second tap mid-export fires a
-    /// second `exportPair` (two staged zips, two save panels / stacked share sheets).
-    private func exportRawAndLog() {
-        rawAndLogBusy = true
-        Task { @MainActor in
-            // `defer` so the flag is cleared on ANY exit (#961 follow-up), including cancellation. It
-            // cleared correctly before, but only because `exportPair` is non-throwing — the guard should
-            // not depend on that. Otherwise the button stays disabled behind a spinner that never stops.
-            defer { rawAndLogBusy = false }
-            // #652: `flushPuffinCaptures` is async now (encode+write moved off the main actor), so await
-            // it here — the file must be current before we read `puffinCaptureURL` to export it.
-            await model.ble.flushPuffinCaptures()
-            guard let capture = live.puffinCaptureURL else {
-                backupAlertTitle = String(localized: "Nothing to export")
-                backupAlertMessage = String(localized: "No raw capture has been recorded yet this session.")
-                showBackupAlert = true
-                return
-            }
-            let stamp = FileExport.timestamp()
-            await FileExport.exportPair(
-                file: capture, fileSuggestedName: "noop-raw-capture-\(stamp).json",
-                text: live.exportableLogText(), textSuggestedName: "noop-strap-log-\(stamp).txt")
-        }
-    }
-
     #if os(macOS)
-    /// Flush, then reveal the capture file in Finder so the user can grab it directly.
-    private func revealPuffinCaptures() {
-        Task { @MainActor in
-            await model.ble.flushPuffinCaptures()
-            guard let url = live.puffinCaptureURL else { return }
-            NSWorkspace.shared.activateFileViewerSelecting([url])
-        }
-    }
     #endif
 
     private var backupCard: some View {
@@ -2532,10 +2266,10 @@ struct SettingsView: View {
         }
     }
 
-    private func runImport() {
+    private func runImport(allowOversize: Bool = false) {
         backupBusy = true
         Task {
-            let result = await DataBackup.runImport()
+            let result = await DataBackup.runImport(allowOversize: allowOversize)
             handleBackup(result)
         }
     }
@@ -2570,6 +2304,19 @@ struct SettingsView: View {
             backupAlertTitle = String(localized: "Backup exported")
             backupAlertMessage = String(localized: "Saved to \(url.lastPathComponent). Copy this file to your other \(Platform.deviceNoun) and use Import there to restore everything.")
             showBackupAlert = true
+        case .exportedOversize(let url, let bytes, let limit):
+            // #1807: the file is written and worth keeping — say so first, then say what restoring it
+            // will ask for. The old behaviour said nothing here and refused at restore, which is the
+            // one moment the original is already gone.
+            let size = ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+            let cap = ByteCountFormatter.string(fromByteCount: limit, countStyle: .file)
+            backupAlertTitle = String(localized: "Backup exported")
+            backupAlertMessage = String(localized: "Saved to \(url.lastPathComponent). Your database is \(size), over the \(cap) NOOP restores without asking — the backup is complete and valid, and restoring it will ask you to confirm once.")
+            showBackupAlert = true
+        case .restoreTooLarge(let name, let limit):
+            let cap = ByteCountFormatter.string(fromByteCount: limit, countStyle: .file)
+            oversizeRestoreMessage = String(localized: "\(name) is larger than the \(cap) NOOP restores without asking. That limit guards against a malicious archive expanding to fill this \(Platform.deviceNoun) — a backup you exported yourself is not that. Restoring it needs the space the database will take. You'll be asked to choose the file again.")
+            showOversizeRestoreConfirm = true
         case .imported:
             backupAlertTitle = String(localized: "Backup imported")
             backupAlertMessage = String(localized: "Your data has been restored. Quit and reopen NOOP for it to take effect.")
@@ -2587,9 +2334,7 @@ struct SettingsView: View {
     /// project.yml MARKETING_VERSION), so the About pill can never go stale the way a hand-edited
     /// Swift constant can. Mirrors how Android's pill reads BuildConfig.VERSION_NAME. Falls back to
     /// the hand-maintained changelog version only if the Info.plist key is somehow missing.
-    private var bundleVersionString: String {
-        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? AppChangelog.currentVersion
-    }
+    private var bundleVersionString: String { UpdateWatch.installedVersion }
 
     private var aboutCard: some View {
         SettingsSection(
@@ -2771,6 +2516,23 @@ struct SettingsView: View {
                         }
                         Spacer()
                     }
+
+                    // #1659: the automatic half. iOS cannot auto-update a sideloaded build at all — no API
+                    // lets an app install or re-sign an .ipa — so noticing and saying so is the whole of
+                    // what is possible. ON by default, because a sideloaded app has no store to tell the
+                    // user anything and a setting nobody finds is the feature not existing; switching it
+                    // off here stops the request entirely. See UpdateAvailability.defaultEnabled.
+                    Toggle(isOn: $autoCheckUpdates) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Check automatically")
+                                .font(StrandFont.subhead)
+                                .foregroundStyle(StrandPalette.textPrimary)
+                            Text("Once a day, NOOP asks GitHub for the latest version number and puts a note in Updates if there's a newer one. Nothing about you is sent, and it never installs anything.")
+                                .font(StrandFont.footnote)
+                                .foregroundStyle(StrandPalette.textSecondary)
+                        }
+                    }
+                    .tint(StrandPalette.accent)
 
                     // Update available: show what's new, with a download straight to the release.
                     if case .available(let v, let url, let notes) = updateChecker.state {
@@ -3234,6 +2996,15 @@ struct StepsCalibrationSheet: View {
     @State private var draftManual: Double = 0
     @State private var didLoad = false
 
+    /// The strap has banked no motion, and we have looked.
+    ///
+    /// Named once because two places depend on it and they must stay exactly complementary: the
+    /// no-motion banner appears, and the calibration countdown does NOT. Written as two separate
+    /// expressions they drifted immediately — the guard's first draft tested `sampleMotion == nil`
+    /// alone, which is also true during the load, so the countdown vanished in a window where the
+    /// banner had not appeared yet and the card explained nothing at all.
+    private var strapHasNoMotion: Bool { didLoad && sampleMotion == nil }
+
     /// #107: the sheet's guidance depends on the strap family. A WHOOP 4.0 streams motion automatically, so
     /// "let it sync" is right; a 5/MG only streams motion once the experimental deep-data unlock is on, so
     /// the 4.0 advice is futile there and the empty state must say so instead.
@@ -3254,7 +3025,7 @@ struct StepsCalibrationSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: NoopMetrics.sectionSpacing) {
                     explainerCard
-                    if didLoad && sampleMotion == nil { noMotionNote }
+                    if strapHasNoMotion { noMotionNote }
                     currentFitCard
                     comparisonCard
                     manualAdjustCard
@@ -3325,7 +3096,7 @@ struct StepsCalibrationSheet: View {
                     .font(StrandFont.headline)
                     .foregroundStyle(StrandPalette.textPrimary)
                 Text(is5MG
-                     ? String(localized: "NOOP estimates your steps from your WHOOP's motion, calibrated to your phone's step count. It's an estimate, not a step counter — a WHOOP 5.0 / MG streams motion (not a step count) only with deep data on.")
+                     ? String(localized: "NOOP estimates your steps from your WHOOP's stored motion, calibrated to your phone's step count. It's an estimate, not a hardware step counter; normal WHOOP 5/MG history sync supplies the motion data.")
                      : String(localized: "NOOP estimates your steps from your WHOOP's motion, calibrated to your phone's step count. It's an estimate, not a step counter. A WHOOP 4.0 doesn't transmit steps."))
                     .font(StrandFont.subhead)
                     .foregroundStyle(StrandPalette.textSecondary)
@@ -3366,7 +3137,7 @@ struct StepsCalibrationSheet: View {
     /// The "why it's empty" line — a 5/MG needs the deep-data unlock before it streams motion at all.
     private var noMotionLead: String {
         if is5MG {
-            return String(localized: "We're not seeing any motion from your WHOOP 5.0 / MG yet. Unlike a 4.0, a 5/MG only streams motion (and history) once the experimental deep-data unlock is on — so until then there's nothing to estimate steps from. Importing history from WHOOP or Apple Health doesn't provide the strap motion this needs.")
+            return String(localized: "We're not seeing motion from your WHOOP 5.0 / MG yet. Keep NOOP connected and let strap history finish syncing; the experimental R22 flags are not required. Account or Apple Health imports do not contain the raw strap motion this estimate needs.")
         }
         return String(localized: "We're not seeing any motion from your strap yet. Steps are estimated from your WHOOP's banked motion history, so your strap needs to sync that history before NOOP has anything to count.")
     }
@@ -3374,7 +3145,7 @@ struct StepsCalibrationSheet: View {
     /// The "what to do" line — 5/MG points at the deep-data toggle (unless it's already on, then just sync).
     private var noMotionAction: String {
         if is5MG && !deepDataEnabled {
-            return String(localized: "Turn on Settings → \u{201C}Unlock WHOOP 5/MG deep data (R22)\u{201D}, reconnect your strap, then open NOOP near it and let a day or two of motion sync. Your step estimate and the calibration below fill in once motion lands.")
+            return String(localized: "Open NOOP near the strap and let WHOOP 5/MG history finish syncing. The step estimate and calibration fill in once enough stored motion has arrived; the legacy R22 experiment is not required.")
         }
         if is5MG {
             return String(localized: "Deep data is on — open NOOP near your strap and let it sync its motion history (a full first-run sync can take a while). Once a day or two of motion lands, your step estimate and the calibration below fill in.")
@@ -3412,6 +3183,18 @@ struct StepsCalibrationSheet: View {
                     Text("Not calibrated yet")
                         .font(StrandFont.bodyNumber)
                         .foregroundStyle(StrandPalette.textPrimary)
+                    // Only ask for phone-step days when phone-step days are what is actually missing.
+                    //
+                    // A step estimate is `motion * coefficient` (`StepsEstimateEngine.estimate`) and a
+                    // calibration point is the ratio `steps / motion`, so BOTH halves are required. With no
+                    // banked strap motion neither the estimate nor the fit can move however many days the
+                    // phone counts. The countdown below then names the half the user already has and hides
+                    // the half they do not — a field report asked whether entering Apple Health steps by
+                    // hand would start the calibration, which is exactly the conclusion it invites.
+                    //
+                    // The no-motion banner at the top of this sheet already explains the real blocker, so
+                    // the honest move is to stop competing with it rather than to add more copy.
+                    if !strapHasNoMotion {
                     // #589: a concrete countdown instead of a vague "a few days". Headline comes straight
                     // from the engine's needsMoreDays state so the wording matches the Today steps tile.
                     // #693: drive `have` off `profile.stepsCalibrationSampleDays` — the value the engine
@@ -3429,6 +3212,7 @@ struct StepsCalibrationSheet: View {
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
         }
@@ -3580,7 +3364,7 @@ struct StepsCalibrationSheet: View {
             .sorted { $0.day > $1.day }
 
         // Reconstruct the estimate for the most recent phone-covered days, motion-by-motion.
-        guard coeff > 0, let store = await repo.storeHandle() else { return }
+        guard coeff > 0 else { return }
         let cal = StepsEstimateEngine.Calibration(coefficient: coeff,
                                                   sampleDays: profile.stepsCalibrationSampleDays,
                                                   confidence: profile.stepsCalibrationConfidence,
@@ -3592,8 +3376,10 @@ struct StepsCalibrationSheet: View {
         for entry in phoneDays.prefix(10) {           // scan a few extra to fill 7 after motion gaps
             guard let dayDate = dayParser.date(from: entry.day) else { continue }
             let mid = Int(calendar.startOfDay(for: dayDate).timeIntervalSince1970)
-            let grav = (try? await store.gravitySamples(deviceId: repo.deviceId, from: mid,
-                                                        to: mid + 86_400 - 1, limit: 200_000)) ?? []
+            // #1643: the UNION, not `repo.deviceId` alone — a re-added strap leaves motion under both the
+            // active id and the canonical one, and reading either by itself makes this screen disagree
+            // with the estimator it is supposed to be reconstructing.
+            let grav = await repo.gravitySamplesUnion(from: mid, to: mid + 86_400 - 1)
             let motion = StepsEstimateEngine.dayMotionIntensity(grav)
             guard motion > 0, let est = StepsEstimateEngine.estimate(motion: motion, calibration: cal) else { continue }
             motions.append(motion)

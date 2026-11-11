@@ -27,7 +27,7 @@ class NeverBondedSelfDropGiveUpTest {
         assertTrue(
             WhoopBleClient.shouldCountNeverBondedSelfDrop(
                 wasConnected = true, didBond = false, intentionalDisconnect = false,
-                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false,
+                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false, helloSuppressed = false,
             )
         )
     }
@@ -38,7 +38,7 @@ class NeverBondedSelfDropGiveUpTest {
         assertFalse(
             WhoopBleClient.shouldCountNeverBondedSelfDrop(
                 wasConnected = true, didBond = true, intentionalDisconnect = false,
-                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false,
+                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false, helloSuppressed = false,
             )
         )
     }
@@ -48,7 +48,7 @@ class NeverBondedSelfDropGiveUpTest {
         assertFalse(
             WhoopBleClient.shouldCountNeverBondedSelfDrop(
                 wasConnected = false, didBond = false, intentionalDisconnect = false,
-                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false,
+                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false, helloSuppressed = false,
             )
         )
     }
@@ -58,7 +58,7 @@ class NeverBondedSelfDropGiveUpTest {
         assertFalse(
             WhoopBleClient.shouldCountNeverBondedSelfDrop(
                 wasConnected = true, didBond = false, intentionalDisconnect = true,
-                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false,
+                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false, helloSuppressed = false,
             )
         )
     }
@@ -68,7 +68,7 @@ class NeverBondedSelfDropGiveUpTest {
         assertFalse(
             WhoopBleClient.shouldCountNeverBondedSelfDrop(
                 wasConnected = true, didBond = false, intentionalDisconnect = false,
-                staleDirectBond = true, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false,
+                staleDirectBond = true, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false, helloSuppressed = false,
             )
         )
     }
@@ -79,7 +79,7 @@ class NeverBondedSelfDropGiveUpTest {
         assertFalse(
             WhoopBleClient.shouldCountNeverBondedSelfDrop(
                 wasConnected = true, didBond = false, intentionalDisconnect = false,
-                staleDirectBond = false, status = STATUS_LOCAL_TERMINATE, alreadyPausedForBondLoop = false,
+                staleDirectBond = false, status = STATUS_LOCAL_TERMINATE, alreadyPausedForBondLoop = false, helloSuppressed = false,
             )
         )
     }
@@ -89,7 +89,7 @@ class NeverBondedSelfDropGiveUpTest {
         assertFalse(
             WhoopBleClient.shouldCountNeverBondedSelfDrop(
                 wasConnected = true, didBond = false, intentionalDisconnect = false,
-                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = true,
+                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = true, helloSuppressed = false,
             )
         )
     }
@@ -103,8 +103,9 @@ class NeverBondedSelfDropGiveUpTest {
             val gate = WhoopBleClient.shouldCountNeverBondedSelfDrop(
                 wasConnected = true, didBond = false, intentionalDisconnect = false,
                 staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = backoff.shouldGiveUp(),
+                helloSuppressed = false,
             )
-            return gate && backoff.recordBounce()
+            return gate && backoff.recordBounce(attributable = true)
         }
         assertFalse("cycle 1 keeps trying", cycle())
         assertFalse("cycle 2 keeps trying", cycle())
@@ -123,28 +124,104 @@ class NeverBondedSelfDropGiveUpTest {
             "self-drop gate excludes the watchdog's own localTerminate",
             WhoopBleClient.shouldCountNeverBondedSelfDrop(
                 wasConnected = true, didBond = false, intentionalDisconnect = false,
-                staleDirectBond = false, status = STATUS_LOCAL_TERMINATE, alreadyPausedForBondLoop = false,
+                staleDirectBond = false, status = STATUS_LOCAL_TERMINATE, alreadyPausedForBondLoop = false, helloSuppressed = false,
             )
         )
-        backoff.recordBounce() // the watchdog would have counted this cycle itself
+        backoff.recordBounce(attributable = true) // the watchdog would have counted this cycle itself
         // cycles 2-4: the strap self-drops (status 0) before the watchdog — the gate counts these.
         repeat(2) {
             assertTrue(
                 WhoopBleClient.shouldCountNeverBondedSelfDrop(
                     wasConnected = true, didBond = false, intentionalDisconnect = false,
-                    staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false,
+                    staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false, helloSuppressed = false,
                 )
             )
-            assertFalse(backoff.recordBounce())
+            assertFalse(backoff.recordBounce(attributable = true))
         }
         // the 4th total bounce (2 watchdog-style + this self-drop) crosses the shared threshold.
         assertTrue(
             WhoopBleClient.shouldCountNeverBondedSelfDrop(
                 wasConnected = true, didBond = false, intentionalDisconnect = false,
-                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false,
+                staleDirectBond = false, status = STATUS_SELF_DROP, alreadyPausedForBondLoop = false, helloSuppressed = false,
             )
         )
-        assertTrue("shared streak crosses the give-up threshold at 4", backoff.recordBounce())
+        assertTrue("shared streak crosses the give-up threshold at 4", backoff.recordBounce(attributable = true))
         assertEquals(4, backoff.consecutiveBounces)
+    }
+
+    @Test
+    fun `a deliberately-suppressed strap is never counted as never-bonding`() {
+        // #1635: hello suppression makes didBond permanently false ON PURPOSE. Without this exclusion every
+        // ordinary drop - out of range, radio off, walking away from the phone - would look like "connects
+        // but never pairs", march this counter to a pause, and hand the user a re-pair guide blaming a stale
+        // pairing. Not-bonding is only evidence of a fault when we were actually trying to bond.
+        assertFalse(
+            WhoopBleClient.shouldCountNeverBondedSelfDrop(
+                wasConnected = true,
+                didBond = false,
+                intentionalDisconnect = false,
+                staleDirectBond = false,
+                status = 0,
+                alreadyPausedForBondLoop = false,
+                helloSuppressed = true,
+            )
+        )
+        // Same inputs, not suppressed: still counted, so the #982 protection is untouched.
+        assertTrue(
+            WhoopBleClient.shouldCountNeverBondedSelfDrop(
+                wasConnected = true,
+                didBond = false,
+                intentionalDisconnect = false,
+                staleDirectBond = false,
+                status = 0,
+                alreadyPausedForBondLoop = false,
+                helloSuppressed = false,
+            )
+        )
+    }
+
+    // --- #1997: a held link still bounds the loop, and only the explanation changes ---
+
+    /**
+     * The shape from the report: the MTU exchange is refused, so the link sits at the 23-byte default, and
+     * not one frame arrives. Both halves are required. A refused exchange on a link that still carried
+     * traffic is a different story, and a silent link that negotiated its MTU fine is the #1809 shape,
+     * which this must not claim.
+     */
+    @Test
+    fun `a held link is the OS signal AND no traffic`() {
+        assertTrue(WhoopBleClient.heldLinkWithoutTraffic(aclHeld = true, inboundFrames = 0))
+        assertFalse(WhoopBleClient.heldLinkWithoutTraffic(aclHeld = true, inboundFrames = 6))
+    }
+
+    /**
+     * The narrowing that matters, and the reason it was added. A refused exchange with no traffic ALSO
+     * describes a stale pairing, where the right advice is the opposite: re-pair. The #1997 reporter
+     * turned out to be exactly that, with no official WHOOP app installed and a bond that had gone stale.
+     * Without the OS actually reporting the connection held, this must not claim it.
+     */
+    @Test
+    fun `a stale pairing is not mistaken for a held connection`() {
+        assertFalse(WhoopBleClient.heldLinkWithoutTraffic(aclHeld = false, inboundFrames = 0))
+    }
+
+    /**
+     * The correction that matters: a held link STILL counts toward the give-up.
+     *
+     * The first version of this fix excluded it, on the reasoning that nothing was exchanged for the strap
+     * to refuse. That was wrong in a way only reachable by asking what else would stop the loop:
+     * CLIENT_HELLO is 5/MG only, so on the reporter's WHOOP 4.0 the other give-up never fires, and
+     * excluding these links would leave the connect-drop-retry cycle unbounded, draining both batteries.
+     * That is exactly what #982 exists to prevent. The pause is correct; only the guide was wrong.
+     */
+    @Test
+    fun `a held link still counts, so the retry loop stays bounded`() {
+        assertTrue(
+            WhoopBleClient.shouldCountNeverBondedSelfDrop(
+                wasConnected = true, didBond = false, intentionalDisconnect = false,
+                staleDirectBond = false, status = 0, alreadyPausedForBondLoop = false,
+                helloSuppressed = false,
+            ),
+        )
     }
 }

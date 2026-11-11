@@ -30,7 +30,13 @@ enum class KeyMetric(val raw: String, @StringRes val titleRes: Int) {
     RESPIRATORY("respiratory", R.string.today_metric_respiratory),
     STEPS("steps", R.string.today_metric_steps),
     WEIGHT("weight", R.string.today_metric_weight),
-    CALORIES("calories", R.string.today_metric_calories);
+    CALORIES("calories", R.string.today_metric_calories),
+    // Added 2026-08-24 (queue 11c follow-up): Skin Temp was already a "Your Cards" (DashboardCard)
+    // option, but was never offered as a Key Metrics tile — not a bug, just never added. Reuses
+    // DashboardCard.SKIN_TEMP's own title resource rather than adding a new one. New case, NOT added
+    // to defaultOrder below, so an existing user's saved layout (and a fresh install's default) is
+    // byte-identical to before; only opts in via the layout editor.
+    SKIN_TEMP("skinTemp", R.string.today_card_skin_temp);
 
     companion object {
         fun fromRaw(raw: String?): KeyMetric? = entries.firstOrNull { it.raw == raw }
@@ -53,8 +59,8 @@ object KeyMetricPrefs {
     private const val KEY_LAYOUT = "today.keyMetrics"
     private const val KEY_DETAILED = "today.keyMetricsDetailed"
 
-    /** Whether the Key-Metrics tiles render DETAILED — taller/squarer with a 14-day trend graph under the
-     *  fill bar. Display-only, default off (the compact ktile look). Set from the #251 editor's switch;
+    /** Whether the Key-Metrics tiles render DETAILED — taller/squarer with a trend graph under the
+     *  fill bar. Display-only, default off (the Today-only compact ktile look). Set by the editor;
      *  key name is parity-ready for the macOS/iOS twin (@AppStorage "today.keyMetricsDetailed"). */
     fun detailed(context: Context): Boolean =
         NoopPrefs.of(context).getBoolean(KEY_DETAILED, false)

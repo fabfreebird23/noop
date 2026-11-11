@@ -31,7 +31,33 @@ class ChargeEffortRestScoringTest {
     fun effort_scaleConstantsAreRescaled() {
         // The whole rebrand is a pure linear rescale: maxStrain 21→100, denominator unchanged.
         assertEquals(100.0, StrainScorer.maxStrain, 0.0)
+        assertEquals(21.0, StrainScorer.whoopMaxStrain, 0.0)
         assertEquals(7201.0, StrainScorer.strainDenominator, 0.0)
+    }
+
+    @Test
+    fun effort_whoopAxisValuesMapAcrossTheWholeRange() {
+        val cases = listOf(
+            0.0 to 0.0,
+            1.0 to 4.761904761904762,
+            3.5 to 16.666666666666668,
+            7.0 to 33.333333333333336,
+            10.5 to 50.0,
+            12.5 to 59.523809523809526,
+            14.0 to 66.66666666666667,
+            17.5 to 83.33333333333333,
+            20.0 to 95.23809523809524,
+            21.0 to 100.0,
+        )
+
+        cases.forEach { (whoop, effort) ->
+            assertEquals(
+                "WHOOP $whoop must map proportionally onto 0–100",
+                effort,
+                StrainScorer.effortValueFromWhoopStrain(whoop),
+                0.0,
+            )
+        }
     }
 
     @Test
@@ -336,6 +362,77 @@ class ChargeEffortRestScoringTest {
             ScoreConfidence.forRest(
                 hasSession = true, hasStagedSleep = true,
                 asleepSeconds = asleep, restorativeSeconds = asleep * 0.03, efficiency = 0.95,
+            ),
+        )
+    }
+
+    // Hypnogram coverage: a stage timeline that accounts for only part of the span it claims cannot earn
+    // a SOLID Rest. The case the other two guards structurally cannot see. Mirrors Swift.
+    @Test
+    fun confidence_restCoverageDowngradesHoledHypnogram() {
+        val asleep = 8.0 * 3600.0
+        assertEquals(
+            ScoreConfidence.BUILDING,
+            ScoreConfidence.forRest(
+                hasSession = true, hasStagedSleep = true,
+                asleepSeconds = asleep, restorativeSeconds = asleep * 0.45, efficiency = 0.80,
+                stageCoverage = 0.23,
+            ),
+        )
+    }
+
+    @Test
+    fun confidence_restCoverageKeepsSolidWhenTimelineCoversItsSpan() {
+        val asleep = 8.0 * 3600.0
+        assertEquals(
+            ScoreConfidence.SOLID,
+            ScoreConfidence.forRest(
+                hasSession = true, hasStagedSleep = true,
+                asleepSeconds = asleep, restorativeSeconds = asleep * 0.45, efficiency = 0.80,
+                stageCoverage = 1.0,
+            ),
+        )
+    }
+
+    /** Unknown coverage must fail OPEN — null is "not measured", never "measured badly". */
+    @Test
+    fun confidence_restCoverageUnknownDoesNotDowngrade() {
+        val asleep = 8.0 * 3600.0
+        assertEquals(
+            ScoreConfidence.SOLID,
+            ScoreConfidence.forRest(
+                hasSession = true, hasStagedSleep = true,
+                asleepSeconds = asleep, restorativeSeconds = asleep * 0.45, efficiency = 0.80,
+                stageCoverage = null,
+            ),
+        )
+    }
+
+    /**
+     * The measured night this guard exists for (2026-08-18, Oura ring vs a paired WHOOP strap): the
+     * hypnogram covered 140 of 601 minutes, so NOOP stored 70 minutes of sleep where the strap recorded
+     * 494. It read SOLID because NEITHER existing guard applies — gravitySparse is false (Oura banks no
+     * gravity at all) and H9 needs efficiency >= 0.85 against this night's 0.50. Mirrors Swift.
+     */
+    @Test
+    fun confidence_restCoverageCatchesTheNightH9AndGravityMiss() {
+        val asleep = 70.0 * 60.0
+        val restorative = asleep * 0.45
+        assertEquals(
+            "precondition: without coverage this night reads SOLID — that is the bug",
+            ScoreConfidence.SOLID,
+            ScoreConfidence.forRest(
+                hasSession = true, hasStagedSleep = true,
+                asleepSeconds = asleep, restorativeSeconds = restorative, efficiency = 0.50,
+                gravitySparse = false,
+            ),
+        )
+        assertEquals(
+            ScoreConfidence.BUILDING,
+            ScoreConfidence.forRest(
+                hasSession = true, hasStagedSleep = true,
+                asleepSeconds = asleep, restorativeSeconds = restorative, efficiency = 0.50,
+                gravitySparse = false, stageCoverage = 140.0 / 601.0,
             ),
         )
     }

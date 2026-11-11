@@ -56,6 +56,16 @@ final class ProfileStore: ObservableObject {
     @Published var stepsCalibrationManual: Bool { didSet { d.set(stepsCalibrationManual, forKey: K.stepsManualFlag) } }
     /// User-set manual coefficient. 0 = auto-fit (nil to the engine); > 0 = manual override.
     @Published var stepsManualCoefficient: Double { didSet { d.set(max(0, stepsManualCoefficient), forKey: K.stepsManualCoeff) } }
+    /// #1816: true when the strap has banked ANY motion (gravity samples → `dayMotionIntensity > 0`)
+    /// in the calibration scan window. Written by `IntelligenceEngine` on every analytics pass so it
+    /// tracks a fresh strap's first sync without a separate query. The Today tile reads this to decide
+    /// whether "Need N more days where your phone also counted steps" is the honest caption or a lie:
+    /// a step estimate is `motion * coefficient`, so with the motion half missing neither the estimate
+    /// nor the fit moves however many phone-counted days the user collects. The caption that names only
+    /// the phone half is actively misleading — it sent a field reporter to enter Apple Health steps by
+    /// hand expecting calibration to start, which it cannot without strap motion. Twin of Android's
+    /// `ProfileStore.stepsHasBankedMotion`.
+    @Published var stepsHasBankedMotion: Bool { didSet { d.set(stepsHasBankedMotion, forKey: K.stepsHasMotion) } }
 
     // ── Profile picture (optional, on-device only) ──────────────────────────────────────────────
     /// The user's chosen profile photo as JPEG bytes, or nil for the default SF-Symbol fallback.
@@ -85,6 +95,7 @@ final class ProfileStore: ObservableObject {
         static let stepsConfidence = "profile.stepsCalibrationConfidence"
         static let stepsManualFlag = "profile.stepsCalibrationManual"
         static let stepsManualCoeff = "profile.stepsManualCoefficient"
+        static let stepsHasMotion = "profile.stepsHasBankedMotion"
         static let avatar = "profile.avatarImageData"
     }
 
@@ -124,18 +135,11 @@ final class ProfileStore: ObservableObject {
         stepsCalibrationConfidence = d.object(forKey: K.stepsConfidence) as? Double ?? 0
         stepsCalibrationManual = d.object(forKey: K.stepsManualFlag) as? Bool ?? false
         stepsManualCoefficient = max(0, d.object(forKey: K.stepsManualCoeff) as? Double ?? 0)
+        stepsHasBankedMotion = d.object(forKey: K.stepsHasMotion) as? Bool ?? false
         avatarImageData = d.data(forKey: K.avatar)
     }
 
     // MARK: - Profile picture
-
-    /// The profile photo as a SwiftUI `Image`, or nil when none is set (callers fall back to the
-    /// `person.crop.circle` SF Symbol). Bridges the stored JPEG bytes through the platform bitmap
-    /// type (`NSImage`/`UIImage`) via the shared `Image(platformImage:)` initializer.
-    var avatarImage: Image? {
-        guard let data = avatarImageData, let img = PlatformImage(data: data) else { return nil }
-        return Image(platformImage: img)
-    }
 
     /// Whether a profile photo is set.
     var hasAvatar: Bool { avatarImageData != nil }
@@ -178,6 +182,25 @@ final class ProfileStore: ObservableObject {
     /// an out-of-range age.
     nonisolated static var dateOfBirthRange: ClosedRange<Date> {
         dateOfBirth(forAge: 100)...dateOfBirth(forAge: 13)
+    }
+
+    /// The effective HRmax an EFFORT score is computed against, resolved exactly as `AnalyticsEngine`
+    /// resolves it: the manual override when one is set, else Tanaka from age, else nil.
+    ///
+    /// Deliberately not `hrMax` below, which answers a different question and differs from this one in
+    /// two ways: it rounds Tanaka to an Int, and for an age-less profile it returns 208 rather than nil.
+    /// A day scored through it would not match the day the engine stored either.
+    ///
+    /// #2460: today's live Effort is computed in the Today views rather than read from the scored day,
+    /// and both of them passed Tanaka here with no reference to the override. Because the ring shows
+    /// `StrainScorer.effectiveEffort(live:stored:)`, which is `max(live, stored)`, and an override is
+    /// normally set BECAUSE the real maximum is above the formula, the Tanaka value was not merely
+    /// different, it was always the larger of the two and so always the one displayed. The setting
+    /// therefore did nothing until the day stopped being today. Both views now read this, so the live
+    /// value and the stored day are scored against one number.
+    var effortHRmax: Double? {
+        if hrMaxOverride > 0 { return Double(hrMaxOverride) }
+        return age > 0 ? StrainScorer.tanakaHRmax(age: Double(age)) : nil
     }
 
     /// Tanaka estimate unless overridden.

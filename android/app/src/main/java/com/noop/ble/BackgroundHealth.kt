@@ -12,11 +12,22 @@ import android.provider.Settings
  * but aggressive OEM battery managers kill even those, so the reliable lever is a USER action:
  * whitelist NOOP from battery optimisation (and, on the worst vendors, enable auto-start). This
  * centralises the detection and the intents that fix it, so the Settings "Keep NOOP alive overnight"
- * toggle and the Test Centre diagnostics share ONE source of truth for the vendor set + exempt check.
+ * row and the Test Centre diagnostics share ONE source of truth for the vendor set + exempt check.
  *
  * POPUP DISCIPLINE: nothing here ever fires a system dialog on its own. [batteryExemptionIntent] and
  * [oemAutostartIntent] only build Intents — the caller starts one exactly when the user taps, and the
- * toggle reflects live [isBatteryExempt] state so an already-exempt user is never prompted again.
+ * row reflects live [isBatteryExempt] state so an already-exempt user is never prompted again.
+ *
+ * That row is a one-way PROMPT, not a setting, and it is gated on [isAggressiveVendor] — it appears
+ * only on a ROM that actually kills background work, and only while [isBatteryExempt] is false.
+ *
+ * The shape is forced by the permission. Android lets an app ASK for the exemption and gives it no way
+ * to hand the grant back, so a bidirectional control could never honour half its input: as a switch it
+ * was reported broken ("I can enable it but can't disable it"), and as a "Manage"/"Allow" action it
+ * read as the control having been taken away. Both readings were fair. A one-way grant gets a one-way
+ * control — state the problem, offer the single action that works, then disappear once it is done, so
+ * nothing on screen implies an off that does not exist. Revoking lives in Android's own battery
+ * settings, and the Test Centre reports the exempt state for anyone diagnosing a lost night.
  *
  * The whitelist adds NO battery cost of its own: it removes a premature kill, it does not add work.
  * The real cost is the existing "Keep connected in the background" / "Continuous HRV" / "Overnight only"

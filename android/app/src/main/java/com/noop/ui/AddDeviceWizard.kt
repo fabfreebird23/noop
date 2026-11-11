@@ -590,8 +590,7 @@ fun AddDeviceWizard(
             title = { Text(uiString(R.string.l10n_add_device_wizard_make_this_your_active_device_b425485c), style = NoopType.title2, color = Palette.textPrimary) },
             text = {
                 Text(
-                    uiString(R.string.l10n_add_device_wizard_make_confirmname_your_active_device_now_90ceb73e, confirmName) +
-                        "this any time.",
+                    uiString(R.string.l10n_add_device_wizard_make_confirmname_your_active_device_now_90ceb73e, confirmName),
                     style = NoopType.subhead,
                     color = Palette.textSecondary,
                 )
@@ -700,7 +699,7 @@ private fun ouraHeaderSubtitle(step: OuraStep, advanced: Boolean): String? = whe
 @Composable
 private fun TypeStep(onPick: (DeviceType) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        TypeRow(Icons.Filled.Watch, DeviceType.Whoop5MG.title, "Newer WHOOP band. Experimental in NOOP") {
+        TypeRow(Icons.Filled.Watch, DeviceType.Whoop5MG.title, "Newer WHOOP band with live data and history sync") {
             onPick(DeviceType.Whoop5MG)
         }
         TypeRow(Icons.Filled.Watch, DeviceType.Whoop4.title, "NOOP's primary, fully-supported band") {
@@ -829,9 +828,7 @@ private fun OnePhoneWarningCard() {
                 color = Palette.statusWarning,
             )
             Text(
-                uiString(R.string.l10n_add_device_wizard_a_whoop_strap_bonds_to_a_d39bdf4a) +
-                    "to the official WHOOP app, and the other way round. It's reversible: pair it in the " +
-                    "other app whenever you want it back.",
+                uiString(R.string.l10n_add_device_wizard_a_whoop_strap_bonds_to_a_d39bdf4a),
                 style = NoopType.footnote,
                 color = Palette.statusWarning,
             )
@@ -1338,7 +1335,10 @@ private fun OuraPickStep(
                     DiscoveredRow(
                         name = ring.name,
                         // Subtitle = the detected generation (best-effort); "Oura ring" when undetected.
-                        subtitle = ring.detectedGen?.displayName ?: "Oura ring",
+                        // Localised: a ring that advertises no local name has no detectable generation
+                        // either, so this fallback is exactly what the #1776 bonded-ring case renders.
+                        subtitle = ring.detectedGen?.displayName
+                            ?: uiString(R.string.l10n_add_device_wizard_oura_ring_e3431536),
                         rssi = ring.rssi,
                         onTap = { onPick(ring) },
                     )
@@ -1381,9 +1381,7 @@ private fun OuraConfirmStep(
                 }
             }
             Text(
-                uiString(R.string.l10n_add_device_wizard_beta_is_an_on_device_estimate_128563e0) +
-                    "are a raw motion count, and HRV needs you to be still. No Oura Readiness or SpO2 " +
-                    "percentage comes off the ring (import an Oura file for those).",
+                uiString(R.string.l10n_add_device_wizard_beta_is_an_on_device_estimate_128563e0),
                 style = NoopType.footnote,
                 color = Palette.textTertiary,
             )
@@ -1480,8 +1478,7 @@ private fun OuraFailedStep(reason: String?, onTryAgain: () -> Unit, onUseFileImp
         )
         // Honest recovery reassurance (Swift parity): a failed adopt never bricks the ring.
         Text(
-            uiString(R.string.l10n_add_device_wizard_the_ring_is_not_bricked_to_5efd1b3d) +
-                "up in the Oura app.",
+            uiString(R.string.l10n_add_device_wizard_the_ring_is_not_bricked_to_5efd1b3d),
             style = NoopType.subhead,
             color = Palette.textSecondary,
         )

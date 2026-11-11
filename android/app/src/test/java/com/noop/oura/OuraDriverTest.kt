@@ -48,6 +48,7 @@ class OuraDriverTest {
         val onReady = d.nextStep(OuraTransition.Ready)
         assertEquals(OuraDriverPhase.Authenticating, d.phase)
         assertEquals(listOf("notify_all", "get_nonce"), onReady.map { it.label })
+        assertArrayEquals(intArrayOf(0x1C, 0x01, 0x3F), onReady[0].bytes)   // the default mask, unchanged
         assertArrayEquals(intArrayOf(0x2F, 0x01, 0x2B), onReady[1].bytes)
 
         // nonce -> submit proof.
@@ -79,6 +80,49 @@ class OuraDriverTest {
     }
 
     // MARK: - Honest pairing path when no key
+
+    // MARK: - Suspended connect: auth success without the live-HR triplet
+
+    /**
+     * With `liveHRWanted` cleared (the app's screen-off suspend is in force), auth success goes straight
+     * to `Streaming` and writes NOTHING to the daytime-HR feature: no `dhr_read`, no `dhr_enable`, no
+     * `dhr_subscribe`. The history path still works from that phase, and a stray enable ACK cannot
+     * restart the triplet. Twin of the Swift `testAuthSuccessSkipsLiveHRTripletWhenNotWanted`.
+     */
+    @Test
+    fun testAuthSuccessSkipsLiveHRTripletWhenNotWanted() {
+        val d = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = key)
+        d.liveHRWanted = false
+        d.nextStep(OuraTransition.Ready)
+        d.nextStep(OuraTransition.NonceReceived(bytes("0102030405060708090a0b0c0d0e0f")))
+
+        val onAuth = d.nextStep(OuraTransition.AuthCompleted(OuraAuthStatus.SUCCESS))
+        assertTrue("a suspended connect must not arm daytime HR", onAuth.isEmpty())
+        assertEquals(OuraDriverPhase.Streaming, d.phase)
+
+        // A stray enable ACK outside EnablingLiveHR is inert — the triplet does not start late.
+        assertTrue(d.nextStep(OuraTransition.EnableAckReceived).isEmpty())
+        assertEquals(OuraDriverPhase.Streaming, d.phase)
+
+        // The drain runs from Streaming exactly as after a full triplet.
+        val fetch = d.nextStep(OuraTransition.StartHistoryFetch(cursor = 0L))
+        assertEquals(listOf("flush_buffer", "get_events"), fetch.map { it.label })
+        assertEquals(OuraDriverPhase.FetchingHistory, d.phase)
+        d.nextStep(OuraTransition.HistoryCursorAdvanced(cursor = 0L, moreData = false))
+        assertEquals(OuraDriverPhase.Streaming, d.phase)
+    }
+
+    /** The default is the historical behaviour: auth success starts the triplet with `dhr_read`. */
+    @Test
+    fun testLiveHRWantedDefaultsToArmingTheTriplet() {
+        val d = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = key)
+        assertTrue(d.liveHRWanted)
+        d.nextStep(OuraTransition.Ready)
+        d.nextStep(OuraTransition.NonceReceived(bytes("0102030405060708090a0b0c0d0e0f")))
+        val onAuth = d.nextStep(OuraTransition.AuthCompleted(OuraAuthStatus.SUCCESS))
+        assertEquals(listOf("dhr_read"), onAuth.map { it.label })
+        assertEquals(OuraDriverPhase.EnablingLiveHR, d.phase)
+    }
 
     @Test
     fun testNoKeyDrivesNeedsKeyInstall() {
@@ -790,15 +834,21 @@ class OuraDriverTest {
     // MARK: - Notification-level ingest (one-packet-per-notification, twin of Swift dae3d7a4)
 
     @Test
-    fun testIngestNotificationParsesOnePacketPerValue() {
+    fun testIngestNotificationDecodesEveryPacketWhenTheValueTilesExactly() {
         val d = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = key)
         val reassembler = OuraReassembler()
-        // A second record packed behind the first is padding under the one-packet model: only the
-        // FIRST record decodes (the old buffering loop minted phantom records from such tails).
+        // A value that tiles exactly into two complete packets decodes BOTH (the ring packs like this
+        // when serving the official app, 2026-09-15): the SpO2 record plus the temp record's two samples.
         val value = bytes("7b060200010003ca" + "460802000100420e470e")
         val events = d.ingest(notification = value, reassembler = reassembler)
-        assertEquals(1, events.size)
+        assertEquals(3, events.size)
         assertEquals(OuraEvent.Spo2(OuraSpO2(ringTimestamp = rt, value = 970)), events[0])
+        assertEquals(36.50, (events[1] as OuraEvent.Temp).value.celsius, 1e-9)
+        assertEquals(36.55, (events[2] as OuraEvent.Temp).value.celsius, 1e-9)
+        // The phantom-storm guarantee kept: a tail that does NOT tile (the 0x46's declared length
+        // overshoots the value) is ignored, never walked into records.
+        val cut = d.ingest(notification = bytes("7b060200010003ca" + "460802000100420e47"), reassembler = reassembler)
+        assertEquals(listOf<OuraEvent>(OuraEvent.Spo2(OuraSpO2(ringTimestamp = rt, value = 970))), cut)
         // Each notification decodes on its own: the temp record in its OWN value decodes fully.
         val tempEvents = d.ingest(notification = bytes("460802000100420e470e"), reassembler = reassembler)
         assertEquals(2, tempEvents.size)
@@ -870,5 +920,37 @@ class OuraDriverTest {
             d.adoptSyncTimeAnchor(ringTimestamp = anchorRt, unixSeconds = futureAnchorSeconds))
         assertNull("but converting a 2034 sample is rejected because it is after now (2023)",
             d.unixSeconds(forRingTimestamp = anchorRt))
+    }
+
+    // MARK: - SetNotification mask (the packed-notification A/B, OURA_PROTOCOL.md s2.3)
+
+    /** Twin of Swift's testNotificationMaskFullReachesBothHandshakePaths: the official app's `ff` mask
+     *  reaches BOTH handshake paths (Ready and the post-install re-auth), carries its value in the label,
+     *  and changes nothing else. The default stays `3f`. */
+    @Test
+    fun testNotificationMaskFullReachesBothHandshakePaths() {
+        assertArrayEquals(intArrayOf(0x1C, 0x01, 0x3F), OuraCommands.enableAllNotifications().bytes)
+        assertEquals("notify_all", OuraCommands.enableAllNotifications().label)
+        assertArrayEquals(intArrayOf(0x1C, 0x01, 0xFF),
+            OuraCommands.enableAllNotifications(mask = OuraCommands.NOTIFICATION_MASK_FULL).bytes)
+        assertEquals("notify_all(ff)",
+            OuraCommands.enableAllNotifications(mask = OuraCommands.NOTIFICATION_MASK_FULL).label)
+
+        val d = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = key,
+                           notificationMask = OuraCommands.NOTIFICATION_MASK_FULL)
+        val onReady = d.nextStep(OuraTransition.Ready)
+        assertEquals(OuraDriverPhase.Authenticating, d.phase)
+        assertEquals(listOf("notify_all(ff)", "get_nonce"), onReady.map { it.label })
+        assertArrayEquals(intArrayOf(0x1C, 0x01, 0xFF), onReady[0].bytes)
+        assertArrayEquals(intArrayOf(0x2F, 0x01, 0x2B), onReady[1].bytes)
+
+        // The post-install re-auth path sends the same mask.
+        val installing = OuraDriver(ringGen = OuraRingGen.GEN3, authKey = null, allowKeyInstall = true,
+                                    notificationMask = OuraCommands.NOTIFICATION_MASK_FULL)
+        assertEquals(emptyList<OuraCommand>(), installing.nextStep(OuraTransition.Ready))
+        assertNotNull(installing.beginKeyInstall(key))
+        val onAck = installing.keyInstallAcknowledged()
+        assertEquals(listOf("notify_all(ff)", "get_nonce"), onAck.map { it.label })
+        assertArrayEquals(intArrayOf(0x1C, 0x01, 0xFF), onAck[0].bytes)
     }
 }

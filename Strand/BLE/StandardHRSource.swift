@@ -126,9 +126,9 @@ public final class StandardHRSource: NSObject, ObservableObject {
 
     // MARK: - Sample buffer
 
-    /// Buffered (hr, rr, ts) readings, flushed to `persist` in batches to keep the write path off
+    /// Buffered (hr, rr, contact, ts) readings, flushed to `persist` in batches to keep the write path off
     /// the per-notification hot loop.
-    private var buffer: [(hr: Int, rr: [Int], ts: Int)] = []
+    private var buffer: [(hr: Int, rr: [Int], contact: StandardHRContact, ts: Int)] = []
     private var lastFlush: Date = .init()
     /// Flush thresholds — whichever trips first.
     private let flushCount = 30
@@ -187,6 +187,15 @@ public final class StandardHRSource: NSObject, ObservableObject {
     /// Connect to the chosen discovered strap and start streaming its HR.
     public func connect(_ id: UUID) {
         stopScan()
+        // Before the radio is up a retrieve answers nothing even for a strap this device has been bonded
+        // to for weeks, and the branch below would read that as "never seen" and arm a scan (#2433).
+        // Park the intent instead: `centralManagerDidUpdateState` asks again once the answer means
+        // something.
+        guard central.state == .poweredOn else {
+            pendingConnectID = id
+            log("HR-strap: connect to \(id) deferred - Bluetooth not powered on (state=\(central.state.rawValue))")
+            return
+        }
         // Reach the peripheral directly: use the freshly-discovered handle if we have it, else ask
         // CoreBluetooth for the cached peripheral by identifier (a strap we've connected before). This is
         // what lets the active-strap switch CONNECT without depending on a fresh scan — the switchToStrap
@@ -202,11 +211,6 @@ public final class StandardHRSource: NSObject, ObservableObject {
         seenPeripherals[id] = p
         peripheral = p
         p.delegate = self
-        guard central.state == .poweredOn else {
-            pendingConnectID = id
-            log("HR-strap: Bluetooth not powered on — connect to \(id) deferred until ready")
-            return
-        }
         log("HR-strap: connecting to \(id)")
         central.connect(p, options: nil)
     }
@@ -230,8 +234,8 @@ public final class StandardHRSource: NSObject, ObservableObject {
 
     // MARK: - Buffer / persistence
 
-    private func enqueue(hr: Int, rr: [Int]) {
-        buffer.append((hr: hr, rr: rr, ts: Int(Date().timeIntervalSince1970)))
+    private func enqueue(hr: Int, rr: [Int], contact: StandardHRContact) {
+        buffer.append((hr: hr, rr: rr, contact: contact, ts: Int(Date().timeIntervalSince1970)))
         if buffer.count >= flushCount || Date().timeIntervalSince(lastFlush) >= flushInterval {
             flush()
         }
@@ -240,7 +244,8 @@ public final class StandardHRSource: NSObject, ObservableObject {
     private func flush() {
         guard !buffer.isEmpty else { lastFlush = Date(); return }
         for sample in buffer {
-            persist(StandardHRMapping.samples(fromHR: sample.hr, rr: sample.rr, at: sample.ts))
+            persist(StandardHRMapping.samples(fromHR: sample.hr, rr: sample.rr,
+                                               contact: sample.contact, at: sample.ts))
         }
         buffer.removeAll()
         lastFlush = Date()
@@ -282,12 +287,40 @@ extension StandardHRSource: @preconcurrency CBCentralManagerDelegate {
         switch central.state {
         case .poweredOn:
             // Replay any intent that arrived before the radio was ready.
-            if let id = pendingConnectID, let p = seenPeripherals[id] {
-                pendingConnectID = nil
-                central.connect(p, options: nil)
-            } else if scanning {
+            // The retrieve is re-issued HERE rather than trusting the one that ran while the state was
+            // still `.unknown`: that one answers nothing even for a bonded strap, which used to drop this
+            // replay into the scan branch and leave it unreachable off-screen, where iOS throttles
+            // scanning hard (#2433).
+            let parked = pendingConnectID
+            let held = parked.flatMap { seenPeripherals[$0] }
+            let fresh = held == nil
+                ? parked.flatMap { central.retrievePeripherals(withIdentifiers: [$0]).first }
+                : nil
+            switch PendingConnect.replay(isPending: parked != nil,
+                                         isHeld: held != nil,
+                                         didRetrieve: fresh != nil,
+                                         isScanning: scanning) {
+            case .connect:
+                if let id = parked, let p = held ?? fresh {
+                    pendingConnectID = nil
+                    seenPeripherals[id] = p
+                    peripheral = p
+                    p.delegate = self
+                    log("HR-strap: connecting to \(id) - targeted (the radio was not up when it was asked for)")
+                    central.connect(p, options: nil)
+                }
+            case .scan:
                 central.scanForPeripherals(withServices: [Self.heartRateService],
                                            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+            case .discover:
+                // Nothing to connect and no scan armed, because the intent was parked before the
+                // retrieve. `scan()` arms `scanning` and `didDiscover` connects the parked id on sight.
+                // Named, because this whole defect was read off log lines: a line that says a
+                // connect could not be resolved is only useful if it says which device.
+                if let id = parked { log("HR-strap: \(id) is not resolvable yet - discovering to find it") }
+                scan()
+            case .idle:
+                break
             }
         default:
             // Radio off / unauthorized / resetting → the link is not live.
@@ -304,7 +337,7 @@ extension StandardHRSource: @preconcurrency CBCentralManagerDelegate {
         seenPeripherals[id] = peripheral
         let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = advName ?? peripheral.name ?? "Heart Rate Strap"
-        if firstSight { log("HR-strap: found \(name) (\(id)) rssi \(RSSI.intValue)") }
+        if firstSight { log("HR-strap: found \(LiveState.logSafeDeviceName(name)) (\(id)) rssi \(RSSI.intValue)") }
         let strap = DiscoveredStrap(id: id, name: name, rssi: RSSI.intValue)
         discovered = Self.upsertByProximity(discovered, strap)
         // If we were scanning specifically to reach this strap (a not-yet-cached active strap), connect now
@@ -478,6 +511,6 @@ extension StandardHRSource: @preconcurrency CBPeripheralDelegate {
         live.heartRate = parsed.hr
         live.setRRIntervals(parsed.rr)
         live.connected = true
-        enqueue(hr: parsed.hr, rr: parsed.rr)
+        enqueue(hr: parsed.hr, rr: parsed.rr, contact: parsed.contact)
     }
 }

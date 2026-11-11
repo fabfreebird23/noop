@@ -28,6 +28,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -49,6 +51,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoGraph
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.platform.LocalContext
+import android.content.ClipData
+import android.content.ClipboardManager
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -59,6 +66,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import android.content.Context
 import androidx.compose.ui.draw.drawBehind
@@ -74,6 +82,7 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -502,12 +511,39 @@ internal fun AutoSizeValue(
         textAlign = textAlign,
         modifier = modifier,
         onTextLayout = { result ->
-            if (result.didOverflowWidth && scale > minScale) {
+            // `lineCount > 0` before asking: isLineEllipsized carries a range precondition, and this
+            // composable is reached from every StatTile on every screen with a computed value, so the
+            // cost of a layout that reports no lines would be an app-wide crash rather than a wrong font
+            // size. One comparison buys the question away.
+            val ellipsized = result.lineCount > 0 && result.isLineEllipsized(0)
+            if (shouldShrinkValue(result.didOverflowWidth, ellipsized, scale, minScale)) {
                 scale = maxOf(minScale, scale - 0.08f)
             }
         },
     )
 }
+
+/**
+ * Whether a value laid out like this should take another step down. Pure, so the rule is testable
+ * away from Compose: the composable above cannot be laid out by the plain-JVM suite, and the source
+ * grep that stood here instead would have passed just as happily with the condition inverted.
+ *
+ * Either signal means the value did not fit. [didOverflowWidth] is what the loop originally keyed on
+ * alone, and it goes false under `TextOverflow.Ellipsis` because Compose constrains the laid-out
+ * paragraph to the width it was given: the ellipsis removes the evidence of the overflow it is
+ * reporting. [lineEllipsized] carries that case. Keeping both means the overflow modes that DO report
+ * an unconstrained width still drive the loop. (#2171, @kavemang)
+ *
+ * The floor is strict on purpose. At exactly [minScale] the answer is no, so a value that still does
+ * not fit at 0.6x truncates rather than stepping below the size the Swift tile's minimumScaleFactor
+ * pins, and the loop terminates instead of resizing on every layout pass.
+ */
+internal fun shouldShrinkValue(
+    didOverflowWidth: Boolean,
+    lineEllipsized: Boolean,
+    scale: Float,
+    minScale: Float,
+): Boolean = (didOverflowWidth || lineEllipsized) && scale > minScale
 
 @Composable
 fun StatTile(
@@ -523,6 +559,12 @@ fun StatTile(
     // intrinsic size. Used by narrow two-column tiles where a wide chip (e.g. "1234 kcal" or
     // "+10 vs base") would otherwise starve the reading column and clip its value. The default
     // keeps callers that have enough width exactly as they were.
+    //
+    // NO CALLER PASSES TRUE ANY MORE, and reach for a shorter chip before reaching for this (#2145).
+    // It splits the row evenly, which starves BOTH sides once the chip is wide: the value is weighted
+    // with fill = true, so it is held to exactly its share however little the chip turns out to need.
+    // The stress marker tiles clipped their reading AND their chip this way. The workouts feed went
+    // full width, the stress tiles shortened the chip; both then wanted the natural-width path.
     compactDelta: Boolean = false,
 ) {
     // Each tile borrows its accent as a faint card wash, so a metric reads as part of its
@@ -607,6 +649,7 @@ fun <T> SegmentedPillControl(
     // control can teach that an option exists before it is usable, e.g. trend ranges that unlock as
     // history builds. Defaulted so every existing call site is untouched.
     enabled: (T) -> Boolean = { true },
+    accessibilityLabel: String? = null,
 ) {
     val outerShape = RoundedCornerShape(50)
     val scrollsForLargeText = adaptsToAvailableWidth && LocalDensity.current.fontScale > 1f
@@ -618,6 +661,8 @@ fun <T> SegmentedPillControl(
     // SegmentedPillControl refresh (segment height 36, pill fills it for an even inset).
     Row(
         modifier = modifier
+            .selectableGroup()
+            .then(if (accessibilityLabel != null) Modifier.semantics { contentDescription = accessibilityLabel } else Modifier)
             .then(if (scrollsForLargeText) Modifier.horizontalScroll(rangeScrollState) else Modifier)
             .then(if (usesEqualWidth) Modifier.fillMaxWidth() else Modifier)
             .height(36.dp)
@@ -648,7 +693,14 @@ fun <T> SegmentedPillControl(
                     .fillMaxHeight()
                     .clip(pillShape)
                     .then(pillBg)
-                    .then(if (itemEnabled) Modifier.clickableNoRipple { onSelect(item) } else Modifier)
+                    .selectable(
+                        selected = selected,
+                        enabled = itemEnabled,
+                        role = Role.Tab,
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = { onSelect(item) },
+                    )
                     .padding(horizontal = if (usesEqualWidth) Metrics.space4 else 12.dp),
                 contentAlignment = Alignment.Center,
             ) {
@@ -912,9 +964,9 @@ fun BevelGauge(
 
 // MARK: - GlowRing — crisp WHOOP-style score ring (Compose parity with iOS StrandDesign.GlowRing, #23)
 //
-// A clean solid arc with round caps over a clearly-visible full-circle track, a bold centred number
-// that counts up from 0, and a tight low-alpha glow hugging the arc. The arc springs in from 12
-// o'clock and re-animates when the value changes (day nav). minSdk-safe (no RenderEffect blur).
+// A clean solid arc with round caps over a clearly-visible full-circle track and a bold centred number
+// that counts up from 0. Quality here is CRISPNESS, not blur: no bloom, no halo, matching the iOS
+// twin's Design Reset. The arc springs in from 12 o'clock and re-animates when the value changes (day nav).
 
 /**
  * The centre-number text style for a ring of the given [diameter] — the house numeral at `diameter * 0.36`,
@@ -935,20 +987,35 @@ fun GlowRing(
     modifier: Modifier = Modifier,
     showsLabel: Boolean = true,
     format: (Double) -> String = { it.toInt().toString() },
+    targetRange: ClosedFloatingPointRange<Float>? = null,
 ) {
     val target = fraction.coerceIn(0f, 1f)
-    var started by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { started = true }
-    val animFraction by animateFloatAsState(
-        targetValue = if (started) target else 0f,
-        animationSpec = spring(dampingRatio = 0.86f, stiffness = Spring.StiffnessMediumLow),
-        label = uiString(R.string.l10n_components_glowring_fraction_5bcc7cd7),
-    )
-    val animValue by animateFloatAsState(
-        targetValue = if (started) value.toFloat() else 0f,
-        animationSpec = tween(durationMillis = 850, easing = FastOutSlowInEasing),
-        label = uiString(R.string.l10n_components_glowring_value_ac0e87de),
-    )
+    val renderStill = rememberPoseStill()
+
+    // When renderStill is true, use final values directly (no animation at all).
+    // When false, animate from 0 to target.
+    val animFraction: Float
+    val animValue: Float
+
+    if (renderStill) {
+        // Still pose: snap to final values with no animation
+        animFraction = target
+        animValue = value.toFloat()
+    } else {
+        // Animated pose: animate from 0 to target
+        var started by remember { mutableStateOf(false) }
+        LaunchedEffect(Unit) { started = true }
+        animFraction = animateFloatAsState(
+            targetValue = if (started) target else 0f,
+            animationSpec = spring(dampingRatio = 0.86f, stiffness = Spring.StiffnessMediumLow),
+            label = uiString(R.string.l10n_components_glowring_fraction_5bcc7cd7),
+        ).value
+        animValue = animateFloatAsState(
+            targetValue = if (started) value.toFloat() else 0f,
+            animationSpec = tween(durationMillis = 850, easing = FastOutSlowInEasing),
+            label = uiString(R.string.l10n_components_glowring_value_ac0e87de),
+        ).value
+    }
     val trackColor = Palette.textPrimary.copy(alpha = 0.10f)
     Box(modifier = modifier.size(diameter), contentAlignment = Alignment.Center) {
         Box(
@@ -957,8 +1024,8 @@ fun GlowRing(
                 // PERF (#scroll-jank): the full-circle TRACK is static (it reads no animation state), but
                 // it shared one Canvas draw lambda with the fraction-driven arcs, so it was re-issued on
                 // every animation/scroll frame. Hoist the track into drawWithCache — keyed on the implicit
-                // size + the stroke + the track tone — so it rasterises ONCE and replays; only the glow +
-                // crisp arc re-draw per frame (the drawBehind below). Pixel-identical: same circle geometry,
+                // size + the stroke + the track tone — so it rasterises ONCE and replays; only the crisp
+                // arc re-draws per frame (the drawBehind below). Pixel-identical: same circle geometry,
                 // same round cap, same track-under-arc order.
                 .drawWithCache {
                     val stroke = lineWidth.toPx()
@@ -984,21 +1051,48 @@ fun GlowRing(
                     val arcSize = Size(d - stroke, d - stroke)
                     val tl = Offset((size.width - d) / 2f + inset, (size.height - d) / 2f + inset)
                     val sweep = animFraction.coerceIn(0f, 1f) * 360f
-                    // Only draw the arc (+ its glow) when there's ACTUAL progress. A near-zero round-capped
+
+                    // Target range segment (gray) — the optimal zone. Drawn BEFORE the value arc so it's
+                    // visible even when effort is 0 (most useful in the morning). Sits on its own inset
+                    // track inside the value ring, so the value arc never overlaps it.
+                    if (targetRange != null) {
+                        // Inset the target arc so it sits on its own track inside the value ring, just inside
+                        // the track. The track spans radius ± 0.5 stroke; the target spans its own radius ± 0.3 stroke.
+                        // Insetting by 1.05 stroke places the target's outer edge just inside the track's inner edge,
+                        // accounting for the round caps.
+                        val targetInset = stroke * 1.05f
+                        val targetD = d - stroke - targetInset * 2f
+                        val targetArcSize = Size(targetD, targetD)
+                        val targetTl = Offset(
+                            tl.x + (arcSize.width - targetD) / 2f,
+                            tl.y + (arcSize.height - targetD) / 2f,
+                        )
+                        val startAngle = targetRange.start * 360f - 90f
+                        val sweepAngle = (targetRange.endInclusive - targetRange.start) * 360f
+                        drawArc(
+                            color = Palette.textTertiary.copy(alpha = 0.5f),
+                            startAngle = startAngle,
+                            sweepAngle = sweepAngle,
+                            useCenter = false,
+                            topLeft = targetTl,
+                            size = targetArcSize,
+                            style = Stroke(width = stroke * 0.6f, cap = StrokeCap.Round),
+                        )
+                    }
+
+                    // Only draw the arc when there's ACTUAL progress. A near-zero round-capped
                     // arc renders as a full visible dot at 12 o'clock on Android's Canvas (unlike iOS's
                     // sub-pixel `trim`), which read as the unwanted "dot" on empty / No-Data / Calibrating
                     // rings the maintainer flagged. Below the threshold we show just the clean full-circle
                     // track — exactly like the iOS GlowRing's empty state.
                     if (animFraction > 0.001f) {
-                        // Tight glow — a wider, low-alpha arc under the crisp one (minSdk-safe, no RenderEffect).
-                        // Gated on the dark canvas only, mirroring iOS AdditiveBloom hiding on the light field
-                        // (on white it just smears the edge); the crisp arc carries the ring on its own there.
-                        if (!Palette.isLight) {
-                            drawArc(
-                                color = color.copy(alpha = 0.45f), startAngle = -90f, sweepAngle = sweep, useCenter = false,
-                                topLeft = tl, size = arcSize, style = Stroke(width = stroke * 1.5f, cap = StrokeCap.Round),
-                            )
-                        }
+                        // NO glow (#2407). iOS dropped the ring's additive bloom in the Design Reset flat-mockup
+                        // pass; this twin kept a stand-in for it — a 1.5x-stroke arc at alpha 0.45 drawn under the
+                        // crisp one — and never followed. With no RenderEffect blur at minSdk 26 that stand-in has
+                        // HARD edges, so it spilled a quarter-stroke past the track on both sides and a quarter
+                        // past each round cap: on a saturated arc (the gold Charge hero) it read as a misaligned
+                        // double edge rather than a glow. Flat crisp arc only, exactly like iOS GlowRing.
+                        //
                         // The crisp, solid arc — from 12 o'clock clockwise.
                         drawArc(
                             color = color, startAngle = -90f, sweepAngle = sweep, useCenter = false,
@@ -1209,7 +1303,16 @@ fun ScreenScaffold(
         Column(
             modifier = columnModifier
                 .verticalScroll(rememberScrollState())
-                .padding(start = 28.dp, end = 28.dp, top = topPadding, bottom = 28.dp),
+                // #1836: the bar's height is added to the CONTENT's bottom padding, not to the screen's
+                // layout. That distinction is the whole overlay: the screen reaches the bottom edge so its
+                // backdrop paints behind and around the glass, while the scrolling content still stops
+                // clear of the bar. Zero when the overlay is off, so the slot layout is untouched.
+                .padding(
+                    start = 28.dp,
+                    end = 28.dp,
+                    top = topPadding,
+                    bottom = 28.dp + BottomBarStyleStore.barHeightForContent(),
+                ),
             // #765: one shared inter-card spacing token (was a bare `20.dp`), so the eager + lazy scaffolds
             // and every screen through them keep the SAME uniform gap between top-level cards.
             verticalArrangement = Arrangement.spacedBy(Metrics.screenRowSpacing),
@@ -1425,13 +1528,18 @@ fun StepperField(
     accessibility: String,
     unit: String? = null,
     valueColor: Color = Palette.textPrimary,
+    // False when another source owns the value (e.g. weight synced from Health Connect): the value
+    // still reads, dimmed, and the buttons stop responding.
+    enabled: Boolean = true,
     onMinus: () -> Unit,
     onPlus: () -> Unit,
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.semantics { contentDescription = accessibility },
+        modifier = Modifier
+            .semantics { contentDescription = accessibility }
+            .alpha(if (enabled) 1f else Palette.disabledOpacity),
     ) {
         Text(
             value,
@@ -1442,20 +1550,20 @@ fun StepperField(
         if (unit != null) {
             Text(unit, style = NoopType.caption, color = Palette.textTertiary)
         }
-        StepperButton(symbol = "−", onClick = onMinus, label = uiString(R.string.l10n_components_decrease_accessibility_df5f1511, accessibility))
-        StepperButton(symbol = "+", onClick = onPlus, label = uiString(R.string.l10n_components_increase_accessibility_0949c0e9, accessibility))
+        StepperButton(symbol = "−", onClick = onMinus, label = uiString(R.string.l10n_components_decrease_accessibility_df5f1511, accessibility), enabled = enabled)
+        StepperButton(symbol = "+", onClick = onPlus, label = uiString(R.string.l10n_components_increase_accessibility_0949c0e9, accessibility), enabled = enabled)
     }
 }
 
 @Composable
-fun StepperButton(symbol: String, onClick: () -> Unit, label: String) {
+fun StepperButton(symbol: String, onClick: () -> Unit, label: String, enabled: Boolean = true) {
     Box(
         modifier = Modifier
             .size(30.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(Palette.surfaceInset)
             .border(1.dp, Palette.hairline, RoundedCornerShape(8.dp))
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .semantics { contentDescription = label },
         contentAlignment = Alignment.Center,
     ) {
@@ -1472,3 +1580,44 @@ private fun Modifier.clickableNoRipple(onClick: () -> Unit): Modifier =
         interactionSource = remember { MutableInteractionSource() },
         onClick = onClick,
     )
+
+// MARK: - Backup / restore failure
+
+/**
+ * The dialog a failed backup, restore or export ends on.
+ *
+ * These messages run to several sentences and each one finishes with the part the reader can act on,
+ * so a Toast was the wrong container: the reported case clipped at "SQLite reports: *** in d..." and
+ * threw away BOTH the diagnosis and the "your current data is untouched" that followed it. What
+ * survived was the one fragment that helps nobody. A dialog shows the sentence whole.
+ *
+ * [Copy] puts it on the clipboard, so a corruption report carries SQLite's own words rather than a
+ * fragment retyped off a screenshot. Apple has shown these in an alert all along; this is Android
+ * catching up to it.
+ */
+@Composable
+fun BackupFailureDialog(message: String, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Palette.surfaceOverlay,
+        text = { Text(message, style = NoopType.subhead, color = Palette.textSecondary) },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text(uiString(R.string.l10n_components_close_bbfa773e), color = Palette.accent)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = {
+                val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                clip?.setPrimaryClip(ClipData.newPlainText("NOOP backup error", message))
+                // Dismiss on copy. Android 13+ shows its own clipboard confirmation, but minSdk here is
+                // 26, and on everything below that a Copy that left the dialog sitting there gave no
+                // sign it had done anything. Dialog buttons conventionally dismiss anyway.
+                onDismiss()
+            }) {
+                Text(uiString(R.string.l10n_components_copy_af74f7c5), color = Palette.textSecondary)
+            }
+        },
+    )
+}

@@ -44,6 +44,7 @@ import org.json.JSONObject
 import java.util.Calendar
 import java.util.UUID
 import kotlin.math.roundToInt
+import com.noop.analytics.ClockFormat
 
 // MARK: - Caffeine window (#526) — pure persistence helpers + the Insights logging card.
 //
@@ -214,9 +215,7 @@ fun CaffeineLogCard() {
                         )
                     }
                     Text(
-                        uiString(R.string.l10n_caffeine_log_have_your_last_caffeine_by_about_16b09033, clockLabel(cutoffMinutes)) +
-                            "by ${clockLabel(bedtimeMinutes)}. A rough guide from a typical 5 to 6 hour " +
-                            "half-life, not a rule.",
+                        uiString(R.string.l10n_caffeine_log_have_your_last_caffeine_by_about_16b09033, clockLabel(cutoffMinutes), clockLabel(bedtimeMinutes)),
                         style = NoopType.footnote,
                         color = Palette.textTertiary,
                     )
@@ -326,8 +325,10 @@ private fun caffeineHoursLabel(hrs: Double): String {
 }
 
 private fun caffeineIntakeLabel(intake: CaffeineIntake, context: Context): String {
-    val time = android.text.format.DateFormat.getTimeFormat(context)
-        .format(java.util.Date(intake.atEpochSec * 1000L))
+    // #1821: the reader's chosen clock, not the raw device format.
+    val time = java.text.SimpleDateFormat(
+        ClockFormat.hourMinutePattern(ClockPrefs.uses24Hour(context)), java.util.Locale.getDefault(),
+    ).format(java.util.Date(intake.atEpochSec * 1000L))
     return if (intake.mg != null) "$time · ${intake.mg.roundToInt()} mg" else "$time · amount not logged"
 }
 

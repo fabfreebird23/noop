@@ -7,6 +7,7 @@ import androidx.compose.material.icons.filled.Air
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.DirectionsRun
 import androidx.compose.material.icons.automirrored.filled.DirectionsWalk
 import androidx.compose.material.icons.filled.Favorite
@@ -50,6 +51,7 @@ enum class DashboardCard(
     RESTING_HR("restingHr", R.string.today_card_resting_hr, R.string.today_card_resting_hr_subtitle, "bpm", Icons.Filled.Favorite),
     RESPIRATORY("respiratory", R.string.today_card_respiratory, R.string.today_card_respiratory_subtitle, "rpm", Icons.Filled.Air),
     STEPS("steps", R.string.today_card_steps, R.string.today_card_steps_subtitle, "", Icons.AutoMirrored.Filled.DirectionsWalk),
+    STEPS_AVERAGE_30("stepsAverage30", R.string.steps_average_30, R.string.steps_average_subtitle, "", Icons.AutoMirrored.Filled.DirectionsWalk),
     STRESS("stress", R.string.today_card_stress, R.string.today_card_stress_subtitle, "", Icons.Filled.Bolt),
     FITNESS_AGE("fitnessAge", R.string.today_card_fitness_age, R.string.today_card_fitness_age_subtitle, "yrs", Icons.AutoMirrored.Filled.DirectionsRun),
     VO2MAX("vo2max", R.string.today_card_vo2max, R.string.today_card_vo2max_subtitle, "", Icons.Filled.Air),
@@ -64,7 +66,15 @@ enum class DashboardCard(
     // every other card it carries NO metric value of its own, it is a navigation row that opens the full
     // CoupledScreen. It is NOT in [defaultSelection], so a fresh install never shows it until the user adds
     // it via CUSTOMISE. Mirrors iOS DashboardCard.coupled (raw "coupled", byte-identical across OS).
-    COUPLED("coupled", R.string.today_card_coupled, R.string.today_card_coupled_subtitle, "", Icons.Filled.Hexagon);
+    COUPLED("coupled", R.string.today_card_coupled, R.string.today_card_coupled_subtitle, "", Icons.Filled.Hexagon),
+
+    // Optional, default-OFF (#1862): opens the Coach launcher BOTTOM SHEET rather than a screen — the one
+    // card that does. Coach is otherwise buried in More, and entering it means leaving Today. Like COUPLED
+    // it carries no metric value and is absent from [defaultSelection], so someone who does not use a
+    // provider never gains a fixed dashboard row for one. Opening the sheet makes NO provider request.
+    // Reuses the existing nav + Coach-screen strings, so the card adds nothing to translate.
+    // Mirrors iOS DashboardCard.coach (raw "coach", byte-identical across OS).
+    COACH("coach", R.string.nav_coach, R.string.l10n_coach_screen_ask_anything_about_your_recent_recovery_e6c287ca, "", Icons.AutoMirrored.Filled.Chat);
 
     companion object {
         fun fromRaw(raw: String?): DashboardCard? = entries.firstOrNull { it.raw == raw }
@@ -80,6 +90,8 @@ enum class DashboardCard(
 
         /** Canonical order used to list the disabled remainder in the editor (matches iOS allCases order). */
         val canonicalOrder: List<DashboardCard> = entries.toList()
+
+        fun hiddenOptions(shown: List<DashboardCard>): List<DashboardCard> = canonicalOrder.filter { it !in shown }
     }
 }
 
@@ -95,8 +107,18 @@ object DashboardCardPrefs {
     private const val KEY_SELECTION = "today.dashboardCards"
 
     /** The enabled cards in display order. An empty/unset value yields the default selection. */
-    fun enabled(context: Context): List<DashboardCard> =
-        decodeEnabled(NoopPrefs.of(context).getString(KEY_SELECTION, null))
+    fun enabled(context: Context): List<DashboardCard> {
+        val prefs = NoopPrefs.of(context)
+        val enabled = decodeEnabled(prefs.getString(KEY_SELECTION, null))
+        // Move an explicit prior opt-in once; removing the old token prevents re-enabling after hiding.
+        val legacy = prefs.getString("today.keyMetrics", null)?.split(",")?.map { it.trim() }.orEmpty()
+        if ("stepsAverage30" !in legacy) return enabled
+        val migrated = (enabled + DashboardCard.STEPS_AVERAGE_30).distinct()
+        prefs.edit().putString(KEY_SELECTION, encode(migrated))
+            .putString("today.keyMetrics", legacy.filter { it != "stepsAverage30" }.joinToString(","))
+            .apply()
+        return migrated
+    }
 
     /** Persist the enabled cards in order. Disabled cards are simply omitted from the stored string. */
     fun setEnabled(context: Context, cards: List<DashboardCard>) {

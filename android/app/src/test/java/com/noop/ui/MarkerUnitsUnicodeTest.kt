@@ -14,4 +14,12 @@ class MarkerUnitsUnicodeTest {
         assertArrayEquals(expected, MarkerUnits.slug("Cafe\u0301 Marker").toByteArray())
         assertEquals("custom_apo_b", MarkerUnits.slug("Apo B"))
     }
+
+    @Test
+    fun slugKeepsCountAndPercentApartAndMatchesTheCsvImporter() {
+        assertEquals("custom_lymph", MarkerUnits.slug("LYMPH"))
+        assertEquals("custom_lymph_pct", MarkerUnits.slug("LYMPH %"))
+        assertEquals(com.noop.ingest.LabMarkerCsvImport.customKey("LYMPH %"), MarkerUnits.slug("LYMPH %"))
+        assertEquals("custom_", MarkerUnits.slug("  ???  "))
+    }
 }

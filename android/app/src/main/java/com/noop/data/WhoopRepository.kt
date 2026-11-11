@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.room.withTransaction
 import com.noop.protocol.DroppedRtcEvent
 import com.noop.protocol.RrSourceChannel
+import com.noop.protocol.Whoop5Ecg
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -43,6 +44,13 @@ data class StreamBatch(
      * never pays for the 24x-larger raw stream. Persisted into `ppgWaveformSample` as a packed i16 BLOB.
      */
     val ppgWaveform: List<PpgWaveformRow> = emptyList(),
+    /**
+     * The flash-banked MG ECG records this batch carried (#2847), one per strap-second of a reading.
+     * Empty on a WHOOP 4.0, on a WHOOP 5 without an MG's ECG front end, and on every offload from a strap
+     * that has banked no reading. Persisted into `ecgWaveformSample` as the record's bytes verbatim.
+     * Nothing scores from it (#752). Swift twin: `Streams.ecgWaveform`.
+     */
+    val ecgWaveform: List<EcgWaveformRow> = emptyList(),
     /**
      * Every remaining 5/MG v18 per-second field the decoder produces and the extractor used to discard —
      * carried verbatim for a later census. Empty on a WHOOP 4.0 and on the live path. Nothing reads it.
@@ -86,6 +94,16 @@ data class StreamBatch(
      */
     val unhandledPacketTypes: Map<String, Int> = emptyMap(),
     /**
+     * #891: one full-frame hex sample per type in [unhandledPacketTypes], keyed the same way, taken from
+     * the first such frame in the batch.
+     *
+     * The census alone tells a reporter that their firmware banks a record NOOP cannot read, and then
+     * asks them to report it — while carrying none of the bytes anyone would need to map it. The dropped
+     * frame is not archived either: `rejectedHistoricalRecords` only ever holds type-47, so these bytes
+     * existed nowhere. Diag only (excluded from [isEmpty]). Mirrors Swift `Streams.unhandledPacketSamples`.
+     */
+    val unhandledPacketSamples: Map<String, String> = emptyMap(),
+    /**
      * #520 diagnostic: a summary of `dynamic_acceleration@41` (the strap's own gravity-removed motion
      * magnitude) over this batch's v18 records. The field has been decoded on both platforms all along
      * with nothing consuming it, so there is no evidence on whether it is a usable stillness signal;
@@ -101,7 +119,7 @@ data class StreamBatch(
         get() = hr.isEmpty() && rr.isEmpty() && events.isEmpty() && battery.isEmpty() &&
             spo2.isEmpty() && skinTemp.isEmpty() && resp.isEmpty() && gravity.isEmpty() &&
             steps.isEmpty() && sleepState.isEmpty() && ppgHr.isEmpty() && ppgWaveform.isEmpty() &&
-            v18Aux.isEmpty()
+            ecgWaveform.isEmpty() && v18Aux.isEmpty()
 }
 
 /**
@@ -224,21 +242,22 @@ data class RrRow(val ts: Long, val rrMs: Int, val srcChannel: RrSourceChannel? =
  * and ON CONFLICT DO NOTHING keeps whichever row landed first. The historical path delivers a second
  * atomically, so the authoritative copy is correctly ordered.
  *
- * And carries `srcChannel` (Room v26, #1071): the sensor channel that measured the beat, as reported by
- * the decoder that produced it. NULL for every WHOOP row (one beat source — there is no channel to name,
- * and that is honest rather than a placeholder). Like `ord` it is OUTSIDE the key: two channels measuring
- * the same beat can yield the same (ts, rrMs), and keying on the label would store both — which is
- * precisely the double-count this fixes. Twin of the Swift StreamStore insert.
+ * `srcChannel` labels the sensor or transport. WHOOP 5 tags name the transport; WHOOP 4 and legacy
+ * rows stay null. Like `ord`, it stays outside the key: two observations may name the same beat.
+ * WHOOP 5 transport counters are independent; historical collisions promote source and order.
+ * Twin of the Swift StreamStore insert.
  */
 internal fun assignRrSeq(deviceId: String, rows: List<RrRow>): List<RrInterval> {
-    val seqByBeat = HashMap<Pair<Long, Int>, Int>()
-    val ordByTs = HashMap<Long, Int>()
+    val seqByBeat = HashMap<Triple<Long, Int, Int>, Int>()
+    val ordByTs = HashMap<Pair<Long, Int>, Int>()
     return rows.map { row ->
-        val key = row.ts to row.rrMs
+        val transport = row.srcChannel?.takeIf { it.isWhoop5Transport }?.code ?: 0
+        val key = Triple(row.ts, row.rrMs, transport)
         val s = seqByBeat.getOrDefault(key, 0)
         seqByBeat[key] = s + 1
-        val o = ordByTs.getOrDefault(row.ts, 0)
-        ordByTs[row.ts] = o + 1
+        val second = row.ts to transport
+        val o = ordByTs.getOrDefault(second, 0)
+        ordByTs[second] = o + 1
         RrInterval(
             deviceId = deviceId, ts = row.ts, rrMs = row.rrMs, seq = s, ord = o,
             srcChannel = row.srcChannel?.code,
@@ -302,7 +321,43 @@ data class PpgHrRow(val ts: Long, val bpm: Int, val conf: Double)
  * unix second, [samples] the raw i16 ADC counts (usually 24, fewer on a truncated frame). deviceId is
  * attached on insert; the samples are packed to a little-endian i16 BLOB by [StreamPersistence.packPpgSamples].
  */
-data class PpgWaveformRow(val ts: Long, val samples: List<Int>)
+data class PpgWaveformRow(
+    val ts: Long,
+    val samples: List<Int>,
+    val burstIndex: Int? = null,
+    /** #2019: the absolute optical code [samples] are deltas from; null on a legacy row, whose absolute
+     *  level is gone for good because a delta series cannot be inverted without it. */
+    val baseCode: Long? = null,
+)
+
+/**
+ * One flash-banked MG ECG record (#2847): [ts] the record's corrected wall-clock unix second, [sequence]
+ * the strap's own record index, [record] the record's INNER bytes verbatim.
+ *
+ * The wire form rather than a decoded field set, for the reasons on [EcgWaveformSampleEntity]: the samples
+ * are signed 18-bit so no integer blob holds them, the lead-off halfwords have no attested byte order, and
+ * `Whoop5Ecg.parseR16` is already the pinned reader. deviceId is attached on insert. Swift twin:
+ * `EcgWaveformSample`.
+ */
+data class EcgWaveformRow(
+    val ts: Long,
+    val sequence: Long,
+    val record: ByteArray,
+) {
+    // ByteArray needs structural equals/hashCode (the generated identity ones break round-trip asserts).
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is EcgWaveformRow) return false
+        return ts == other.ts && sequence == other.sequence && record.contentEquals(other.record)
+    }
+
+    override fun hashCode(): Int {
+        var result = ts.hashCode()
+        result = 31 * result + sequence.hashCode()
+        result = 31 * result + record.contentHashCode()
+        return result
+    }
+}
 
 /** Count of rows ACTUALLY inserted per stream (mirrors WhoopStore.insert return tuple). */
 data class InsertCounts(
@@ -317,11 +372,17 @@ data class InsertCounts(
     val gravity: Int = 0,
 )
 
+data class StepTimestampCoverage(val firstTs: Long?, val lastTs: Long?)
+
+internal fun newlyInsertedStepTimestamps(timestamps: List<Long>, rowIds: List<Long>): List<Long> =
+    timestamps.zip(rowIds).mapNotNull { (ts, id) -> ts.takeIf { id != -1L } }
+
 /** Monotonic event revisions for Test Centre repository-backed readouts. Counts move only after Room
  * reports at least one newly inserted relevant row; duplicate/no-op inserts leave them unchanged. */
 internal data class ReadoutDataRevisions(
     val sleepSamples: Long = 0,
     val battery: Long = 0,
+    val steps: Long = 0,
 )
 
 internal fun advanceReadoutDataRevisions(
@@ -330,7 +391,34 @@ internal fun advanceReadoutDataRevisions(
 ): ReadoutDataRevisions = current.copy(
     sleepSamples = current.sleepSamples + if (inserted.hr > 0 || inserted.gravity > 0) 1 else 0,
     battery = current.battery + if (inserted.battery > 0) 1 else 0,
+    steps = current.steps + if (inserted.steps > 0) 1 else 0,
 )
+
+/** Process-local because the cycle cache is process-local too; keyed by device and UTC day. */
+internal class StepDataRevisionIndex {
+    private val utcDaySeconds = 86_400L
+    private var nextRevision = 0L
+    private val byOwnerDay = HashMap<Pair<String, Long>, Long>()
+
+    @Synchronized
+    fun record(deviceId: String, stepTimestamps: List<Long>, insertedRows: Int) {
+        if (insertedRows <= 0) return
+        nextRevision++
+        for (ts in stepTimestamps) {
+            byOwnerDay[deviceId to Math.floorDiv(ts, utcDaySeconds)] = nextRevision
+        }
+    }
+
+    @Synchronized
+    fun signature(deviceId: String, onset: Long, endExclusive: Long): String {
+        if (endExclusive <= onset) return ""
+        val first = Math.floorDiv(onset, utcDaySeconds)
+        val last = Math.floorDiv(endExclusive - 1L, utcDaySeconds)
+        return (first..last).joinToString(",") { day ->
+            "$day:${byOwnerDay[deviceId to day] ?: 0L}"
+        }
+    }
+}
 
 /**
  * A compact snapshot of how much history each source holds, for the Data Sources "Freshness
@@ -346,8 +434,6 @@ data class DataFreshness(
     val earliestDay: String? = null,
     val latestDay: String? = null,
 ) {
-    val hasAnyHistory: Boolean get() = importedDays > 0 || computedDays > 0 || appleDays > 0
-
     companion object {
         val EMPTY = DataFreshness()
     }
@@ -397,6 +483,19 @@ class WhoopRepository(
         suspend fun <R> run(block: suspend () -> R): R
     }
 
+    /** PPG waveform rows banked since its retention sweep last ran, PER DEVICE, for the same reason as
+     *  [v18AuxRowsSincePrune] below: the sweep is per device, so a shared counter would let one strap
+     *  spend another's budget. A separate counter because the two caps differ and a batch commonly writes
+     *  one table and not the other. Swift twin: `WhoopStore.ppgWaveformRowsSincePrune`. */
+    private val ppgWaveformRowsSincePrune = mutableMapOf<String, Int>()
+
+    /** ECG records banked since its retention sweep last ran, PER DEVICE, on the same terms as the two
+     *  counters beside it: the sweep is per device, so a shared counter would let one strap spend
+     *  another's budget. Its own counter because the caps differ by two orders of magnitude and an
+     *  offload routinely writes one of the three tables and not the others. Swift twin:
+     *  `WhoopStore.ecgWaveformRowsSincePrune`. */
+    private val ecgWaveformRowsSincePrune = mutableMapOf<String, Int>()
+
     /** v18 aux rows banked since the retention sweep last ran, PER DEVICE — the sweep is per device too,
      *  so a shared counter would let one strap spend another's budget. Only the single-threaded offload
      *  path banks v18 rows, so a plain map is enough. Swift twin: `WhoopStore.v18AuxRowsSincePrune`. */
@@ -408,6 +507,7 @@ class WhoopRepository(
     val batteryRevision: StateFlow<Long> = _batteryRevision.asStateFlow()
     private val readoutRevisionLock = Any()
     private var readoutRevisions = ReadoutDataRevisions()
+    private val stepRevisionIndex = StepDataRevisionIndex()
 
     constructor(db: WhoopDatabase) : this(
         dao = db.whoopDao(),
@@ -439,6 +539,14 @@ class WhoopRepository(
     /** #716: read all paired devices (thin pass-through for the BLE scan fix). */
     suspend fun pairedDevices(): List<PairedDeviceRow> = dao.pairedDevices()
 
+    /** Raw biometric sample counts per device id in a window - see [WhoopDao.rawSampleCountsByDevice]. */
+    suspend fun rawSampleCountsByDevice(from: Long, to: Long): List<Pair<String, Int>> =
+        dao.rawSampleCountsByDevice(from, to).map { it.deviceId to it.total }
+            // isNotEmpty, NOT isNotBlank: the Swift twin filters on `!isEmpty`, so a whitespace-only id
+            // would be dropped here and kept there. Neither can occur today - the point is that the two
+            // predicates stay the same one.
+            .filter { it.first.isNotEmpty() && it.second > 0 }
+
     // MARK: - Insert decoded streams (idempotent by natural key)
 
     /**
@@ -456,18 +564,28 @@ class WhoopRepository(
         // shipped constants. (#888)
         v18AuxRetentionRows: Int = V18_AUX_RETENTION_ROWS,
         v18AuxPruneEveryRows: Int = V18_AUX_PRUNE_EVERY_ROWS,
+        ppgWaveformRetentionRows: Int = PPG_WAVEFORM_RETENTION_ROWS,
+        ppgWaveformPruneEveryRows: Int = PPG_WAVEFORM_PRUNE_EVERY_ROWS,
+        ecgWaveformRetentionRows: Int = ECG_WAVEFORM_RETENTION_ROWS,
+        ecgWaveformPruneEveryRows: Int = ECG_WAVEFORM_PRUNE_EVERY_ROWS,
     ): InsertCounts {
         if (streams.isEmpty) return InsertCounts()
 
-        val counts = transactor.run {
+        val result = transactor.run {
             insertWithinTransaction(
                 streams = streams,
                 deviceId = deviceId,
                 v18AuxRetentionRows = v18AuxRetentionRows,
                 v18AuxPruneEveryRows = v18AuxPruneEveryRows,
+                ppgWaveformRetentionRows = ppgWaveformRetentionRows,
+                ppgWaveformPruneEveryRows = ppgWaveformPruneEveryRows,
+                ecgWaveformRetentionRows = ecgWaveformRetentionRows,
+                ecgWaveformPruneEveryRows = ecgWaveformPruneEveryRows,
             )
         }
+        val counts = result.counts
         publishReadoutRevisions(counts)
+        stepRevisionIndex.record(deviceId, result.insertedStepTimestamps, counts.steps)
         return counts
     }
 
@@ -480,17 +598,50 @@ class WhoopRepository(
         }
     }
 
+    /** Bounded process-local cache witness; duplicate rows do not advance because InsertCounts is zero. */
+    fun stepDataRevisionSignature(deviceId: String, onset: Long, endExclusive: Long): String =
+        stepRevisionIndex.signature(deviceId, onset, endExclusive)
+
     /** All DAO writes for one decoded chunk share the Room transaction opened by [insert]. */
+    private data class InsertResult(
+        val counts: InsertCounts,
+        val insertedStepTimestamps: List<Long>,
+    )
+
     private suspend fun insertWithinTransaction(
         streams: StreamBatch,
         deviceId: String,
         v18AuxRetentionRows: Int,
         v18AuxPruneEveryRows: Int,
-    ): InsertCounts {
+        ppgWaveformRetentionRows: Int,
+        ppgWaveformPruneEveryRows: Int,
+        ecgWaveformRetentionRows: Int,
+        ecgWaveformPruneEveryRows: Int,
+    ): InsertResult {
         val hrIds = if (streams.hr.isEmpty()) emptyList() else
             dao.insertHr(streams.hr.map { HrSample(deviceId, it.ts, it.bpm) })
-        val rrIds = if (streams.rr.isEmpty()) emptyList() else
-            dao.insertRr(assignRrSeq(deviceId, streams.rr))
+        val rrRows = assignRrSeq(deviceId, streams.rr)
+        val rrIds = if (rrRows.isEmpty()) emptyList() else dao.insertRr(rrRows)
+        for ((index, row) in rrRows.withIndex()) {
+            if (rrIds[index] == -1L && (row.srcChannel == RrSourceChannel.WHOOP5_HISTORICAL.code ||
+                    row.srcChannel == RrSourceChannel.WHOOP5_STANDARD.code)) {
+                // Counts stay separate; the canonical observation owns this key's order and provenance.
+                dao.promoteWhoop5RrSource(row.deviceId, row.ts, row.rrMs, row.seq, row.ord!!, row.srcChannel)
+            }
+            if (rrIds[index] == -1L && row.srcChannel == RrSourceChannel.WHOOP4_HISTORICAL.code) {
+                dao.promoteWhoop4HistoricalRr(row.deviceId, row.ts, row.rrMs, row.seq, row.ord!!)
+            }
+        }
+        // #2371: mark the strap's 500 ms fill beats in this batch's window. The batch's heart rate was written
+        // above, so the same-second rate the rule reads is already in the table. Only a batch that carries a
+        // 500 ms WHOOP 5 beat pays for the statement. iOS runs the same statement from `WhoopStore.insert`.
+        val fillTs = rrRows.filter {
+            it.rrMs == 500 && (it.srcChannel == RrSourceChannel.WHOOP5_HISTORICAL.code ||
+                it.srcChannel == RrSourceChannel.WHOOP5_STANDARD.code)
+        }.map { it.ts }
+        val fillFrom = fillTs.minOrNull()
+        val fillTo = fillTs.maxOrNull()
+        if (fillFrom != null && fillTo != null) dao.flagWhoop5RrFill(deviceId, fillFrom, fillTo)
         val evIds = if (streams.events.isEmpty()) emptyList() else
             dao.insertEvents(streams.events.map { EventRow(deviceId, it.ts, it.kind, it.payloadJSON) })
         val batIds = if (streams.battery.isEmpty()) emptyList() else
@@ -536,9 +687,52 @@ class WhoopRepository(
         if (streams.ppgWaveform.isNotEmpty()) {
             dao.insertPpgWaveform(
                 streams.ppgWaveform.map {
-                    PpgWaveformSampleEntity(deviceId, it.ts, StreamPersistence.packPpgSamples(it.samples))
+                    PpgWaveformSampleEntity(deviceId, it.ts, StreamPersistence.packPpgSamples(it.samples),
+                        it.burstIndex, it.baseCode)
                 },
             )
+            // #1911 rolling retention, amortised and best-effort on exactly the same terms as the v18-aux
+            // sweep below (see [PPG_WAVEFORM_RETENTION_ROWS] for why this is newest-N and not an age-based
+            // drop). Its own counter: a batch routinely writes one of these two tables and not the other.
+            val bankedPpg = (ppgWaveformRowsSincePrune[deviceId] ?: 0) + streams.ppgWaveform.size
+            ppgWaveformRowsSincePrune[deviceId] = bankedPpg
+            if (bankedPpg >= ppgWaveformPruneEveryRows) {
+                runCatching { dao.prunePpgWaveform(deviceId, ppgWaveformRetentionRows) }
+                    .onSuccess { ppgWaveformRowsSincePrune[deviceId] = 0 }
+                    // prunePpgWaveform is a suspend call, so a scope cancellation arrives here as a
+                    // CancellationException that runCatching would otherwise swallow, leaving the caller
+                    // running inside a cancelled coroutine. Same rethrow as the v18-aux sweep below.
+                    .onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
+            }
+        }
+
+        // Flash-banked MG ECG records (#2847), one row per strap-second of a reading, holding the
+        // record's inner bytes verbatim. Persist-only, same as steps/sleepState/ppgWaveform: not added to
+        // InsertCounts. Idempotent by (deviceId, ts), IGNORE-on-conflict keeps the FIRST-seen record for
+        // a second, as every other per-second stream does.
+        //
+        // The length is ASSERTED rather than trusted. `Whoop5Ecg.parseR16` refuses a record of any other
+        // length, so a short blob would read back as undecodable for the rest of that row's life, and
+        // keeping the table's one structural invariant true is worth more than a partial row. Mirrors the
+        // Swift insert's own guard.
+        val ecgRows = streams.ecgWaveform.filter { it.record.size == Whoop5Ecg.R16_INNER_LENGTH }
+        if (ecgRows.isNotEmpty()) {
+            dao.insertEcgWaveform(
+                ecgRows.map { EcgWaveformSampleEntity(deviceId, it.ts, it.sequence, it.record) },
+            )
+            // #2847 rolling retention, amortised and best-effort on exactly the same terms as the sweep
+            // above (see [ECG_WAVEFORM_RETENTION_ROWS] for why this is newest-N and not an age-based
+            // drop). Its own counter: an offload writes one of these tables far more often than all three.
+            val bankedEcg = (ecgWaveformRowsSincePrune[deviceId] ?: 0) + ecgRows.size
+            ecgWaveformRowsSincePrune[deviceId] = bankedEcg
+            if (bankedEcg >= ecgWaveformPruneEveryRows) {
+                runCatching { dao.pruneEcgWaveform(deviceId, ecgWaveformRetentionRows) }
+                    .onSuccess { ecgWaveformRowsSincePrune[deviceId] = 0 }
+                    // Same rethrow as the two sweeps beside it: pruneEcgWaveform is a suspend call, so a
+                    // scope cancellation arrives as a CancellationException that runCatching would
+                    // otherwise swallow, leaving the caller running inside a cancelled coroutine.
+                    .onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
+            }
         }
 
         // Every remaining v18 slot (v31), one compact blob per strap-second. Persist-only, same as
@@ -552,9 +746,8 @@ class WhoopRepository(
             }
             if (rows.isNotEmpty()) {
                 dao.insertV18Aux(rows)
-                // Rolling retention (the insertRawImu shape, #423) but AMORTISED. The delete finds the
-                // Nth-newest row by rank, so it walks up to [V18_AUX_RETENTION_ROWS] index entries;
-                // insertRawImu keeps 3,600 so that is free, this keeps 604,800 and an offload inserts once
+                // Rolling retention is amortised. The delete finds the Nth-newest row by rank, so it walks up
+                // to [V18_AUX_RETENTION_ROWS] index entries; this keeps 604,800 and an offload inserts once
                 // per chunk. Swept once per [V18_AUX_PRUNE_EVERY_ROWS] rows instead, which keeps
                 // newest-N-rows exactly (a time window would not — a sporadically-worn strap's rows span
                 // far more than a week, and the census wants that). Counter is per device because the
@@ -576,7 +769,7 @@ class WhoopRepository(
         }
 
         // OnConflictStrategy.IGNORE returns -1 for skipped (already-present) rows; count the inserts.
-        return InsertCounts(
+        val counts = InsertCounts(
             hr = hrIds.countInserted() + ppgHrIds.countInserted(),
             rr = rrIds.countInserted(),
             events = evIds.countInserted(),
@@ -587,6 +780,10 @@ class WhoopRepository(
             resp = respIds.countInserted(),
             gravity = gravIds.countInserted(),
         )
+        return InsertResult(
+            counts,
+            newlyInsertedStepTimestamps(streams.steps.map { it.ts }, stepIds),
+        )
     }
 
     /** #836 — cheap whole-history raw-HR change fingerprint `"count:maxTs"`. The idle 15-min rescore (the
@@ -594,16 +791,73 @@ class WhoopRepository(
      *  moves it (count or maxTs), so a real change always rescores; mirrors Swift WhoopStore.hrFingerprint. */
     suspend fun hrFingerprint(): String = "${dao.countHr()}:${dao.maxHrTs()}"
 
+    /** Complete cross-device scoring-input change detector. Unlike [hrFingerprint], this also moves when
+     * a trailing sleep-critical stream (especially gravity) lands after HR in the same history sync. */
+    suspend fun analysisFingerprint(): String = dao.analysisFingerprint()
+
     /** #1005 — per-day (device + window) HR fingerprint as (count, newestTs) for analyzeRecent's per-day
      *  reuse cache. Cheap COUNT/MAX aggregate, never a row fetch; mirrors Swift
      *  WhoopStore.hrFingerprint(deviceId:from:to:). */
     suspend fun hrFingerprintWindow(deviceId: String, from: Long, to: Long): Pair<Int, Long> =
         Pair(dao.countHrInWindow(deviceId, from, to), dao.maxHrTsInWindow(deviceId, from, to))
 
+    /** Whether [deviceId] has ANY heart-rate row in the window, as a scalar EXISTS rather than a fetched
+     *  row. The day-owner resolver's per-candidate-per-day probe; see [WhoopDao.hasHrInWindow]. */
+    suspend fun hasHrInWindow(deviceId: String, from: Long, to: Long): Boolean {
+        // Timed HERE rather than at the call site: the steps loop that drives most of these sits inside
+        // `analyzeRecentOnCpu`, which has 210 bytes of JaCoCo ratchet margin and no room for a stopwatch.
+        // See StoreProbeTally. Instrumentation only.
+        val started = System.nanoTime()
+        val present = dao.hasHrInWindow(deviceId, from, to)
+        com.noop.analytics.StoreProbeTally.recordOwnerHr(System.nanoTime() - started)
+        return present
+    }
+
+    /** Per-day (device + window) gravity fingerprint as (count, newestTs) for the steps-calibration
+     *  motion cache. Narrower than [dayStreamFingerprint] on purpose: dayMotionIntensity folds gravity
+     *  alone, so a new HR row must not invalidate it. Mirrors Swift WhoopStore.gravityFingerprint. */
+    suspend fun gravityFingerprintWindow(deviceId: String, from: Long, to: Long): Pair<Int, Long> {
+        // Timed here for the same budget reason as [hasHrInWindow]; see StoreProbeTally.
+        val started = System.nanoTime()
+        val witness = dao.gravityWitnessInWindow(deviceId, from, to)
+        com.noop.analytics.StoreProbeTally.recordGravityFp(System.nanoTime() - started)
+        return witness.c to witness.m
+    }
+
+    /** #29 — the same per-day (device + window) witness for every OTHER stream analyzeDay scores: PPG-derived
+     *  HR, R-R, respiration, SpO2, gravity, steps, skin temp and events. [hrFingerprintWindow] cannot see a
+     *  channel that lands after HR, and an offload commits its channels independently, so keyed on HR alone
+     *  the reuse cache re-served an HRV-less scan for the rest of the process. See
+     *  DAY_STREAM_FINGERPRINT_SQL; mirrors Swift WhoopStore.dayStreamFingerprint. */
+    suspend fun dayStreamFingerprint(deviceId: String, from: Long, to: Long): String =
+        dao.dayStreamFingerprint(deviceId, from, to) + "|rr5=${isWhoop5RrSource(deviceId)}"
+
     // MARK: - Server-derived caches (latest value wins on conflict)
 
     suspend fun upsertDailyMetrics(days: List<DailyMetric>) = dao.upsertDailyMetrics(days)
-    suspend fun upsertSleepSessions(sessions: List<SleepSession>) = dao.upsertSleepSessions(sessions)
+
+    /**
+     * Upsert cached sleep sessions without letting a partial re-serve replace a fuller night.
+     *
+     * The read and write share one transaction so every caller gets the same store-level guarantee.
+     * Existing hand-edited bounds/stages and the arrays owned by targeted writers are retained by
+     * [SleepSessionUpsertPolicy]; derived vitals still refresh. Mirrors WhoopStore's cache upsert.
+     */
+    suspend fun upsertSleepSessions(sessions: List<SleepSession>) {
+        if (sessions.isEmpty()) return
+        transactor.run {
+            for (candidate in sessions) {
+                val existing = dao.sleepSession(candidate.deviceId, candidate.startTs)
+                if (existing == null) {
+                    dao.insertSleepSession(candidate)
+                } else {
+                    SleepSessionUpsertPolicy.merge(existing, candidate)?.let {
+                        dao.updateSleepSession(it)
+                    }
+                }
+            }
+        }
+    }
 
     /** Delete the computed source's cached daily rows whose day-key is in [from, to] (inclusive,
      *  yyyy-MM-dd). The #277 local-day re-bucketing migration clears the computed UTC-keyed rows over
@@ -618,12 +872,44 @@ class WhoopRepository(
         dailyMetrics: List<DailyMetric>,
         metricPoints: List<MetricSeriesRow>,
         provenance: List<ScoreInputProvenanceRow>,
+        replaceMetricKeys: List<String> = emptyList(),
+        replaceMetricSourceIds: List<String> = listOf(deviceId),
     ) = dao.replaceComputedScoreWindow(
-        deviceId, from, to, dailyMetrics, metricPoints, provenance
+        deviceId, from, to, dailyMetrics, metricPoints, provenance,
+        replaceMetricKeys, replaceMetricSourceIds,
     )
+
+    /** Computed-only daily rows; unlike daysMerged this can never substitute imported/calendar steps. */
+    suspend fun computedDailyUnion(activeStrapId: String, from: String, to: String): List<DailyMetric> =
+        unionByDay(computedSourceIds(activeStrapId).map { dao.dailyMetricsRange(it, from, to) })
+
+    fun computedDailyUnionFlow(activeStrapId: String, from: String, to: String): Flow<List<DailyMetric>> =
+        unionDaysFlow(computedSourceIds(activeStrapId).map { dao.dailyMetricsRangeFlow(it, from, to) })
+
+    /** Imported-only daily rows over the same active-and-canonical union, the twin of
+     *  [computedDailyUnionFlow]. The Charge baselines (#2525) read the two buckets apart, because their rule
+     *  needs to know which nights are imported; [daysMergedFlow] has already blended them. */
+    fun importedDailyUnionFlow(activeStrapId: String, from: String, to: String): Flow<List<DailyMetric>> =
+        unionDaysFlow(importedSourceIds(activeStrapId).map { dao.dailyMetricsRangeFlow(it, from, to) })
+
+    fun metricSeriesComputedUnionFlow(
+        activeStrapId: String,
+        key: String,
+        from: String,
+        to: String,
+    ): Flow<List<MetricSeriesRow>> {
+        val flows = computedSourceIds(activeStrapId).map { dao.metricSeriesFlow(it, key, from, to) }
+        return if (flows.size == 1) flows[0]
+        else combine(flows) { rows -> mergeComputedSeriesUnion(rows.toList()) }
+    }
 
     suspend fun scoreInputSource(deviceId: String, day: String, key: String): String? =
         dao.scoreInputSource(deviceId, day, key)
+
+    suspend fun upsertMetricSeriesWithProvenance(
+        rows: List<MetricSeriesRow>,
+        provenance: List<ScoreInputProvenanceRow>,
+    ) = dao.upsertMetricSeriesWithProvenance(rows, provenance)
 
     /** Hand-correct the bed (onset) / wake (end) time of an existing sleep session, DURABLY , port
      *  of iOS PR #395 (Repository.editSleepTimes + MetricsCache.applySleepEdit).
@@ -781,7 +1067,7 @@ class WhoopRepository(
         // The instrumentation streams, missing from this list since they landed (see the DAO note).
         deleted += dao.pruneSleepStateByTs(minTs, maxTs)
         deleted += dao.prunePpgWaveformByTs(minTs, maxTs)
-        deleted += dao.pruneRawImuByTs(minTs, maxTs)
+        deleted += dao.pruneEcgWaveformByTs(minTs, maxTs)
         deleted += dao.pruneV18AuxByTs(minTs, maxTs)
         deleted += dao.pruneEventByTs(minTs, maxTs)
         deleted += dao.pruneBatteryByTs(minTs, maxTs)
@@ -858,8 +1144,8 @@ class WhoopRepository(
         dao.updateSleepStages(deviceId, detectedStartTs, stagesJSON)
 
     // MARK: - Per-epoch sleep analytics (v18: motionJSON / sleepStateJSON). Banked beside stagesJSON on
-    // the sleepSession row; written/read through targeted methods so the @Upsert recompute/import path
-    // (which never names these columns) preserves them. Port of iOS WhoopStore.persist/sessionMotion +
+    // the sleepSession row; written/read through targeted methods, then carried through recompute/import
+    // refreshes by SleepSessionUpsertPolicy. Port of iOS WhoopStore.persist/sessionMotion +
     // persist/sessionSleepState. HONESTY: an absent signal is stored as NULL and read back as null, never
     // a fabricated zero series; an EMPTY input array clears the column.
 
@@ -872,19 +1158,31 @@ class WhoopRepository(
     suspend fun sessionMotion(deviceId: String, sessionStart: Long): List<Double>? =
         dao.sessionMotionJson(deviceId, sessionStart)?.let { decodeDoubleArray(it) }
 
-    /** Per-epoch MOTION series for each of [starts] (detected session start keys), keyed by start (#407).
-     *  Motion is written ONLY under the computed ("-noop") source by the engine, so we read there; an
-     *  imported-only night (no computed twin) has no motion (absent stays absent , an honest empty state,
-     *  never a fabricated zero array). Does NOT resolve the night: the caller has already chosen the
-     *  main-night GROUP and passes those blocks' starts. A start with no stored series is omitted. Mirrors
-     *  iOS Repository.sessionMotions. */
-    suspend fun sessionMotions(strapDeviceId: String, starts: List<Long>): Map<Long, List<Double>> {
-        if (starts.isEmpty()) return emptyMap()
-        val computedId = computedDeviceId(strapDeviceId)
+    /** Per-epoch motion for the already-resolved [sessions], keyed by detected start (#407).
+     *
+     * The engine writes motion under a computed ("-noop") namespace. A selected session can belong to
+     * an older strap, however, while [activeStrapId] names the strap worn now. Resolve each start from its
+     * owning computed namespace first, then every registered WHOOP's computed namespace (active first,
+     * canonical last). This keeps old nights attached to their source across repeated strap switches and
+     * still finds a computed twin for an imported canonical session. A missing series remains absent.
+     */
+    suspend fun sessionMotions(
+        activeStrapId: String,
+        sessions: List<SleepSession>,
+    ): Map<Long, List<Double>> {
+        if (sessions.isEmpty()) return emptyMap()
+        val fallbackIds = rawWhoopSourceIds(activeStrapId).map { "$it-noop" }
         val out = HashMap<Long, List<Double>>()
-        for (start in starts) {
-            val m = dao.sessionMotionJson(computedId, start)?.let { decodeDoubleArray(it) }
-            if (!m.isNullOrEmpty()) out[start] = m
+        for (session in sessions) {
+            if (out.containsKey(session.startTs)) continue
+            val ownerComputed = if (session.deviceId.endsWith("-noop")) session.deviceId else "${session.deviceId}-noop"
+            for (sourceId in (listOf(ownerComputed) + fallbackIds).distinct()) {
+                val motion = dao.sessionMotionJson(sourceId, session.startTs)?.let { decodeDoubleArray(it) }
+                if (!motion.isNullOrEmpty()) {
+                    out[session.startTs] = motion
+                    break
+                }
+            }
         }
         return out
     }
@@ -905,6 +1203,15 @@ class WhoopRepository(
         dao.deleteMetricSeries(deviceId, key)
     suspend fun upsertJournal(rows: List<JournalEntry>) = dao.upsertJournal(rows)
     suspend fun upsertWorkouts(rows: List<WorkoutRow>) = dao.upsertWorkouts(rows)
+
+    /**
+     * Persist analytics-derived fields onto workouts the user already logged. This is deliberately
+     * append/update-only: unlike the retired detected-row reconciliation, an empty or interrupted pass
+     * performs no DAO call and can never delete grandfathered `sport="detected"` history (#2187).
+     */
+    suspend fun persistWorkoutBackfills(rows: List<WorkoutRow>) {
+        if (rows.isNotEmpty()) dao.upsertWorkouts(rows)
+    }
     suspend fun upsertAppleDaily(rows: List<AppleDaily>) = dao.upsertAppleDaily(rows)
 
     // MARK: - Live Sessions (silent guardian, v22). The runner banks the row at start (endTs null) and
@@ -933,7 +1240,7 @@ class WhoopRepository(
 
     // MARK: - Reads
 
-    suspend fun hrSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
+    suspend fun hrSamplesForDevice(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.hrSamples(deviceId, from, to, limit)
 
     /** #856: HR samples over an EXPLICIT id list, deduped by ts with earlier ids winning — the sample
@@ -944,10 +1251,45 @@ class WhoopRepository(
         if (deviceIds.isEmpty()) emptyList()
         else mergeHrByTs(deviceIds.map { dao.hrSamples(it, from, to, limit) })
 
+    /** Count and newest timestamp of measured HR per source [hrSamplesUnion] reads, as one opaque string:
+     *  an index-only witness of whether a window's heart rate changed, without fetching a row.
+     *
+     * A fingerprint narrower than the read it guards is worse than none: it would serve a cached result
+     * after a backfill landed rows under an alias id, which is exactly the id set [hrSamplesUnion] exists
+     * to cover (#908, a re-added strap banking under its own fresh id). So this walks the same ids rather
+     * than the bare [activeDeviceId].
+     *
+     * Cost is one COUNT plus one MAX per id via [hrFingerprintWindow], index range walks that materialise
+     * no rows, against the full per-day row fetches a caller would otherwise repeat. Compared only to
+     * itself, so the format carries no contract beyond equality. One caller does persist a value
+     * ([com.noop.widget.StressWidgetRefresh.storedFingerprint], whose worker has no process memory
+     * between wakes), and a stored value only ever compares equal to one written in the same format, so
+     * changing the format costs one extra scoring pass and can never produce a false hit. The Swift
+     * `Repository.hrFingerprintUnion` is a twin in ROLE only, encoding the same facts differently; there
+     * is no byte-identity contract between them and no oracle asserting one.
+     *
+     * The single union witness for every caller (#2566): the cycle load cache in
+     * [com.noop.analytics.PhysiologicalStepCycleEngine], the daytime stress lens memo in
+     * [com.noop.ui.selectedDaytimeStressMode], and all three stress gates standing in front of a union
+     * read (#2710) — [com.noop.widget.StressWidgetProducer]'s memo, the Stress screen's periodic
+     * re-read, and [com.noop.widget.StressWidgetRefresh.storedFingerprint]'s stored value. Two of these
+     * that were free to disagree is what #2566 removed, so route a new caller here rather than adding
+     * another.
+     */
+    suspend fun hrUnionFingerprint(activeDeviceId: String, from: Long, to: Long): String {
+        // An explicit loop rather than joinToString: the per-id read suspends and that builder's lambda
+        // is not a suspend function.
+        val parts = ArrayList<String>()
+        for (id in rawWhoopSourceIds(activeDeviceId)) {
+            val (count, maxTs) = hrFingerprintWindow(id, from, to)
+            parts += "$id=$count:$maxTs"
+        }
+        return parts.joinToString(",")
+    }
+
     /**
-     * HR samples over the read-side UNION of the active strap id AND the canonical "my-whoop" (SPINE /
-     * #814 + HIGH-2), deduped by ts with the active strap winning. This is the Kotlin twin of the Swift
-     * [com.noop] Repository.hrSamples(from:to:) union overload.
+     * HR samples over every registered WHOOP plus canonical "my-whoop", deduped by timestamp with the
+     * active strap winning and archived straps retained for historical windows.
      *
      * #908: a strap re-added through the in-app device manager banks its LIVE raw under its OWN fresh id
      * (e.g. "whoop-<uuid>"), NOT "my-whoop". A Today-curve / live-Effort read pinned to the hardcoded
@@ -956,7 +1298,7 @@ class WhoopRepository(
      * A single-WHOOP install resolves [activeDeviceId] to "my-whoop" ⇒ ONE id ⇒ byte-identical read.
      */
     suspend fun hrSamplesUnion(activeDeviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT):
-        List<HrSample> = mergeHrByTs(importedSourceIds(activeDeviceId).map { dao.hrSamples(it, from, to, limit) })
+        List<HrSample> = mergeHrByTs(rawWhoopSourceIds(activeDeviceId).map { dao.hrSamples(it, from, to, limit) })
 
     /** Raw measured HR only (no v26 PPG-derived union) for the raw-sensor diagnostic export. */
     suspend fun rawHrSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
@@ -990,25 +1332,9 @@ class WhoopRepository(
         dao.v18AuxSamples(deviceId, from, to, limit)
             .map { V18AuxCodec.unpack(it.fields, it.ts) }
 
-    /** #423: persist a batch of decoded 5/MG raw-IMU offload buffers (one row per strap-second, packed i16
-     *  BLOB), then bound the table to the newest [RAW_IMU_RETENTION_ROWS] for the device. Comes from the
-     *  deep-buffer capture seam, not the normal stream path, so it inserts directly (idempotent by ts). */
-    suspend fun insertRawImu(deviceId: String, rows: List<RawImuSampleEntity>) {
-        if (rows.isEmpty()) return
-        dao.insertRawImu(rows)
-        dao.pruneRawImu(deviceId, RAW_IMU_RETENTION_ROWS)
-    }
-
-    /** #423: raw 5/MG IMU buffers in [from, to] as the decoded i16 columns [ax…az,gx…gz] (100/axis).
-     *  Intentionally dormant — zero callers, retained for the eventual cross-check (see [RawImuSampleEntity]
-     *  CONSUMER STATUS, #978). Not dead code; do not delete. */
-    suspend fun rawImuSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT):
-        List<Pair<Long, ShortArray>> =
-        dao.rawImuSamples(deviceId, from, to, limit)
-            .map { it.ts to StreamPersistence.unpackImuColumns(it.samples) }
 
     /** Downsampled HR (mean bpm per [bucketSeconds]) for the strap, for the Today 24h trend chart. */
-    suspend fun hrBuckets(deviceId: String, from: Long, to: Long, bucketSeconds: Long = 300L) =
+    suspend fun hrBucketsForDevice(deviceId: String, from: Long, to: Long, bucketSeconds: Long = 300L) =
         dao.hrBuckets(deviceId, from, to, bucketSeconds)
 
     /** #856: the same dedup over an EXPLICIT id list, so a workout can read its OWN recording strap
@@ -1020,15 +1346,13 @@ class WhoopRepository(
         else mergeHrBucketsByStart(deviceIds.map { dao.hrBuckets(it, from, to, bucketSeconds) })
 
     /**
-     * Downsampled HR buckets over the read-side UNION of the active strap id AND the canonical "my-whoop"
-     * (SPINE / #814 + HIGH-2), deduped by bucket start with the active strap winning. Kotlin twin of the
-     * Swift Repository.hrBuckets(from:to:bucketSeconds:) union overload. #908: keeps the Today HR curve
-     * pointed at whichever id the re-added strap actually banks under. Single-WHOOP install ⇒ one id ⇒
-     * byte-identical read.
+     * Downsampled HR buckets over every registered WHOOP (active first, archived included, canonical
+     * last), deduped by bucket start with the active source winning. Kotlin twin of the raw-sample union.
+     * A legacy canonical-only install remains a single byte-identical DAO read.
      */
     suspend fun hrBucketsUnion(activeDeviceId: String, from: Long, to: Long, bucketSeconds: Long = 300L):
         List<HrBucket> = mergeHrBucketsByStart(
-            importedSourceIds(activeDeviceId).map { dao.hrBuckets(it, from, to, bucketSeconds) },
+            rawWhoopSourceIds(activeDeviceId).map { dao.hrBuckets(it, from, to, bucketSeconds) },
         )
 
     /**
@@ -1055,10 +1379,27 @@ class WhoopRepository(
         rows: List<WorkoutRow>,
         // HR read key for IMPORTED rows ONLY (Apple/HC/CSV/activity file): they carry no strap HR of their
         // own, so #77 derives it from the worn strap. STRAP-NATIVE rows ignore this and key on their OWN
-        // recording strap (see [workoutHrDeviceIds]). The canonical "my-whoop" default is the worn strap on a
-        // single-WHOOP install (and every current caller uses it); which strap was worn during an imported
-        // session on a MULTI-strap install is undetermined, so that case is left as-is (not the active strap).
-        strapDeviceId: String = "my-whoop",
+        // recording strap (see [workoutHrDeviceIds]).
+        //
+        // #1601: both UI callers now pass the ACTIVE strap id. This used to be left at the canonical
+        // default on the reasoning that which strap was worn during an imported session is undetermined on
+        // a MULTI-strap install — true, but it made the common SINGLE-strap case wrong, because an install
+        // whose one strap banks under a non-canonical id (a re-add, or a 5/MG's transient CB-UUID pairing,
+        // #1193) resolved `importedSourceIdsFor("my-whoop")` to the canonical id ALONE while the detail
+        // sheet's chart, zones and HR-recovery resolved active ∪ canonical. The graph found HR and this
+        // fill did not, so the session showed "AVG –" against a populated curve — the state this function's
+        // own promise of "display == graph == zones == effort by construction" exists to prevent.
+        //
+        // The multi-strap ambiguity is not resolved by this, and is not made worse by it either: the union
+        // and its first-wins merge are exactly what the chart already applies to the same window, so the two
+        // now agree rather than disagreeing.
+        //
+        // REQUIRED, no default. The canonical default is what caused this — #857 unified the RESOLVER
+        // ("one HR device-id rule for the chart, zones, Avg HR and HRR") but this parameter, inherited from
+        // #77, kept feeding it a different active id, so the one rule ran on two inputs and Avg HR was the
+        // surface that missed out. Nothing depended on the default once both call sites were corrected, and
+        // a caller that cannot name the strap it means should not be silently given the canonical one.
+        strapDeviceId: String,
         minSamples: Long = 60,
         cap: Int = 300,
         // #961: the user's HRmax + sex. When supplied, a strap-native row whose Effort (strain) is null gets
@@ -1116,11 +1457,111 @@ class WhoopRepository(
         }
     }
 
-    suspend fun rrIntervals(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
-        dao.rrIntervals(deviceId, from, to, limit)
+    suspend fun isWhoop5RrSource(deviceId: String, unlabelledAliasOfWhoop5: Boolean = false): Boolean {
+        val owner = dao.pairedDevice(deviceId)
+        val known = com.noop.protocol.DeviceFamily.confirmedRegistryFamily(owner?.model, owner?.brand)
+        val nonWhoop = !owner?.brand.isNullOrEmpty() && !owner?.brand.equals("WHOOP", ignoreCase = true)
+        var tagged = known == null && !nonWhoop && dao.hasWhoop5RrSource(deviceId)
+        // Re-pairing leaves some callers and historical rows under the canonical alias. Resolve
+        // its active strap here so sleep edits, manual naps and nightly reads share one policy.
+        // Confirmed WHOOP 4 and physical owners retain their own identity.
+        if (known == null && !nonWhoop && !tagged && !unlabelledAliasOfWhoop5 && deviceId == WHOOP_SOURCE) {
+            val active = dao.activeDeviceId()
+            if (active != null && active != deviceId) tagged = isWhoop5RrSource(active)
+        }
+        return com.noop.protocol.Whoop5RR.usesCanonicalSource(owner?.model, owner?.brand, tagged || unlabelledAliasOfWhoop5)
+    }
+
+    /** The earliest beat this device has banked that the unit policy can actually score, or null when
+     *  it has none. See [FIRST_SCORABLE_WHOOP5_RR_SQL]; the caller turns it into a local day key, since
+     *  the calendar is the app's policy and not the store's. Twin of Swift
+     *  `firstScorableWhoop5RRTimestamp`. */
+    suspend fun firstScorableWhoop5RrTs(deviceId: String): Long? =
+        dao.firstScorableWhoop5RrTs(deviceId)
+
+    /** The earliest beat this device has banked at all, or null when it has none. See
+     *  [FIRST_RECORDED_RR_SQL]. Twin of Swift `firstRecordedRRTimestamp`. */
+    suspend fun firstRecordedRrTs(deviceId: String): Long? =
+        dao.firstRecordedRrTs(deviceId)
+
+    /** True only when strict WHOOP 5 policy withheld unlabelled legacy beats in this exact scoring window. */
+    suspend fun legacyWhoop5RrWithheld(
+        deviceId: String,
+        from: Long,
+        to: Long,
+        unlabelledAliasOfWhoop5: Boolean = false,
+    ): Boolean = transactor.run {
+        isWhoop5RrSource(deviceId, unlabelledAliasOfWhoop5) &&
+            dao.legacyWhoop5RrWithheld(deviceId, from, to)
+    }
+
+    /** Diagnostic export keeps all WHOOP transports, both Oura beat channels and legacy values without
+     * scoring selection. Existing quarantine and Oura SpO2-IBI exclusions still apply. */
+    suspend fun rawRrIntervalsForDevice(deviceId: String, from: Long, to: Long,
+                                        limit: Int = DEFAULT_LIMIT): List<RrInterval> =
+        dao.rawRrIntervals(deviceId, from, to, limit)
+
+    suspend fun rrIntervalsForDevice(deviceId: String, from: Long, to: Long,
+                                     limit: Int = DEFAULT_LIMIT,
+                                     unlabelledAliasOfWhoop5: Boolean = false): List<RrInterval> = transactor.run {
+        // A WHOOP 4 reads its labelled type-47 history OR its unlabelled standard-BLE feed, never both
+        // spliced together: they overlap, and the pair over-counts coverage the same way two Oura
+        // channels did.
+        //
+        // A ring record served twice is stored twice: each connection anchors on its own SyncTime, so
+        // the second copy lands a second or two off the first and misses the row key instead of
+        // colliding with it (#2456). Collapsed HERE rather than at one scorer, so every SCORING reader
+        // agrees: the damage shows up as a coverage over-count, and coverage is computed from this read.
+        //
+        // `rawRrIntervalsForDevice` above deliberately does NOT collapse and still shows both copies.
+        // That is the point of a raw export, and it is the evidence the duplication was diagnosed from,
+        // so a diagnostic export and the app can legitimately disagree on beat counts.
+        OuraRedrainCollapse.withoutRedrainedRuns(
+            when {
+                isWhoop5RrSource(deviceId, unlabelledAliasOfWhoop5) ->
+                    dao.whoop5RrIntervals(deviceId, from, to, limit)
+                isWhoop4RrSource(deviceId) || dao.hasWhoop4HistoricalRrSource(deviceId) ->
+                    dao.whoop4RrIntervals(deviceId, from, to, limit)
+                else -> dao.rrIntervals(deviceId, from, to, limit)
+            }
+        )
+    }
+
+    /** Whether the device registry CONFIRMS this owner is a WHOOP 4, so its type-47 history is scorable. */
+    private suspend fun isWhoop4RrSource(deviceId: String): Boolean {
+        val owner = dao.pairedDevice(deviceId)
+        return com.noop.protocol.DeviceFamily.confirmedRegistryFamily(owner?.model, owner?.brand) ==
+            com.noop.protocol.DeviceFamily.WHOOP4
+    }
+
+    /** R-R beats over active strap + canonical history. Exact duplicate beats are removed with the
+     * active source winning; distinct beats sharing a timestamp remain intact. */
+    suspend fun rrIntervalsUnion(
+        activeDeviceId: String,
+        from: Long,
+        to: Long,
+        limit: Int = DEFAULT_LIMIT,
+    ): List<RrInterval> = transactor.run {
+        val activeWhoop5 = isWhoop5RrSource(activeDeviceId)
+        // Preserve archived physical straps; guard only the ambiguous canonical alias's units.
+        mergeRrByIdentity(rawWhoopSourceIds(activeDeviceId).map {
+            rrIntervalsForDevice(it, from, to, limit,
+                unlabelledAliasOfWhoop5 = activeWhoop5 && it == "my-whoop")
+        })
+    }
 
     suspend fun events(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.events(deviceId, from, to, limit)
+
+    /** Standard-BLE contact readings only; legacy HR rows have no companion event and stay absent. */
+    suspend fun standardHrContacts(
+        deviceId: String,
+        from: Long,
+        to: Long,
+        limit: Int = DEFAULT_LIMIT,
+    ): List<StandardHrContactSample> = dao.eventsByKind(
+        deviceId, StandardHrMapping.CONTACT_EVENT_KIND, from, to, limit,
+    ).map(StandardHrMapping::contactSample)
 
     suspend fun batterySamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.batterySamples(deviceId, from, to, limit)
@@ -1133,6 +1574,25 @@ class WhoopRepository(
 
     suspend fun stepSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.stepSamples(deviceId, from, to, limit)
+
+    suspend fun stepSampleBefore(deviceId: String, onset: Long): StepSample? =
+        dao.stepSampleBefore(deviceId, onset)
+
+    suspend fun hasStepActivityClasses(deviceId: String, onset: Long, endExclusive: Long): Boolean =
+        dao.hasStepActivityClasses(deviceId, onset, endExclusive)
+
+    suspend fun stepTimestampCoverage(deviceId: String, onset: Long, endExclusive: Long): StepTimestampCoverage =
+        StepTimestampCoverage(
+            firstTs = dao.firstStepTimestamp(deviceId, onset, endExclusive),
+            lastTs = dao.lastStepTimestamp(deviceId, onset, endExclusive),
+        )
+
+    suspend fun stepSamplesPage(
+        deviceId: String,
+        afterExclusive: Long,
+        endExclusive: Long,
+        limit: Int,
+    ): List<StepSample> = dao.stepSamplesPage(deviceId, afterExclusive, endExclusive, limit)
 
     /**
      * The strap's OWN band sleep_state samples (#175) in [from, to] as (ts, state) pairs, ascending. Feeds
@@ -1155,20 +1615,27 @@ class WhoopRepository(
     suspend fun stepActivityClassLatestUnion(activeDeviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT):
         Int? = latestActivityClass(importedSourceIds(activeDeviceId).map { dao.stepSamples(it, from, to, limit) })
 
-    /** Delete a computed source's [sport] workouts in [from, to] (makes re-detection idempotent). (#78) */
-    suspend fun deleteComputedWorkouts(deviceId: String, sport: String, from: Long, to: Long) =
-        dao.deleteWorkoutsBySport(deviceId, sport, from, to)
-
     // MARK: - Workout editing (manual add/edit · relabel · dismiss · delete) (#107)
     //
     // Mirrors macOS Repository's workout-editing surface. Manual workouts live under the strap source
-    // ([strapDeviceId], source "manual") , the same place live-tracked sessions land. Detected bouts
-    // live under "<strapDeviceId>-noop" with sport "detected" and are wiped + re-derived each engine
-    // run, so a durable dismissal is recorded in the independent `dismissedWorkout` table.
+    // ([strapDeviceId], source "manual") , the same place live-tracked sessions land. Grandfathered
+    // detected bouts live under "<strapDeviceId>-noop" with sport "detected"; the engine no longer
+    // creates or reconciles them, but their durable dismissal path remains supported.
 
     /** Dismissed detected-bout markers for the computed source of [strapDeviceId]. */
     suspend fun dismissedDetected(strapDeviceId: String = "my-whoop"): List<DismissedWorkout> =
         dao.dismissedWorkouts(computedDeviceId(strapDeviceId))
+
+    /**
+     * Dismissed detected-bout markers across the same active + archived + canonical WHOOP union used by
+     * raw telemetry and workout reads. A rejection recorded before a strap remove/re-add must keep
+     * suppressing the corresponding suggestion after the active namespace changes.
+     */
+    suspend fun dismissedDetectedUnion(activeDeviceId: String): List<DismissedWorkout> =
+        rawWhoopSourceIds(activeDeviceId)
+            .map { computedDeviceId(it) }
+            .flatMap { dao.dismissedWorkouts(it) }
+            .distinctBy { Triple(it.deviceId, it.startTs, it.endTs) }
 
     /** Deleted-sleep tombstones for BOTH the imported and computed sources of [strapDeviceId] (#33/#65).
      *
@@ -1195,10 +1662,11 @@ class WhoopRepository(
     /**
      * Persist a retroactive / edited manual workout under the strap source. [replacing] is the row the
      * edit started from:
-     *  - editing a DETECTED bout replaces it with this manual row , the detected original is dismissed
-     *    durably so the re-detector doesn't bring it back (else both would show);
-     *  - editing a MANUAL row whose PRIMARY KEY moved deletes the stale row first (the
-     *    (deviceId, startTs, sport) PK upsert would otherwise orphan it). deviceId is part of that key,
+     *  - editing a grandfathered DETECTED bout writes the manual replacement first, then records its
+     *    legacy dismissal marker and deletes the original. A failed replacement write therefore leaves
+     *    the user's existing history intact;
+     *  - editing a MANUAL row whose PRIMARY KEY moved writes the replacement first, then retires the
+     *    stale row. A failed write therefore preserves the original. deviceId is part of that key,
      *    so a row stored under a re-paired strap's active id counts as moved even when startTs and sport
      *    are untouched: the edit lands on the "my-whoop" seed while the original stays put, and
      *    `workoutsUnion` reads [activeDeviceId, "my-whoop"] keeping the FIRST row per (startTs, sport),
@@ -1208,43 +1676,50 @@ class WhoopRepository(
      */
     suspend fun saveManualWorkout(row: WorkoutRow, replacing: WorkoutRow? = null) {
         if (replacing != null && replacing.source.lowercase().endsWith("-noop")) {
+            dao.upsertWorkouts(listOf(row))
             dismissDetected(replacing)
-        } else if (replacing != null && supersedesStoredRow(replacing, row)) {
+            return
+        }
+        if (replacing != null && supersedesStoredRow(replacing, row)) {
+            // A failed insert must not erase history. If the later delete fails, retaining both rows is
+            // safer and recoverable; the caller can retry the edit.
+            dao.upsertWorkouts(listOf(row))
             dao.deleteWorkoutByKey(replacing.deviceId, replacing.startTs, replacing.sport)
+            return
         }
         dao.upsertWorkouts(listOf(row))
     }
 
     /**
-     * Re-label a detected bout: copy it to a manual strap row with the chosen [sport], then delete the
-     * detected original. Survives analyzeRecent , the engine re-derives only sport="detected" rows AND
-     * skips any re-derived bout overlapping a real strap workout, which this copy now is , so the same
-     * session is never re-created as a duplicate. (#107)
+     * Re-label a grandfathered detected bout: write a manual strap row with the chosen [sport], then retain
+     * the legacy dismissal marker and delete the detected original. Writing first preserves history on a
+     * failed upsert; the marker keeps the decision durable if deletion fails or the manual copy is removed.
+     * (#107/#2187)
      */
     suspend fun relabelDetected(row: WorkoutRow, sport: String, strapDeviceId: String = "my-whoop") {
         val trimmed = sport.trim()
         if (trimmed.isEmpty()) return
         val manual = row.copy(deviceId = strapDeviceId, sport = trimmed, source = "manual")
         dao.upsertWorkouts(listOf(manual))
-        dao.deleteWorkoutsBySport(computedDeviceId(strapDeviceId), "detected", row.startTs, row.startTs)
+        dismissDetected(row)
     }
 
     /**
-     * Dismiss a DETECTED bout the user says isn't a workout: record a durable marker (so a re-detect
-     * that recreates the same PK stays hidden) AND delete the current row so it disappears now.
-     * No-op when the row isn't a detected bout. (#107)
+     * Dismiss a grandfathered DETECTED bout the user says isn't a workout: retain its durable marker for
+     * historical compatibility and suggestion suppression, then delete the current row so it disappears
+     * now. No-op when the row isn't a detected bout. (#107/#2187)
      */
     suspend fun dismissDetected(row: WorkoutRow) {
         if (!row.source.lowercase().endsWith("-noop")) return
-        // Marker carries the bout's [startTs, endTs] span so a re-detected bout whose boundary drifts
-        // still overlaps it and stays hidden (matches macOS dismissed-span semantics).
+        // Marker carries the bout's [startTs, endTs] span; the suggestion path preserves its historical
+        // half-open overlap semantics even though the analytics engine no longer creates generic rows.
         dao.insertDismissed(listOf(DismissedWorkout(row.deviceId, row.startTs, row.endTs)))
         dao.deleteWorkoutsBySport(row.deviceId, row.sport, row.startTs, row.startTs)
     }
 
     /**
-     * Delete ONE workout. A detected bout is dismissed durably (so it doesn't come back on the next
-     * re-detect); everything else is removed by its exact natural key. (#107)
+     * Delete ONE workout. A grandfathered detected bout also retains a durable dismissal marker;
+     * everything else is removed by its exact natural key. (#107/#2187)
      */
     suspend fun deleteWorkout(row: WorkoutRow) {
         if (row.source.lowercase().endsWith("-noop")) { dismissDetected(row); return }
@@ -1296,10 +1771,41 @@ class WhoopRepository(
     suspend fun respSamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.respSamples(deviceId, from, to, limit)
 
-    suspend fun gravitySamples(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
+    suspend fun gravitySamplesForDevice(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.gravitySamples(deviceId, from, to, limit)
 
-    suspend fun sleepSessions(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
+    /** Which raw streams this device has any rows for — see [WhoopDao.streamPresence]. Presence, not
+     *  counts, so it is four index seeks that stop at the first row. Diagnostics-export only. */
+    suspend fun streamPresence(deviceId: String, from: Long, to: Long) =
+        dao.streamPresence(deviceId, from, to)
+
+    /**
+     * Gravity samples over the read-side union of the active strap id and canonical "my-whoop",
+     * deduped by timestamp with the active strap winning. A re-added strap banks live motion under its
+     * fresh device id while older/imported motion can remain under the canonical id; calibration reads
+     * need both histories just like [hrSamplesUnion]. A canonical active id still performs one unchanged
+     * DAO read.
+     */
+    suspend fun gravitySamplesUnion(
+        activeDeviceId: String,
+        from: Long,
+        to: Long,
+        limit: Int = DEFAULT_LIMIT,
+    ): List<GravitySample> = mergeGravityByTs(
+        rawWhoopSourceIds(activeDeviceId).map { dao.gravitySamples(it, from, to, limit) },
+    )
+
+    /** Resolve raw WHOOP telemetry across every registered WHOOP, including archived straps. Registry
+     * order is stable (addedAt ASC); the currently worn strap wins overlaps and canonical imports lose
+     * overlaps. The explicitly active source is preserved even for another brand; unrelated registered
+     * devices from other brands are deliberately excluded from WHOOP-specific fallback reads. */
+    private suspend fun rawWhoopSourceIds(activeDeviceId: String): List<String> =
+        rawWhoopSourceIdsFor(
+            activeDeviceId,
+            dao.pairedDevices().filter { it.brand.equals("WHOOP", ignoreCase = true) }.map { it.id },
+        )
+
+    suspend fun sleepSessionsForDevice(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT) =
         dao.sleepSessions(deviceId, from, to, limit)
 
     /**
@@ -1318,13 +1824,15 @@ class WhoopRepository(
         val now = System.currentTimeMillis() / 1000L
         val lo = now - days * 86_400L
         val hi = now + 86_400L
-        // UNION active strap + canonical "my-whoop" (imported) and their computed siblings (#814/#1008),
+        // UNION every registered WHOOP (active first, including archived, canonical last) and their
+        // computed siblings,
         // de-duplicating identical (startTs, endTs) blocks recorded under both ids so a night present in
         // both namespaces doesn't double-weight the learner. Reading one id narrowed the night set vs iOS
         // after a strap re-add (the learner could cold-start to null where iOS returned a learned value).
         // Mirrors Swift Repository.habitualMidsleepSec (importedReadIds/computedReadIds + dedupBlocks).
-        val imported = dedupSleepBlocks(importedSourceIds(deviceId).flatMap { dao.sleepSessions(it, lo, hi, 4000) })
-        val computed = dedupSleepBlocks(computedSourceIds(deviceId).flatMap { dao.sleepSessions(it, lo, hi, 4000) })
+        val rawIds = rawWhoopSourceIds(deviceId)
+        val imported = dedupSleepBlocks(rawIds.flatMap { dao.sleepSessions(it, lo, hi, 4000) })
+        val computed = dedupSleepBlocks(rawIds.map { "$it-noop" }.flatMap { dao.sleepSessions(it, lo, hi, 4000) })
         val offsetSec = (java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000).toLong()
         val blocks = (imported + computed).mapNotNull { s ->
             val start = s.effectiveStartTs
@@ -1530,6 +2038,15 @@ class WhoopRepository(
      * the Phase-1 zeros. Keys mirror the Swift probe (TestCentreReport.storageProbe) so a maintainer
      * reads the same map from either platform. Best-effort: a read failure returns empty (the caller's
      * zeroed fallback stays an honest "unreadable"), never a fabricated figure.
+     *
+     * THE KEY SET IS A CROSS-PLATFORM CONTRACT. Apple pins it in `WhoopStoreTests.ReadTests`
+     * (`testStorageRowCountsNamesEveryAccumulatingTable`) against this exact list, so adding a table
+     * there fails loudly until both sides agree. There is no equivalent pin on this side: these counts
+     * need a DAO, and the JVM unit tests have no in-memory Room, so a key added HERE and not there goes
+     * unnoticed. Add it to `WhoopStore.rawTableKeys` in the same change - the Apple probe reads that list
+     * for both its total and its breakdown, so a table missing from it is invisible in the footprint,
+     * which is how ppgWaveform - the only blob table, and the one a row-count model misprices worst -
+     * stayed unreported on Apple until #1911 asked which table was large.
      */
     suspend fun storageRowCounts(): Map<String, Int> = runCatching {
         mapOf(
@@ -1539,9 +2056,10 @@ class WhoopRepository(
             "resp" to dao.countResp(), "gravity" to dao.countGravity(),
             // The rest of the accumulating decoded raw streams, so the Test-Centre footprint counts ALL of
             // them (keep in sync with Swift storageStats / TimestampHeal's raw-table list). ppgHr/ppgWaveform
-            // /rawImu can each be large.
+            // /v18Aux can each be large.
             "ppgHr" to dao.countPpgHr(), "sleepState" to dao.countSleepState(),
-            "ppgWaveform" to dao.countPpgWaveform(), "rawImu" to dao.countRawImu(),
+            "ppgWaveform" to dao.countPpgWaveform(),
+            "ecgWaveform" to dao.countEcgWaveform(),
             "v18Aux" to dao.countV18Aux(),
         )
     }.getOrDefault(emptyMap())
@@ -1669,35 +2187,65 @@ class WhoopRepository(
         computed = computedSourceIds(deviceId).reversed().flatMap { dao.sleepSessions(it, from, to, limit) },
     )
 
-    /** ALL imported sleep BLOCKS across the active∪canonical union (#814/#1008), keeping every session
-     *  per day (a nap + a main night both survive) and dropping only EXACT-duplicate (startTs, endTs)
-     *  blocks recorded under both union ids , active strap FIRST so it keeps the surviving copy. The
+    /** ALL imported sleep BLOCKS across every registered WHOOP (active first, archived included,
+     *  canonical last), keeping every session
+     *  per day (a nap + a main night both survive) and collapsing near-identical nights
+     *  recorded under different union ids, active strap FIRST so it keeps the surviving copy. The
      *  Sleep tab's chevron walk reads this instead of the single canonical id, so a night recorded under
      *  a re-added strap's fresh id still surfaces (the downstream per-day imported-wins split is the
      *  caller's, exactly as before). Mirrors Swift Repository.unionSleepSessions. */
     suspend fun sleepSessionsUnion(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT):
         List<SleepSession> =
-        dedupSleepBlocks(importedSourceIds(deviceId).flatMap { dao.sleepSessions(it, from, to, limit) })
+        dedupSleepBlocks(rawWhoopSourceIds(deviceId).flatMap { dao.sleepSessions(it, from, to, limit) })
 
     /** The COMPUTED ("-noop") twin of [sleepSessionsUnion]: all computed sleep blocks across the computed
-     *  union ids, exact-duplicate blocks dropped (active's computed sibling first). Mirrors Swift
+     *  union ids, near-identical nights collapsed (active's computed sibling first). Mirrors Swift
      *  Repository.unionComputedSleepSessions. */
     suspend fun computedSleepSessionsUnion(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT):
-        List<SleepSession> =
-        dedupSleepBlocks(computedSourceIds(deviceId).flatMap { dao.sleepSessions(it, from, to, limit) })
+        List<SleepSession> {
+        val ids = rawWhoopSourceIds(deviceId).map { "$it-noop" }
+        return dedupSleepBlocks(ids.flatMap { dao.sleepSessions(it, from, to, limit) })
+    }
 
-    /** Workouts over the read-side UNION of the active strap id AND the canonical "my-whoop" (#814 twin of
-     *  [hrSamplesUnion] / [sleepSessionsUnion]): a re-added / newly-paired strap owns "whoop-<uuid>" while
+    /**
+     * ALL sleep sessions across every registered WHOOP (active first, archived included, canonical
+     * last) over the last [days], imported [sleepSessionsUnion] merged with the computed
+     * [computedSleepSessionsUnion] twin: a computed session is kept only when its LOCAL wake-day (the
+     * same `AnalyticsEngine.dayString` keyer `mergeSleep` uses) is NOT already covered by an imported
+     * session that day — no richness exception, unlike `mergeSleepRichness`/[sleepSessionsMerged].
+     * Sorted by [SleepSession.effectiveStartTs] ascending, so the caller's `.lastOrNull()` is the most
+     * recent night. Robust to a stale/wrong [deviceId] (e.g. no strap currently connected) because
+     * [rawWhoopSourceIds] enumerates every registered WHOOP regardless of which id is passed in.
+     * Mirrors Swift `Repository.allSleepSessions(days:)` exactly.
+     */
+    suspend fun allSleepSessionsUnion(deviceId: String, days: Int = 4000): List<SleepSession> {
+        val now = System.currentTimeMillis() / 1000L
+        val lo = now - days * 86_400L
+        val hi = now + 86_400L
+        val imported = sleepSessionsUnion(deviceId, lo, hi)
+        val computed = computedSleepSessionsUnion(deviceId, lo, hi)
+        fun endDay(s: SleepSession): String {
+            val offsetSec = (java.util.TimeZone.getDefault().getOffset(s.endTs * 1000) / 1000).toLong()
+            return com.noop.analytics.AnalyticsEngine.dayString(s.endTs, offsetSec)
+        }
+        val importedDays = imported.mapTo(HashSet(), ::endDay)
+        val computedKept = computed.filter { endDay(it) !in importedDays }
+        return (imported + computedKept).sortedBy { it.effectiveStartTs }
+    }
+
+    /** Workouts over every registered WHOOP (active first, archived retained) plus canonical "my-whoop",
+     *  matching [hrSamplesUnion] / [sleepSessionsUnion]. A re-added strap owns "whoop-<uuid>" while
      *  imports + prior data live under "my-whoop", so a read pinned to a SINGLE id strands the other's
      *  workouts — the Workouts screen then reads empty while Data Sources (which queries "my-whoop") shows
      *  them (#28). Exact-duplicate rows are dropped on the (startTs, sport) natural key, active-strap-first. */
     suspend fun workoutsUnion(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT): List<WorkoutRow> =
-        dedupWorkoutsByKey(importedSourceIds(deviceId).flatMap { dao.workouts(it, from, to, limit) })
+        dedupWorkoutsByKey(rawWhoopSourceIds(deviceId).flatMap { dao.workouts(it, from, to, limit) })
 
-    /** The COMPUTED ("-noop") twin of [workoutsUnion] for detected workouts (the engine writes detected
-     *  sessions under "<importedDeviceId>-noop"), across the computed union ids. */
+    /** The COMPUTED ("-noop") twin of [workoutsUnion], including grandfathered detected sessions retained
+     *  under "<importedDeviceId>-noop", across the computed union ids. */
     suspend fun detectedWorkoutsUnion(deviceId: String, from: Long, to: Long, limit: Int = DEFAULT_LIMIT): List<WorkoutRow> =
-        dedupWorkoutsByKey(computedSourceIds(deviceId).flatMap { dao.workouts(it, from, to, limit) })
+        dedupWorkoutsByKey(rawWhoopSourceIds(deviceId).map { "$it-noop" }
+            .flatMap { dao.workouts(it, from, to, limit) })
 
     /** Cached daily metrics for the inclusive day range [from, to] (YYYY-MM-DD), oldest first. */
     suspend fun dailyMetrics(deviceId: String, from: String, to: String): List<DailyMetric> =
@@ -1776,7 +2324,24 @@ class WhoopRepository(
         // Book / any resolver read agrees with the mergeDaily dashboards instead of re-surfacing the
         // schedule target the merge already rejects.
         val perCandidate = candidates.map { it to resolvedRows(it, from, to) }
-        return MetricSeriesResolution(preferredSource, candidates, resolveFirstWins(perCandidate))
+        val points = resolveFirstWins(perCandidate)
+        // #1705: skin_temp is bimodal — a CSV import writes ABSOLUTE °C into skinTempDevC while the
+        // computed pipeline writes a baseline DEVIATION, and the candidate list unions the imported and
+        // computed identities, so first-wins can resolve older days to one kind and recent days to the
+        // other. Every consumer aggregates these points (Compare's min/max and its min-max chart
+        // normalisation, Lab Book), and that is arithmetic across two scales. Reduce to the newest
+        // entry's kind HERE, at the one place the candidates are resolved, rather than at each screen.
+        if (key == "skin_temp") {
+            val keep = com.noop.analytics.SkinTempDisplay.dominantKind(points.map { it.value })
+            if (keep != null) {
+                return MetricSeriesResolution(
+                    preferredSource,
+                    candidates,
+                    points.filter { com.noop.analytics.SkinTempDisplay.kind(it.value) == keep },
+                )
+            }
+        }
+        return MetricSeriesResolution(preferredSource, candidates, points)
     }
 
     /**
@@ -1930,16 +2495,95 @@ class WhoopRepository(
         /** Default row cap on range reads. Matches the Swift call sites' bounded scans. */
         const val DEFAULT_LIMIT = 100_000
 
-        /** #423: rolling retention for the raw-IMU capture table (1 row/strap-second, ~1.2 KB each). One
-         *  hour ≈ 3600 rows ≈ 4 MB caps the table hard, so an enabled capture can never balloon the DB
-         *  during a multi-day offload replay. Instrument-first bounded window; nothing consumes it yet. */
-        const val RAW_IMU_RETENTION_ROWS = 3600
+        /**
+         * #1911: rolling retention for the v27 PPG waveform table (Swift twin
+         * `WhoopStore.ppgWaveformRetentionRows`). Previously the only UNBOUNDED blob table, and it carries
+         * by far the largest PER-ROW cost of any decoded stream: ~120 B against ~30 B for a scalar row.
+         *
+         * It is NOT the store's fastest-growing table, and this note must not be read as saying so. v26
+         * runs only in optical windows, roughly 28,800 rows/day by #1911's own figures, where `rrInterval`
+         * banks ~100,000/day and remains the higher-volume table by bytes. Capping this one bounds the
+         * worst row, not the bulk of #1911's ~93 MB/day.
+         *
+         * A NEWEST-N-ROWS CAP, DELIBERATELY NOT A TIME-WINDOW DROP. #1911 proposes "dropped after the hot
+         * window", calling the waveform "diagnostic-only". That framing is wrong: the migration note on
+         * `ppgWaveformSample` is the authority, and these rows are kept so a better estimator,
+         * HRV-from-PPG, or a waveform viewer can later run over the ORIGINAL samples rather than the
+         * derived bpm. Deleting by wall-clock age would empty the table for exactly the user such an
+         * estimator needs most (a sporadic wearer, whose v26 seconds are spread thin over months), and a
+         * waveform has no aggregate that survives it. Newest-N bounds the bytes while always leaving a
+         * full working set — the same trade [V18_AUX_RETENTION_ROWS] below makes.
+         *
+         * 604,800 = 7 × 86,400, matching the aux cap's "week of strap-seconds" semantic and #1911's own
+         * 7-day hot window. The ceiling is larger than aux's because the row is: ~120 B/row (a 48 B
+         * packed-i16 blob for 24 samples plus row and primary-key-index overhead) gives ~70 MB per device
+         * against ~50 MB for aux. That is the bound worth quoting; the wall-clock
+         * span is longer than the arithmetic suggests, because v26 only runs in optical windows. At #1911's
+         * ~28,800 rows/day the cap holds about three weeks of typical wear, and proportionally more for a
+         * sporadic wearer, which is exactly the population an age-based cutoff would have emptied. Retuning
+         * is one constant with no migration.
+         */
+        const val PPG_WAVEFORM_RETENTION_ROWS = 604_800
+
+        /**
+         * Rolling retention for the v42 ECG table (#2847). Swift twin: `WhoopStore.ecgWaveformRetentionRows`.
+         *
+         * 36,000 = 60 × 600: SIXTY READINGS AT THE STRAP'S OWN TEN-MINUTE SESSION LIMIT, which is the unit
+         * this data actually arrives in. @meta1971's month on one MG is the measurement behind the figure:
+         * 140 readings in 31 days, about 4.5 a day, a median of roughly 3 minutes (182 records), and 7 of
+         * the 140 reaching the 10-minute cap. So the same 36,000 rows holds about 198 readings and 44 days
+         * of that shape, and still 60 readings and 13 days if every one ran to the strap's limit. At
+         * ~1,600 B a row (a 1,572 B blob plus row and primary-key-index overhead) the ceiling is ~58 MB
+         * per device, in the same bracket as [PPG_WAVEFORM_RETENTION_ROWS]' ~70 MB.
+         *
+         * A ROW CAP THAT BEHAVES LIKE A READING CAP, which is why #2847's request for "a cap counted in
+         * readings" needs no reading-grouping machinery. The sweep deletes the OLDEST rows, so the only
+         * reading it can ever cut in half is the oldest one still in the window; every newer reading stays
+         * whole. A fragment at the far end of the window is the tolerable case, and a fragment of the
+         * NEWEST reading, which a cap applied the other way round would produce, is the useless one.
+         *
+         * Not an age-based drop, for the reason [PPG_WAVEFORM_RETENTION_ROWS] gives and more sharply:
+         * readings are DISCRETE EVENTS, so a user who takes one a week would be left with an empty table
+         * by any wall-clock cutoff, and a waveform has no aggregate that survives its samples.
+         */
+        const val ECG_WAVEFORM_RETENTION_ROWS = 36_000
+
+        /** Records to bank before sweeping `ecgWaveformSample` again: ONE MAXIMUM-LENGTH READING, and
+         *  deliberately far tighter in proportion than the two 10,000-row budgets beside it (600 against
+         *  36,000 is 1.7%, ~1 MB of overshoot against a ~58 MB bound). Swift twin:
+         *  `WhoopStore.ecgWaveformPruneEveryRows`.
+         *
+         *  The reason is the restart hole those budgets document: the counter is in-memory and per
+         *  repository instance, so a repository that never banks this many rows in one process lifetime
+         *  never sweeps. For `ppgWaveformSample` that is theoretical, since one night's offload banks
+         *  ~28,800 rows. ECG records arrive a few hundred at a time, days apart, so a budget of their size
+         *  would make the hole the normal case rather than the edge. At one full reading, any session that
+         *  offloads a long reading sweeps, and a run of median-length ones sweeps every third or fourth.
+         *  The hole is narrowed here, not closed: closing it needs a sweep forced once per session, which
+         *  belongs in a change that covers all three tables. */
+        const val ECG_WAVEFORM_PRUNE_EVERY_ROWS = 600
+
+        /** Rows to bank before sweeping `ppgWaveformSample` again — same amortisation and magnitude as
+         *  [V18_AUX_PRUNE_EVERY_ROWS] below, for the same reason: the sweep walks up to
+         *  [PPG_WAVEFORM_RETENTION_ROWS] index entries, so running it per insert batch is the cost. The
+         *  table may sit this many rows (plus the crossing batch) above the cap, roughly a MB against its
+         *  ~70 MB bound. Swift twin: `WhoopStore.ppgWaveformPruneEveryRows`.
+         *
+         *  WHAT THIS BUDGET DOES NOT GUARANTEE, and why the cap above is stated as a size and not a "hard
+         *  ceiling": the counter is in-memory and per repository instance, so process death resets it. The
+         *  sweep is the ONLY thing enforcing retention on this table (the `*ByTs` deletes belong to the
+         *  timestamp heal, not to retention), so a repository that never banks this many rows in one
+         *  process lifetime never sweeps. Not a concern for the normal shape, since the budget accumulates
+         *  across every batch of a session and one night's offload banks ~28,800 rows, but a repository fed
+         *  only short bursts between app kills can drift above the cap indefinitely.
+         *  [V18_AUX_PRUNE_EVERY_ROWS] has the identical property; forcing a sweep once per session would
+         *  close it for both, and belongs in a change that covers both. */
+        const val PPG_WAVEFORM_PRUNE_EVERY_ROWS = 10_000
 
         /**
          * v31: rolling retention for the v18 aux-slot table (Swift twin `WhoopStore.v18AuxRetentionRows`).
          *
-         * [RAW_IMU_RETENTION_ROWS] is the closest precedent — raw instrumentation banked as a blob, capped
-         * rather than unbounded — and the same reasoning applies: nothing reads these rows yet, so a cap
+         * Raw instrumentation is capped rather than unbounded. Nothing reads these rows yet, so a cap
          * is far cheaper to RELAX later than to impose once users have a year of history. Unbounded, this
          * table is the one genuinely new source of row growth in v31; the four named columns only WIDEN
          * rows that were already being written (~14 B on a gravity/skinTemp/sleepState row that exists
@@ -1974,10 +2618,10 @@ class WhoopRepository(
          * The IMPORTED daily-source ids to read for an [activeDeviceId]: the UNION of the active strap id
          * AND the canonical legacy "my-whoop", active FIRST (so a per-day pick takes the active/live row).
          * SPINE / #814 + HIGH-2. A re-added strap writes live data under its fresh id while the WHOOP-export
-         * import path ([com.noop.ingest.WhoopCsvImporter]) keeps writing under the canonical "my-whoop"
-         * (never drifting), so reading only the active id orphans the import. A single-WHOOP install resolves
-         * to "my-whoop" only ⇒ one id, byte-identical reads. Companion form so [com.noop.ui.FusionDayAdapter]
-         * (an object) and the instance reads share ONE definition.
+     * import path ([com.noop.ingest.WhoopCsvImporter]) keeps writing under the canonical "my-whoop"
+     * (never drifting), so reading only the active id orphans the import. A single-WHOOP install resolves
+     * to "my-whoop" only ⇒ one id, byte-identical reads. Companion form so [com.noop.ui.FusionDayAdapter]
+     * (an object) and the instance reads share ONE definition.
          */
         fun importedSourceIdsFor(activeDeviceId: String): List<String> =
             if (activeDeviceId == WHOOP_SOURCE) listOf(WHOOP_SOURCE)
@@ -1987,6 +2631,19 @@ class WhoopRepository(
          *  scores under "<importedDeviceId>-noop"). */
         fun computedSourceIdsFor(activeDeviceId: String): List<String> =
             importedSourceIdsFor(activeDeviceId).map { "$it-noop" }
+
+        /** Pure ordering contract shared with Swift through Tools/parity_cases/device_raw_sources.json. */
+        fun rawWhoopSourceIdsFor(activeDeviceId: String, registeredWhoopIds: List<String>): List<String> =
+            (listOf(activeDeviceId) +
+                registeredWhoopIds.filter { it != activeDeviceId && it != WHOOP_SOURCE } +
+                WHOOP_SOURCE).distinct()
+
+        /** Computed namespaces to probe for a session's motion, owner first and then the current
+         * active + canonical union. [sessionOwnerId] may already be a computed id. */
+        fun motionSourceIdsFor(activeDeviceId: String, sessionOwnerId: String): List<String> {
+            val ownerComputed = if (sessionOwnerId.endsWith("-noop")) sessionOwnerId else "$sessionOwnerId-noop"
+            return (listOf(ownerComputed) + computedSourceIdsFor(activeDeviceId)).distinct()
+        }
 
         /** Pick the winner among per-source LATEST rows ([computedSourceIdsFor] order, active-strap
          *  first): the strictly newest day wins; a shared newest day keeps the FIRST seen (the active
@@ -2016,14 +2673,28 @@ class WhoopRepository(
             return byDay.values.sortedBy { it.day }
         }
 
-        /** Drop sleep blocks sharing an identical (startTs, endTs) , the same physical night recorded
-         *  under two #814 union ids , keeping the FIRST seen (the callers pass active-strap-first lists,
-         *  so the active copy survives). Genuinely distinct blocks (a nap + a main night) are preserved.
+        /** Keep the active source's copy of a night when another source recorded nearly the same interval.
+         *  A majority of BOTH intervals must overlap, preserving a short nap inside a long night.
+         *  Separate blocks from one source remain distinct, including split sleeps.
          *  Pure companion form so the JVM tests exercise it without Room ([ResolverUnionTest]). Mirrors
          *  Swift Repository.dedupBlocks. (#1008) */
         internal fun dedupSleepBlocks(sessions: List<SleepSession>): List<SleepSession> {
             val seen = HashSet<Pair<Long, Long>>()
-            return sessions.filter { seen.add(it.startTs to it.endTs) }
+            val kept = ArrayList<SleepSession>()
+            for (session in sessions) {
+                if (!seen.add(session.startTs to session.endTs)) continue
+                val duplicate = kept.any { other ->
+                    if (session.deviceId == other.deviceId) return@any false
+                    val overlap = minOf(session.endTs, other.endTs) -
+                        maxOf(session.effectiveStartTs, other.effectiveStartTs)
+                    val duration = session.endTs - session.effectiveStartTs
+                    val otherDuration = other.endTs - other.effectiveStartTs
+                    duration > 0 && otherDuration > 0 &&
+                        overlap > duration / 2 && overlap > otherDuration / 2
+                }
+                if (!duplicate) kept.add(session)
+            }
+            return kept
         }
 
         /** True when [replacing] is stored under a DIFFERENT primary key than the row about to be written,
@@ -2275,12 +2946,19 @@ class WhoopRepository(
                 remMin = if (sleepFromFiller) filler.remMin else winner.remMin,
                 lightMin = if (sleepFromFiller) filler.lightMin else winner.lightMin,
                 disturbances = if (sleepFromFiller) filler.disturbances else winner.disturbances,
+                // Part of the SLEEP GROUP (#1801): it describes how the stage figures above were derived,
+                // so it moves with them. `copy()` would leave the WINNER's flag in place while the stages
+                // came from the filler — captioning one row's hypnogram with another row's staging.
+                sleepHrOnly = if (sleepFromFiller) filler.sleepHrOnly else winner.sleepHrOnly,
                 spo2Red = if (rawSpo2FromFiller) filler.spo2Red else winner.spo2Red,
                 spo2Ir = if (rawSpo2FromFiller) filler.spo2Ir else winner.spo2Ir,
                 // Independent columns: each stands alone, so a plain per-column fill is safe.
                 restingHr = winner.restingHr ?: filler.restingHr,
                 avgHrv = winner.avgHrv ?: filler.avgHrv,
                 avgSdnn = winner.avgSdnn ?: filler.avgSdnn,
+                // Strap-only, like raw SpO2: an imported winner carries no absolute skin temp, so
+                // take the filler's rather than blank a value the strap did record (#1636).
+                skinTempC = winner.skinTempC ?: filler.skinTempC,
                 recovery = winner.recovery ?: filler.recovery,
                 strain = winner.strain ?: filler.strain,
                 exerciseCount = winner.exerciseCount ?: filler.exerciseCount,
@@ -2301,6 +2979,40 @@ class WhoopRepository(
         internal fun mergeHrByTs(lists: List<List<HrSample>>): List<HrSample> {
             if (lists.size == 1) return lists[0]
             val byTs = LinkedHashMap<Long, HrSample>()
+            for (list in lists) for (s in list) byTs.putIfAbsent(s.ts, s)
+            return byTs.values.sortedBy { it.ts }
+        }
+
+        /** Merge R-R lists with source priority matching [mergeHrByTs]. R-R has multiple legitimate
+         * beats at one timestamp, so its identity is the storage key excluding deviceId, not timestamp
+         * alone. The first (active) list wins only an exact duplicate. */
+        internal fun mergeRrByIdentity(lists: List<List<RrInterval>>): List<RrInterval> {
+            if (lists.size == 1) return lists[0]
+            data class BeatKey(val ts: Long, val rrMs: Int, val seq: Int)
+            val byBeat = LinkedHashMap<BeatKey, RrInterval>()
+            for (list in lists) for (beat in list) {
+                byBeat.putIfAbsent(BeatKey(beat.ts, beat.rrMs, beat.seq), beat)
+            }
+            if (byBeat.values.any { it.srcChannel in 5..7 || it.srcChannel == 8 }) {
+                // Kotlin's stable sort preserves owner precedence and captured within-second order.
+                return byBeat.values.sortedBy { it.ts }
+            }
+            return byBeat.values.sortedWith(
+                compareBy<RrInterval> { it.ts }
+                    .thenBy { it.seq }
+                    .thenBy { it.rrMs }
+                    .thenBy { it.ord },
+            )
+        }
+
+        /**
+         * Merge gravity sample lists into one time-ordered stream, deduped by timestamp with the FIRST
+         * list (the active strap) winning on a tie. A single-id read is returned unchanged, matching the
+         * pre-union path and [mergeHrByTs].
+         */
+        internal fun mergeGravityByTs(lists: List<List<GravitySample>>): List<GravitySample> {
+            if (lists.size == 1) return lists[0]
+            val byTs = LinkedHashMap<Long, GravitySample>()
             for (list in lists) for (s in list) byTs.putIfAbsent(s.ts, s)
             return byTs.values.sortedBy { it.ts }
         }
@@ -2383,6 +3095,7 @@ class WhoopRepository(
                     restingHr = d.restingHr ?: c.restingHr,
                     avgHrv = d.avgHrv ?: c.avgHrv,
                     avgSdnn = d.avgSdnn ?: c.avgSdnn,
+                    skinTempC = d.skinTempC ?: c.skinTempC,
                     recovery = d.recovery ?: c.recovery,
                     strain = d.strain ?: c.strain,
                     exerciseCount = d.exerciseCount ?: c.exerciseCount,
@@ -2507,7 +3220,15 @@ class WhoopRepository(
          *  (ryanbr/noop#241): a sparse import (no stage data on ANY of its sessions that day) must NOT clobber
          *  a computed day that HAS stage data — otherwise a stage-less WHOOP/Apple/HC re-import blanks the
          *  stage breakdown for a night the strap fully staged. Days where the import carries stages, or where
-         *  neither side does, keep the imported-wins rule. Mirrors WhoopStore.SleepMerge (SleepMergeTests). */
+         *  neither side does, keep the imported-wins rule. Mirrors WhoopStore.SleepMerge (SleepMergeTests).
+         *
+         *  Richness is a RANK, not a yes/no ([richness]): 2 = stages covering the span they claim, 1 =
+         *  stages present but HOLED, 0 = none — and the computed day wins only when it OUT-RANKS the
+         *  import. Collapsing 1 and 0 gives back the original presence rule exactly, so this is a strict
+         *  generalisation: every case #241 decided it still decides the same way. What changes is the pair
+         *  the old rule could not express — a holed import (a device hypnogram assembled from records that
+         *  arrived incomplete: many segments, a fraction of the span) against a COMPLETE computed night,
+         *  which used to go to the import and now goes to the night that actually covers itself. */
         internal fun mergeSleepRichness(
             imported: List<SleepSession>,
             computed: List<SleepSession>,
@@ -2518,8 +3239,8 @@ class WhoopRepository(
             val out = ArrayList<SleepSession>(imported.size + computed.size)
             for ((day, imp) in importedByDay) {
                 val comp = computedByDay[day]
-                if (comp != null && imp.none { hasStages(it) } && comp.any { hasStages(it) }) {
-                    out.addAll(comp)   // richer computed day survives a stage-less import
+                if (comp != null && dayRichness(comp) > dayRichness(imp)) {
+                    out.addAll(comp)   // richer computed day survives a poorer import
                 } else {
                     out.addAll(imp)    // imported wins its day (unchanged rule)
                 }
@@ -2528,12 +3249,18 @@ class WhoopRepository(
             return out
         }
 
-        /** True when the session carries a non-empty stage payload; null, "", and "[]" carry none.
-         *  Twin of WhoopStore.SleepMerge.hasStages. */
-        private fun hasStages(s: SleepSession): Boolean {
-            val json = s.stagesJSON?.trim() ?: return false
-            return json.isNotEmpty() && json != "[]"
-        }
+        /** How much of a night this session's stages actually describe: 2 = covers its span, 1 = present
+         *  but HOLED, 0 = none. A timeline whose coverage cannot be measured (the imported minute-dict
+         *  shape, which has no timestamps) is never holed, so it ranks 2 — imports keep being judged on
+         *  presence exactly as they always were, and this gate cannot reach them.
+         *  Twin of WhoopStore.SleepMerge.richness. */
+        private fun richness(s: SleepSession): Int = SleepSessionUpsertPolicy.richness(s)
+
+        /** A day's richness is that of its BEST session — a day with a fully-staged main night plus an
+         *  unstaged nap is a staged day (#715 keeps every session of the winning day either way).
+         *  Twin of WhoopStore.SleepMerge.dayRichness. */
+        private fun dayRichness(sessions: List<SleepSession>): Int =
+            sessions.fold(0) { acc, s -> maxOf(acc, richness(s)) }
     }
 }
 

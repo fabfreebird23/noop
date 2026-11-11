@@ -22,6 +22,12 @@ public enum WhoopCommand: UInt8, CaseIterable {
     case reportVersionInfo     = 7
     case setClock              = 10
     case getClock              = 11
+    /// TOGGLE_GENERIC_HR_PROFILE (14) — opcode/name come from the canonical `CommandNumber` schema in
+    /// `Packages/WhoopProtocol/Sources/WhoopProtocol/Resources/whoop_protocol.json` and its WHOOP 4
+    /// matrix in `docs/PROTOCOL_COMMANDS.md`. Payload `[0x01]` enabled standard BLE Heart Rate
+    /// advertising and `[0x00]` disabled it on the WHOOP 4.0 tested for #2400. Safe and reversible,
+    /// driven only by the explicit Broadcast strap HR opt-in; the effect has no readable confirmation.
+    case toggleGenericHRProfile = 14
     /// ABORT_HISTORICAL_TRANSMITS (20) — ask the strap to stop streaming the offload it is part-way
     /// through. NON-DESTRUCTIVE, and specifically not a trim: the strap only frees banked records when
     /// NOOP acks a HISTORY_END, so anything unacked when the abort lands stays in flash and re-offloads
@@ -92,6 +98,11 @@ public enum WhoopCommand: UInt8, CaseIterable {
     /// payloads. If probing (#592): send THIS curated number first and capture the response — do NOT lead
     /// with the decompile's 87, an opcode unknown to this table (the curated-safe-subset rule).
     case getExtendedBatteryInfo = 98
+    /// The 5/MG battery pack's fuel gauge, read THROUGH the strap — the pack talks to the strap over its
+    /// own link, so there is no peripheral to connect to and nothing to scan for. `BatteryPackInfo` has
+    /// decoded this reply since the offsets were captured; until now nothing sent the command, so the
+    /// decoder had no caller. A 4.0 never answers it (its pack is voltage-only via 98).
+    case getBatteryPackInfo = 151
     /// #690: read-only body-location/status probe. Documented in the WHOOP protocol; driven only by the
     /// user-triggered, Test-Centre-gated probeBodyLocationAndStatus(). Decoded to a diagnostic report only.
     case getBodyLocationAndStatus = 84
@@ -210,6 +221,7 @@ public enum WhoopCommand: UInt8, CaseIterable {
         case .reportVersionInfo:     return "Report Version Info"
         case .setClock:              return "Set Clock"
         case .getClock:              return "Get Clock"
+        case .toggleGenericHRProfile:return "Toggle Generic HR Profile"
         case .abortHistoricalTransmits: return "Abort Historical Transmits"
         case .sendHistoricalData:    return "Send Historical Data"
         case .historicalDataResult:  return "Historical Data Result"
@@ -226,6 +238,7 @@ public enum WhoopCommand: UInt8, CaseIterable {
         case .enterHighFreqSync:     return "Enter High-Freq Sync"
         case .exitHighFreqSync:      return "Exit High-Freq Sync"
         case .getExtendedBatteryInfo:return "Get Extended Battery Info"
+        case .getBatteryPackInfo:    return "Get Battery Pack Info"
         case .getBodyLocationAndStatus:return "Get Body Location And Status"
         case .startFeatureFlagKeyExchange: return "Start Feature-Flag Key Exchange"
         case .sendNextFeatureFlag:   return "Send Next Feature Flag"

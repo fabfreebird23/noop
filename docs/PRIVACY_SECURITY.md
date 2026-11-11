@@ -14,7 +14,8 @@ be checked.
 > are approximations and are not clinically validated. Self-tracking features such
 > as the Mind / mood check-in and nutrition import are **informational only** and are
 > **not** a diagnosis, treatment, or dietary/medical advice. Use at your own risk;
-> your data stays on your device. See `DISCLAIMER.md`, `TERMS.md`, and
+> your data stays on your device unless you explicitly export it or enable an optional network path.
+> See `DISCLAIMER.md`, `TERMS.md`, and
 > `ATTRIBUTION.md` at the repo root.
 
 ---
@@ -26,82 +27,92 @@ local SQLite — has no network layer at all: no phone-home, no analytics, no ac
 no login, no cloud sync, and no telemetry. Everything NOOP computes about you lives in a
 single SQLite file on your own device.
 
-There are exactly **two** opt-in exceptions: the **AI Coach** (§1.1a) and the **Oura history
-import** (§1.1b). The AI Coach is off until you turn it on with your own API key; when you
-ask it a question it sends a short text summary of your recent metrics to the provider you
-choose. The Oura history import is **not even compiled into a default build** — the code
-only exists in your binary if you build from source with your own Oura developer app's
-credentials (§1.1b); instead of sending data out, it pulls your own Oura data **in** over
-OAuth, once, and never sends any of your existing NOOP data out. Nothing else in the app
-ever touches the network, and your raw biometric streams never leave the device through
-either exception.
+**Offline does not mean the app has no internet permission or never makes a request.**
+Strap collection and local analytics work without a network connection. The update check is
+**on by default**; optional features can send data to destinations you configure.
+[§1.1](#11-network-paths-canonical-inventory) is the canonical inventory of network paths,
+their defaults, triggers and payloads.
 
-Data enters NOOP three ways, and leaves it (other than the optional AI Coach) only when **you**
-deliberately export it to another store on the **same device**:
+The main local data paths are:
 
 | Path | Transport | Direction |
 |------|-----------|-----------|
 | Live collection | Bluetooth LE, strap → device | Read-only from the strap |
 | File import (Apple Health, WHOOP CSV, nutrition CSV) | User-selected files on disk | Read-only from disk |
-| Oura history import (opt-in build flag, §1.1b) | HTTPS OAuth + REST, `api.ouraring.com` → device | Read-only from your own Oura account |
 | Apple Health export, incl. iOS "Export for Shortcuts" | On-device, user-initiated | NOOP → your Apple Health, on your device only (§1.3) |
 
-The only **network** paths are the opt-in AI Coach and the compile-time-optional Oura
-history import; the
-biometric pipeline produces no network traffic of any kind. The Apple Health export above is
-an **on-device** hand-off, not a network upload — see §1.3.
+These local hand-offs do not upload data through NOOP's HTTP clients. What another app or
+the operating system does with shared data is governed by that service and your settings (§1.3).
 
-### 1.1 Network code: only the two optional exceptions
+<a id="11-network-code-the-four-exceptions"></a>
 
-The biometric pipeline and all five Swift packages
-(`WhoopProtocol`, `WhoopStore`, `StrandAnalytics`, `StrandImport`, `StrandDesign`)
-contain **no** use of `URLSession`, `URLRequest`, `NWConnection`, `dataTask`, or any
-other networking API — still true after the Oura history import (§1.1b) landed: its OAuth
-and REST calls live entirely in the app target, `Strand/Oura/`, and `StrandImport`
-gained only pure, network-free parsers for Oura's payload shapes. These Swift packages
-are **shared by the macOS and iOS apps** (iOS is build-from-source only — no App Store /
-TestFlight — and was folded into the main tree in v1.94), so the Swift-side privacy
-behaviour described here applies equally to both. Android is a separate codebase using
-Room for storage and Kotlin for the BLE / import / Coach paths; its own Oura support is
-the local BLE ring-pairing lane, not a network API, so it has no equivalent to §1.1b. The
-**only** networking anywhere in the app is the AI Coach (`Strand/AI/AICoach.swift` on the
-Swift side — macOS and iOS — `com.noop.ai.AiCoach` on Android), described in §1.1a, and
-the Oura history import (`Strand/Oura/`, Swift-only — macOS and iOS), described in §1.1b.
+### 1.1 Network paths (canonical inventory)
+
+The following table covers NOOP's direct HTTP clients. A path can make several requests;
+these are features, not a count of individual requests or destinations.
+
+| Path / platforms | Default and trigger | What is sent | Destination |
+| --- | --- | --- | --- |
+| AI Coach / macOS, iOS, Android (§1.1a) | Unconfigured initially; requests after provider setup for chat, model refresh or enabled briefs | Provider authentication when required; conversation text; health summaries only with data consent; optional chart attachment on Apple/Gemini | Chosen provider or Custom server |
+| Oura history import / opt-in macOS, iOS build (§1.1b) | Compiled out by default; user starts authorization/import | OAuth credentials, authorization/refresh tokens and history query parameters; no existing NOOP health data | `cloud.ouraring.com`, `api.ouraring.com` |
+| Update check / macOS, iOS, Android (§1.1c) | Automatic check **on by default**, at most daily after onboarding/Terms; manual check on tap | Public release `GET`; no health data or app-added user/account identifier | `api.github.com` |
+| Self-hosted push / Android (§1.1d) | Experimental, **off by default**; configured export after offload/launch or on tap; explicit connection test | Bearer authentication; capability `GET`; versioned health batches with local installation/device IDs on export | User-owned HTTP(S) endpoint |
+
+**Platform services are a separate boundary.** Apple's workout route view uses `MKMapView`
+(`Strand/Screens/WorkoutDetailView.swift`), which can load map data for the displayed region.
+The route overlay is built locally; that does not guarantee the map makes no network requests.
+Opening a web link hands it to a browser; Apple Health/Health Connect and sideloaders have their
+own network and sharing settings. This inventory does not promise those services are offline.
+
+For ordinary strap collection without NOOP's direct HTTP requests: turn off **Check automatically**
+in Settings → About, leave the AI Coach and self-hosted push unconfigured, use a default build
+without the Oura cloud import, and do not tap the manual update check. This does not disable
+platform-service traffic such as the route map.
+
+Networking clients live in the app targets: `Strand/AI/`, `Strand/Oura/`, `Strand/System/UpdateChecker.swift`,
+and Android's `ai/`, `update/` and `push/` packages. The biometric pipeline and Swift packages under
+`Packages/` do not make runtime network requests; shared parsers such as `SseDeltas` only process
+already-received text. Android's Oura support is local BLE, with no equivalent to the cloud import.
+
 The package manifests reference dependency *download* URLs that Swift Package Manager
 resolves at build time, never at runtime:
 
 ```
 Packages/WhoopStore/Package.swift   → https://github.com/groue/GRDB.swift.git
 Packages/StrandImport/Package.swift → https://github.com/weichsel/ZIPFoundation.git
+Packages/NoopLocalAccess/Package.swift → https://github.com/groue/GRDB.swift.git
 ```
 
 GRDB.swift is the SQLite layer; ZIPFoundation is the archive reader used by the
 importers. Neither opens a socket.
 
-### 1.1a The AI Coach (optional, off by default, bring your own key)
+<a id="11a-the-ai-coach-optional-off-by-default-bring-your-own-key"></a>
 
-The AI Coach lets you ask questions about your data in plain language. It is one of the
-two features that use the network (the other is the Oura history import, §1.1b), and only
-on your terms:
+### 1.1a The AI Coach (optional, provider setup required)
 
-- **Off until you enable it.** You enter your own API key for the provider you choose
-  (Anthropic, OpenAI, or a local / self-hosted OpenAI-compatible LLM such as Ollama or
-  LM Studio). No key, no network calls, ever.
-- **What is sent.** When you ask a question, NOOP builds a compact **text** summary of
-  your recent metrics (Charge, Effort, Rest, HRV, resting HR over ~14 days, plus
-  30-day averages and recent workouts) and sends it, with your question, directly to
-  your chosen endpoint (e.g. `api.anthropic.com` / `api.openai.com` for the hosted
-  providers). If you point the Coach at a local / self-hosted LLM, that endpoint is on
-  your own machine and the request never leaves it.
-- **What is NOT sent.** No raw biometric streams, no Bluetooth data, no account or
-  device identifiers — only the summary text and your question.
-- **Your key, your relationship.** The request goes from your device straight to the
-  provider you picked, under your own account. NOOP runs no server in between and keeps
-  no copy.
+The AI Coach sends requests directly to the provider you choose:
 
-If you never enable the AI Coach and never build the Oura import in (§1.1b), NOOP makes
-zero network connections — and in a default build, the Oura code isn't in the binary to
-begin with.
+- **Unconfigured until you set it up.** Hosted providers (Anthropic, OpenAI and Google Gemini)
+  require your API key. A Custom OpenAI-compatible server requires an explicit Connect action;
+  its key is optional. A server on the same machine receives requests locally; a LAN or remote
+  server receives them over that network. "Self-hosted" does not necessarily mean on-device.
+- **What triggers a request.** Sending a question, refreshing the provider's model list, or
+  connecting a Custom server (which fetches its models). With data consent, opening an empty
+  Coach conversation can generate a brief. A separately enabled morning brief can also request
+  one without a chat question. Saving a hosted-provider key alone does not fetch models.
+- **What is sent.** Chat requests include your question and conversation context. With the
+  separate, default-off data consent, they also include compact summaries of recent metrics
+  and workouts. Additional on-device-signal summaries require another opt-in. On Apple,
+  Gemini can also receive a rendered chart when its default-off multimodal option is enabled
+  and you attach one. Model-list requests send authentication where required, without health
+  summaries. Scheduled briefs require provider configuration and data consent.
+- **What is not automatically attached.** Raw biometric streams, BLE frames and local device
+  identifiers. Text you type and charts you attach can contain personal information.
+- **Your provider, your relationship.** NOOP operates no intermediary. Provider retention and
+  processing policies apply to what you send. The conversation is also stored locally in NOOP.
+
+Code: `Strand/AI/AICoach.swift`, `Strand/AI/AIProvider.swift`, `Strand/AI/Providers/`,
+`Strand/System/CoachBriefScheduler.swift`; Android `com.noop.ai` and `com.noop.ui.CoachViewModel`.
 
 ### 1.1b The Oura history import (compiled out by default, bring your own OAuth app)
 
@@ -144,6 +155,65 @@ API — a one-time, foreground backfill you trigger yourself, not an ongoing bac
 
 If you never build the lane in, your binary cannot call `ouraring.com` — the code is not there.
 
+### 1.1c The update check
+
+NOOP is sideloaded on every platform — there is no App Store or Play Store to update it — so an install
+that is never told about a release simply runs an old build indefinitely. Two paths address that, and
+both read the **same** public endpoint: `https://api.github.com/repos/ryanbr/noop/releases/latest`.
+
+- **"Check for updates"** in Settings → About. Runs only when tapped. It has always existed;
+  it was previously undocumented here, which is why this section is new rather than merely amended.
+- **"Check automatically"**, beside it. At most once a day, after onboarding and the
+  Terms gate, NOOP reads that endpoint and — if a newer release exists — puts a row in the Updates
+  inbox. **On by default**, and switchable off, at which point it makes no request at all.
+
+What is sent: an unauthenticated `GET` of a public URL, with normal HTTP headers but no app-added
+user/account identifier or biometric data. What comes back is a version number and the
+release notes. **It never installs anything** — on iOS no API permits that for a sideloaded app (see
+[docs/IOS.md](IOS.md)); the row tells you a release exists and where to get it.
+
+The request is a plain HTTPS call, so your IP address is visible to GitHub exactly as it would be if
+you opened the releases page in a browser. If that is not a trade you want, turn the toggle off; the
+manual button then remains the only way NOOP touches the network for this.
+
+Code: `Strand/System/UpdateChecker.swift` + `Strand/System/UpdateAvailability.swift` (Swift),
+`com.noop.update.UpdateCheck` + `com.noop.update.UpdateAvailability` (Android).
+
+### 1.1d Self-hosted push (Experimental, Android, off by default)
+
+Self-hosted push keeps a fresh one-way copy of selected rows on a machine the user controls. It is
+not a NOOP cloud, account, restore path, or two-way sync:
+
+- **Off until configured.** No endpoint means the worker does not send. The user supplies both the
+  HTTP(S) URL and bearer token; NOOP operates no intermediary or receiver.
+- **After offload, at launch, or explicitly now — always outside BLE sync.** Automatic work is queued
+  after a complete strap offload and at app launch to catch up; the user may also press **Export now**.
+  An unavailable or slow endpoint cannot delay BLE collection, local persistence, analytics, or UI.
+- **What is sent.** The finite, versioned stream registry in
+  [`PUSH_PROTOCOL.md`](PUSH_PROTOCOL.md) includes biometric rows and rolling snapshots of selected
+  recomputed/editable tables, scoped by a locally generated installation ID and local device ID.
+- **What comes back.** The receiver may advertise only a subset of NOOP's fixed v1 stream names, and
+  acknowledges submitted batches. NOOP never fetches health rows, remote changes, commands, URLs,
+  schemas, settings, or conflict decisions. The local database remains authoritative.
+- **Connection test.** The explicit **Test connection** action performs only the authenticated
+  capability `GET`; it does not open the health database or submit a batch, and uses the same
+  network policy as export work: Wi-Fi only by default, with an explicit option to allow mobile
+  and other connected networks.
+- **Useful diagnostics without leaking secrets.** The screen distinguishes DNS lookup, TLS
+  certificate/handshake, timeout, connection-refused, unreachable/reset connection, HTTP status,
+  capability/acknowledgement, local encoding, and local database failures. It stores and displays
+  only that stable category and (where applicable) the numeric HTTP status. Bearer tokens, response
+  bodies, health rows, endpoint-derived exception text, and stack traces are never placed in push
+  status. Retryable failures also say that backoff is scheduled; permanent failures identify the
+  configuration or receiver area to check.
+- **Credential transport.** The bearer token authenticates every capability `GET` and batch `POST`. Public cleartext endpoints
+  are rejected; HTTP is limited to numeric loopback/private/link-local/ULA addresses. Cleartext
+  hostnames are rejected, so DNS cannot move an allowed local URL to a public address. Even on an
+  allowed IP, HTTP exposes the token and batch contents locally, so HTTPS remains preferable.
+
+The repository ships the Android client and protocol document, not a server. The feature remains
+Experimental and default-off under the boundary in [`SCOPE.md`](SCOPE.md).
+
 ### 1.2 The macOS sandbox (and what it means for the AI Coach and the Oura import)
 
 On macOS the App Sandbox is the backstop. The app ships with a minimal entitlement set
@@ -170,10 +240,9 @@ That is the entire entitlement file. Four keys:
   signed/sandboxed build, where the sandbox otherwise refuses any socket the app tries
   to open (#128); the Oura history import (§1.1b) now relies on the same entitlement. The
   ad-hoc distributed build applies **no** entitlements at all (unsigned build + ad-hoc
-  re-sign), so this key only matters for a signed/sandboxed build. The entitlement only
-  permits the socket the sandbox would otherwise refuse — it doesn't make either feature
-  call out on its own; both stay off until you deliberately turn the Coach on or tap
-  Connect Oura.
+  re-sign), so this key only matters for a signed/sandboxed build. The update check (§1.1c)
+  also uses outbound network access. The entitlement permits connections; feature code
+  determines when they happen and what they carry.
 
 Notably **absent**:
 
@@ -182,10 +251,11 @@ Notably **absent**:
   the app cannot wander the disk; it sees only what the user hands it through the
   open panel, plus its own sandbox container.
 
-This is the structural guarantee behind "offline by design" on macOS: the sandbox
-permits exactly the two deliberate, opt-in exceptions above and nothing else — no
-undeclared entitlement could smuggle out a connection the user didn't ask for. The
-property is enforced by the OS, not merely by convention.
+The sandbox restricts filesystem and device access, but `network.client` is **not a
+destination allow-list** or proof that only the documented features can connect. As
+[Apple documents](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.network.client),
+it permits outgoing connections. The network boundaries in §1.1 rely on the source's feature
+gates and request construction, not on an OS restriction to particular servers.
 
 > **Note on Hardened Runtime.** `project.yml` currently sets
 > `ENABLE_HARDENED_RUNTIME: NO` for local development builds. Distributable /
@@ -365,7 +435,7 @@ truncated, oversized, or adversarial frames. The protocol core
 (`Packages/WhoopProtocol/`) is the reverse-engineering layer and is the first line of
 defense.
 
-**CRC-gated parsing.** Every frame is checked against its checksums before it is
+**Integrity-gated parsing.** Every frame is checked against its envelope before it is
 allowed to drive any application state. `Framing.swift` implements three checksums
 verbatim from the wire formats:
 
@@ -373,44 +443,72 @@ verbatim from the wire formats:
 - `crc32` (zlib/reflected) over the inner payload,
 - `crc16Modbus` for the WHOOP 5.0 header (ported from the `goose` work).
 
-`verifyFrame(_:)` (and the family-aware `verifyFrame(_:family:)`) only return
-`ok == true` when the header CRC **and** the payload CRC32 both validate:
+`verifyFrame(_:)` (and the family-aware `verifyFrame(_:family:)`) return
+`ok == true` only when the header CRC, the payload CRC32 **and** the configured size
+rules all hold. The size half matters as much as the checksums: a frame must be
+at least 11 bytes on WHOOP 4.0 and 13 on 5.0/MG, and must carry *exactly* the total its
+length field declares (`length + 4`, `declLength + 8`), so a truncated frame and one
+with trailing bytes past its own end are both rejected. If the payload CRC32 cannot be
+computed safely, the earlier size rule is the rejection reason; every frame reaching the
+payload-integrity decision has a CRC result. The outcome is one verdict plus one non-optional reason:
 
 ```swift
-let ok = crc8OK && (crc32OK ?? false)
+guard total >= FrameLimits.whoop4MinimumFrameBytes else { /* reject minimum */ }
+guard total == frame.count else { /* reject length; retain any safe CRC diagnostic */ }
+let crc32OK = crc32(frame, 4, length) == u32le(frame, length)
+let reason = integrityRejectReason(headerCRCOK: crc8OK, payloadCRCOK: crc32OK)
+return FrameCheck(ok: reason == .none, /* … */ reason: reason)
 ```
 
-The live BLE path then refuses anything that fails. In
+The live BLE path then refuses anything that fails, in a single condition. In
 `Strand/BLE/FrameRouter.swift`:
 
 ```swift
 let parsed = parseFrame(frame)
+// `ok` is the FULL verdict — never let bad bytes drive state.
 guard parsed.ok else { return }
-// Reject frames that failed their checksum — never let bad bytes drive state.
-if parsed.crcOK == false { return }
 ```
 
-The same gate guards clock correlation (`Strand/Collect/ClockCorrelation.swift`
-requires `parsed.ok, parsed.crcOK != false`), so a corrupt frame can neither update
-the displayed metrics nor poison the device-clock model.
+The same gate guards clock correlation (`Strand/Collect/ClockCorrelation.swift`),
+historical-metadata classification, live and historical stream extraction, and the
+data-range reply — so a corrupt frame can neither update the displayed metrics, nor
+poison the device-clock model, nor advance the strap's trim cursor. `parsed.rejectReason`
+carries the cause, so a rejection is counted and attributable rather than silent.
 
-**Bounds-checked decoding.** Field reads never index past the end of the buffer. The
-low-level readers in `Interpreter.swift` return `nil` instead of trapping when a read
-would run off the end of the frame:
+**What this does not claim.** A CRC is not a signature, so none of the above asserts
+**authenticity**: a peer that forms the envelope correctly is not excluded. Nor is the
+claim "every frame consumer" — six state-driving consumers require the full verdict.
+Evidence-preserving readers deliberately keep the opposite direction: a raw history
+frame that fails is *archived* rather than dropped, so the durable copy of a frame the
+strap is about to release survives.
+
+**Bounds-checked decoding.** Field reads never index past the end of the buffer, and
+never reach into the frame's own CRC32 trailer. The low-level readers in
+`Interpreter.swift` take an explicit `limit` and return `nil` instead of trapping:
 
 ```swift
-@inline(__always) private func readU16(_ f: [UInt8], _ off: Int) -> Int? {
-    off + 2 <= f.count ? Int(f[off]) | (Int(f[off + 1]) << 8) : nil
+@inline(__always) private func readU16(_ f: [UInt8], _ off: Int, _ limit: Int) -> Int? {
+    off >= 0 && off + 2 <= limit ? Int(f[off]) | (Int(f[off + 1]) << 8) : nil
 }
 ```
 
+The `limit` is the **minimum** of where the trailer starts and how many bytes the frame
+actually has. Both halves are load-bearing: the trailer start is derived from the
+*declared* length and points past the buffer on a truncated frame, while the buffer size
+alone would let a frame sitting at the family minimum have its own checksum trailer
+decoded as a sequence number, a command byte or a metadata type. The argument is
+required rather than defaulted, so adding a field read without deciding its bound does
+not compile. The one deliberate exception is the 8-byte history-end acknowledgement
+block echoed back to the strap verbatim, which reaches into the trailer by construction
+and is an opaque echo rather than a decoded field.
+
 Schema-driven field extraction skips any field whose offset is out of range
-(`guard let val = readDType(frame, fld.off, dtype) else { continue }`), and the
-`FieldBuilder` clamps every slice to the real buffer length
-(`let end = min(off + length, frame.count)`). The WHOOP 5.0 path adds explicit
-minimum-length and `payloadEnd <= frame.count` guards before slicing the payload or
-trailer. A short or lying length field therefore yields a partial parse, never an
-out-of-bounds read.
+(`guard let val = readDType(frame, fld.off, dtype, limit) else { continue }`), the same
+bound applies to the per-type post-hooks, and the `FieldBuilder` clamps every slice to
+the real buffer length (`let end = min(off + length, frame.count)`). The WHOOP 5.0 path
+adds explicit minimum-length and `payloadEnd <= frame.count` guards before slicing the
+payload or trailer. A short or lying length field therefore yields a partial parse,
+never an out-of-bounds read.
 
 **Sane-value gating at the application edge.** Even a CRC-valid frame is range-checked
 before it updates the UI/state. The realtime handler discards implausible heart rates
@@ -419,7 +517,10 @@ carries them — so a single bad-but-valid packet can't wipe good state.
 
 **Reassembly is bounded by the declared length.** The `Reassembler` resynchronizes on
 the `0xAA` start-of-frame byte, discards leading garbage, and only emits a frame once
-`length + 4` bytes are present — it does not unboundedly buffer arbitrary data.
+`length + 4` bytes are present — it does not unboundedly buffer arbitrary data. A
+declared total below the family minimum (11 bytes on WHOOP 4.0, 13 on 5.0/MG) or above
+the 8192-byte ceiling is not a frame at all: that start byte is dropped and the scan
+resyncs on the next one. Sub-minimum drops are counted rather than discarded silently.
 
 ### 3.2 Threat B: a malicious import file (zip bombs, XML bombs, huge exports)
 
@@ -503,10 +604,9 @@ dedicated source id `nutrition-csv`, alongside your other metrics and entirely o
   OAuth — NOOP never sees your Oura password, only the resulting tokens, kept in the
   Keychain.
 - **No telemetry / analytics / crash reporting.** No third-party SDKs of that kind.
-- **No cloud, no sync, no remote backup of NOOP's own data.** Your NOOP data never
-  leaves the machine via NOOP. The Oura history import (§1.1b) is the one path that
-  reaches a cloud service, and it is **inbound only** — it pulls your own Oura data in;
-  it does not sync or back up any NOOP data out.
+- **No NOOP cloud, account sync, or operated remote backup.** The Oura history import (§1.1b) is
+  **inbound only**. Android self-hosted push (§1.1d) is the sole standing outbound export: off by
+  default, one-way, and directed only to the endpoint the user configured and owns.
 - **No advertising identifiers, no tracking.**
 - **No WHOOP account or API credentials.** NOOP talks only to the strap over local
   BLE; it does not authenticate against, or pull from, any WHOOP server. (Oura is the
@@ -518,7 +618,7 @@ dedicated source id `nutrition-csv`, alongside your other metrics and entirely o
 
 | Surface | Risk | Mitigation | Where |
 |---------|------|------------|-------|
-| Process | Data exfiltration / network egress | Only two opt-in features network: the AI Coach (your key, to your chosen provider, a text summary — §1.1a) and the Oura history import (your own OAuth app, to `api.ouraring.com`, inbound-only — §1.1b). Nothing else makes a network call, and nothing is sent until you ask. Both work on Android/iOS where shipped (Android's Oura support is local-BLE only, no cloud lane); on macOS both cross the sandbox on the same `network.client` entitlement, present since #128 (§1.2) | `Strand/AI/AICoach.swift`, `Strand/Oura/`, `android/.../ai/AiCoach.kt` |
+| Process | Data exfiltration / network egress | Feature defaults, triggers, destinations and payloads are documented once in the [§1.1 inventory](#11-network-paths-canonical-inventory), including update checks and platform-service boundaries. No NOOP server, account or telemetry. Internet permission is not a destination allow-list. | App HTTP clients and source paths in §1.1 |
 | Oura history import | OAuth token / scope leakage, cross-account data mixing | Compiled out by default (`OURA_CLOUD_IMPORT`, §1.1b); tokens Keychain-only (`kSecAttrAccessibleAfterFirstUnlock`, never UserDefaults/plist); fixed OAuth scopes set at build time; raw + normalized rows partitioned under `deviceId = "oura-api"`; Oura's own scores kept reference-only (`ref_*`/`oura_*` metricSeries keys, never NOOP's Charge/Effort/Rest); `.cloudImport` is structurally priority-2 so it never seizes a WHOOP day; Forget Oura access purges tokens + every `oura-api` row incl. the raw archive | `Strand/Oura/OuraTokenStore.swift`, `Strand/Oura/OuraConnectModel.swift`, `Packages/WhoopStore/Sources/WhoopStore/OuraRawStore.swift` |
 | Filesystem | Broad disk access | Only `files.user-selected.read-write`; data stays in the sandbox container | `Strand.entitlements`, `Strand/Collect/StorePaths.swift` |
 | BLE frames | Malformed / adversarial packets | CRC8 + CRC32 (+ CRC16 for v5) gating; reject on failure | `WhoopProtocol/Framing.swift`, `Strand/BLE/FrameRouter.swift` |

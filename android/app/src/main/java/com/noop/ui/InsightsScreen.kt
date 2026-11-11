@@ -60,14 +60,17 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import com.noop.analytics.BehaviorEffect
+import com.noop.analytics.EffectRanker
 
 // MARK: - Insights
 //
 // The "interrogate what affects what" screen, ported from the macOS InsightsView.
 // Two halves:
 //
-//  1. BEHAVIOUR EFFECTS, split logged journal answers (the days each behaviour WAS
-//     logged "yes" vs NOT) and compare a chosen outcome metric (Charge / HRV /
+//  1. BEHAVIOUR EFFECTS, split logged journal answers (the days each behaviour was
+//     logged "yes" vs the days it was logged "no" — a day it was not logged at all
+//     is in neither group) and compare a chosen outcome metric (Charge / HRV /
 //     Rest / RHR) between the two groups. Ranked by effect size (Cohen's d), with
 //     significant effects first. Each card carries a plain-English sentence, the
 //     with/without means, group counts, a significance pill, and the magnitude word.
@@ -119,23 +122,7 @@ private enum class Outcome(
     ),
 }
 
-// MARK: - Computed shapes (plain data, no analytics package dependency)
-
-/** One behaviour's effect on the selected outcome: with/without means, counts,
- *  Cohen's d and a crude significance flag. */
-private data class BehaviorEffect(
-    val behavior: String,
-    val meanWith: Double,
-    val meanWithout: Double,
-    val nWith: Int,
-    val nWithout: Int,
-    val cohensD: Double,
-) {
-    val delta: Double get() = meanWith - meanWithout
-    /** Crude significance: a non-trivial effect with enough days on both sides.
-     *  Honest stand-in for a t-test, |d| ≥ 0.5 ("moderate") with ≥3 days each side. */
-    val significant: Boolean get() = abs(cohensD) >= 0.5 && nWith >= 3 && nWithout >= 3
-}
+// MARK: - Computed shapes (plain data; behaviour effects come from the analytics package)
 
 /** A curated metric relationship plus its computed Pearson correlation. */
 private data class Relationship(
@@ -153,6 +140,9 @@ private data class Relationship(
 private data class InsightModel(
     /** behaviour question → set of days it was answered "yes". */
     val behaviours: Map<String, Set<String>>,
+    /** Per behaviour, the days it was logged NO — the only legitimate control group. A day with no
+     *  journal row for the question is in neither map and takes part in no comparison. */
+    val controls: Map<String, Set<String>>,
     /** day → value, per outcome. */
     val outcomeByDay: Map<Outcome, Map<String, Double>>,
     /** ordered (day, value) per outcome for correlations. */
@@ -184,6 +174,7 @@ fun InsightsScreen(vm: AppViewModel, onOpenInsightsHub: () -> Unit = {}) {
     // rows (native wins per (day, question)). Keyed on journalSeq so the logging card's saves and
     // clears refresh the effects immediately; re-loaded too when the cached days change underneath.
     var behaviours by remember { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
+    var controls by remember { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
     // #322: numeric journal item (question) -> [day: value]. A numeric journal series is a daily series
     // the effect ranker consumes exactly like a metric series (EffectRanker.effect already takes a
     // Map<String, Double> outcome), so "caffeine mg" / "alcohol units" can rank as a numeric outcome.
@@ -233,15 +224,18 @@ fun InsightsScreen(vm: AppViewModel, onOpenInsightsHub: () -> Unit = {}) {
         val native = vm.repo.journal(JOURNAL_DEVICE_ID, "0000-01-01", "9999-12-31")
         val entries = mergeJournalEntries(imported, native)
         val byBehaviour = mutableMapOf<String, MutableSet<String>>()
+        val controlsByBehaviour = mutableMapOf<String, MutableSet<String>>()
         // #322: a numeric log writes answeredYes=true too, so a numeric item lands in the with/without
         // split here unchanged; its per-day value is captured separately for a numeric series the effect
         // ranker can consume like any metric outcome (dose-response lands in the v5 hub). Additive.
         val numericByBehaviour = mutableMapOf<String, MutableMap<String, Double>>()
         for (e in entries) {
-            if (e.answeredYes) byBehaviour.getOrPut(e.question) { mutableSetOf() }.add(e.day)
+            val bucket = if (e.answeredYes) byBehaviour else controlsByBehaviour
+            bucket.getOrPut(e.question) { mutableSetOf() }.add(e.day)
             e.numericValue?.let { v -> numericByBehaviour.getOrPut(e.question) { mutableMapOf() }[e.day] = v }
         }
         behaviours = byBehaviour.mapValues { it.value.toSet() }
+        controls = controlsByBehaviour.mapValues { it.value.toSet() }
         numericJournalSeries = numericByBehaviour.mapValues { it.value.toMap() }
         importedQuestions = imported.map { it.question }.distinct()
         val key = journalDayKey(dayOffset)
@@ -290,7 +284,9 @@ fun InsightsScreen(vm: AppViewModel, onOpenInsightsHub: () -> Unit = {}) {
 
     // Build outcome day-maps + ordered series off the cached daily metrics. Cheap and
     // recomputed only when `days` changes (not on every recomposition).
-    val model = remember(days, behaviours, numericJournalSeries) { buildModel(days, behaviours, numericJournalSeries) }
+    val model = remember(days, behaviours, controls, numericJournalSeries) {
+        buildModel(days, behaviours, controls, numericJournalSeries)
+    }
 
     // Ranked behaviour effects for the current outcome (recomputed when outcome/data change).
     val ranked = remember(model, outcome) { rankEffects(model, outcome) }
@@ -760,9 +756,7 @@ private fun BehaviourSection(
         if (ranked.isEmpty()) {
             NoopCard {
                 Text(
-                    uiString(R.string.l10n_insights_screen_not_enough_overlap_between_your_journal_0ebdd7a2) +
-                        "${outcome.outcomeName.lowercase(Locale.US)} to measure an effect yet. " +
-                        "Keep logging. Effects need days both with and without each behaviour.",
+                    uiString(R.string.l10n_insights_screen_not_enough_overlap_between_your_journal_0ebdd7a2, outcome.outcomeName.lowercase(Locale.US)),
                     style = NoopType.subhead,
                     color = Palette.textTertiary,
                 )
@@ -990,9 +984,7 @@ private fun ExperimentSetupCard(
                 Text(uiString(R.string.l10n_insights_screen_run_a_clean_personal_test_4da69781), style = NoopType.headline, color = Palette.textPrimary)
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    uiString(R.string.l10n_insights_screen_pick_one_behaviour_you_log_one_bd34090e) +
-                        "compares the days you log the behaviour against your behaviour-free " +
-                        "days before the start.",
+                    uiString(R.string.l10n_insights_screen_pick_one_behaviour_you_log_one_bd34090e),
                     style = NoopType.subhead,
                     color = Palette.textSecondary,
                 )
@@ -1289,9 +1281,8 @@ private fun ExperimentBehaviourPicker(
 /**
  * Behaviours the user actually has data for: distinct logged journal questions
  * (`behaviours.keys`) ∪ imported-export questions, minus the catalog's hidden set.
- * Triage fix (a)/(b): we do NOT route this through `mergeJournalCatalog`, which would
- * inject the whole starter catalog (and re-surface hidden behaviours), so only
- * behaviours with real history are eligible, and the empty-state guard is real.
+ * The full catalog resolver includes starter questions without history. Experiment eligibility
+ * instead includes only behaviours with history and excludes hidden questions.
  */
 private fun experimentCandidates(
     behaviours: Map<String, Set<String>>,
@@ -1584,6 +1575,7 @@ private fun RBar(r: Double, color: Color) {
 private fun buildModel(
     days: List<DailyMetric>,
     behaviours: Map<String, Set<String>>,
+    controls: Map<String, Set<String>>,
     numericJournalSeries: Map<String, Map<String, Double>> = emptyMap(),
 ): InsightModel {
     val outcomeByDay = mutableMapOf<Outcome, Map<String, Double>>()
@@ -1594,35 +1586,19 @@ private fun buildModel(
         seriesByOutcome[o] = series
         outcomeByDay[o] = series.toMap()
     }
-    return InsightModel(behaviours, outcomeByDay, seriesByOutcome, numericJournalSeries)
+    return InsightModel(behaviours, controls, outcomeByDay, seriesByOutcome, numericJournalSeries)
 }
 
 /** Rank behaviour effects for one outcome by |Cohen's d|, significant first. */
 private fun rankEffects(model: InsightModel, outcome: Outcome): List<BehaviorEffect> {
     val outcomeDays = model.outcomeByDay[outcome] ?: emptyMap()
     if (outcomeDays.isEmpty()) return emptyList()
-
-    val effects = model.behaviours.mapNotNull { (behaviour, yesDays) ->
-        val with = mutableListOf<Double>()
-        val without = mutableListOf<Double>()
-        for ((day, value) in outcomeDays) {
-            if (day in yesDays) with.add(value) else without.add(value)
-        }
-        // Need both groups to compare; require ≥2 each so a mean/SD is meaningful.
-        if (with.size < 2 || without.size < 2) return@mapNotNull null
-        BehaviorEffect(
-            behavior = behaviour,
-            meanWith = with.average(),
-            meanWithout = without.average(),
-            nWith = with.size,
-            nWithout = without.size,
-            cohensD = cohensD(with, without),
-        )
-    }
-    return effects.sortedWith(
-        compareByDescending<BehaviorEffect> { it.significant }
-            .thenByDescending { abs(it.cohensD) },
-    )
+    // Through the shared engine, not a local copy. This screen used to carry its own with/without split,
+    // its own pooled-SD Cohen's d and a "crude significance" (|d| >= 0.5 with >= 3 a side) where iOS's
+    // same screen ran a Welch p — so identical journals could flag different behaviours on the two
+    // platforms. EffectRanker.rankNoLag is the byte-identical twin of Swift's BehaviorInsights.rank,
+    // which is what iOS calls here.
+    return EffectRanker.rankNoLag(model.behaviours, model.controls, outcomeDays, outcome.outcomeName)
 }
 
 /** The curated metric relationships, computed via Pearson r over aligned day pairs. */
@@ -1667,25 +1643,6 @@ private fun computeRelationships(model: InsightModel): List<Relationship> {
 }
 
 // MARK: - Statistics (pooled-SD Cohen's d, Pearson r)
-
-/** Cohen's d using pooled standard deviation. 0 when either side lacks spread. */
-private fun cohensD(a: List<Double>, b: List<Double>): Double {
-    if (a.size < 2 || b.size < 2) return 0.0
-    val ma = a.average()
-    val mb = b.average()
-    val va = variance(a, ma)
-    val vb = variance(b, mb)
-    val pooled = sqrt(((a.size - 1) * va + (b.size - 1) * vb) / (a.size + b.size - 2).toDouble())
-    if (pooled <= 0.0 || !pooled.isFinite()) return 0.0
-    return (ma - mb) / pooled
-}
-
-/** Sample variance (n-1 denominator) about a known mean. */
-private fun variance(xs: List<Double>, mean: Double): Double {
-    if (xs.size < 2) return 0.0
-    val ss = xs.sumOf { val d = it - mean; d * d }
-    return ss / (xs.size - 1).toDouble()
-}
 
 /** Pearson r over two (day,value) series aligned on shared days. Returns (r, n) or
  *  null if fewer than 3 overlapping pairs or no variance. */

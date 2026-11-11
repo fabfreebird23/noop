@@ -659,11 +659,13 @@ private fun BondedStep(viewModel: AppViewModel) {
 private fun ProfileStep() {
     val context = LocalContext.current
     val profile = remember { ProfileStore.from(context.applicationContext) }
-    // Imperial/Metric display preference (D#103). The stored profile is always SI; the steppers keep
-    // operating in SI and only the DISPLAYED value re-labels to lb / ft-in. Held in remembered state
-    // (#781) so the Units control below can flip it live. SharedPreferences isn't reactive, so the
-    // picker writes through to NoopPrefs AND updates this state to re-render the Weight/Height labels.
+    // The stored profile is always SI. Body measurements and exercise distance can follow regional
+    // conventions independently; an unset distance choice follows the body choice for compatibility.
     var unitSystem by remember { mutableStateOf(UnitPrefs.system(context)) }
+    var distanceSystemRaw by remember {
+        mutableStateOf(NoopPrefs.of(context).getString(NoopPrefs.KEY_DISTANCE_UNIT_SYSTEM, "") ?: "")
+    }
+    val distanceUnitSystem = UnitPrefs.resolveDistance(unitSystem, distanceSystemRaw)
     var rev by remember { mutableIntStateOf(0) }
     fun mutate(block: () -> Unit) {
         block()
@@ -712,12 +714,10 @@ private fun ProfileStep() {
                     )
                 }
                 ThinDivider()
-                // Units control (#781). Onboarding read `unitSystem` for the Weight/Height display but
-                // had no way to set it, so US users were locked to kg/cm until they found Settings →
-                // Units. Mirror the Sex picker idiom; the stored profile stays SI either way, only the
-                // displayed labels re-format (lb / ft-in). Same key Settings → Units writes.
+                // Keep the two choices explicit: "Metric/Imperial" alone cannot describe common mixed
+                // conventions such as Canadian pounds with kilometres.
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Overline(uiString(R.string.onboarding_units), color = Palette.textTertiary)
+                    Overline(uiString(R.string.units_body_measurements), color = Palette.textTertiary)
                     SegmentedPillControl(
                         items = listOf(UnitSystem.METRIC, UnitSystem.IMPERIAL),
                         selection = unitSystem,
@@ -725,6 +725,23 @@ private fun ProfileStep() {
                         onSelect = {
                             unitSystem = it
                             NoopPrefs.setUnitSystem(context, it)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                ThinDivider()
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Overline(uiString(R.string.units_exercise_distance_pace), color = Palette.textTertiary)
+                    SegmentedPillControl(
+                        items = listOf(UnitSystem.METRIC, UnitSystem.IMPERIAL),
+                        selection = distanceUnitSystem,
+                        label = {
+                            if (it == UnitSystem.METRIC) uiString(R.string.units_kilometres)
+                            else uiString(R.string.units_miles)
+                        },
+                        onSelect = {
+                            distanceSystemRaw = it.raw
+                            NoopPrefs.setDistanceUnitSystem(context, it)
                         },
                         modifier = Modifier.fillMaxWidth(),
                     )
@@ -778,6 +795,9 @@ private fun ImportStep(viewModel: AppViewModel) {
     // so a persisted busy=true would strand the buttons disabled with nothing running.
     var busy by remember { mutableStateOf(false) }
     var status by rememberSaveable { mutableStateOf<String?>(null) }
+    var hcReadCategories by remember {
+        mutableStateOf(HealthConnectImporter.selectedCategories(context))
+    }
     val importingText = uiString(R.string.onboarding_importing)
     val importLabel = uiString(R.string.onboarding_import_label)
     val importFailed = uiString(R.string.onboarding_failed)
@@ -810,7 +830,8 @@ private fun ImportStep(viewModel: AppViewModel) {
     val hcPermissionLauncher = rememberLauncherForActivityResult(
         PermissionController.createRequestPermissionResultContract(),
     ) { granted ->
-        if (granted.any { it in HealthConnectImporter.PERMISSIONS }) {
+        val selectedPermissions = HealthConnectImporter.permissionsFor(hcReadCategories)
+        if (granted.any { it in selectedPermissions }) {
             runImport { HealthConnectImporter.import(context, viewModel.repo, ProfileStore.from(context).heightCm) }
         } else {
             val message = healthConnectDenied
@@ -828,15 +849,21 @@ private fun ImportStep(viewModel: AppViewModel) {
             val granted = runCatching {
                 HealthConnectImporter.client(context).permissionController.getGrantedPermissions()
             }.getOrDefault(emptySet())
-            if (granted.any { it in HealthConnectImporter.PERMISSIONS } &&
-                !HealthConnectImporter.hasUnaskedPermissions(context)
+            // #645: a user who predates the selector has nothing stored. Recover their real scope from
+            // what Android already grants BEFORE the checkboxes are read back, or a first visit would
+            // show Recovery-only and saving it would lock in the narrowing.
+            HealthConnectImporter.migrateSelectionFromGrants(context, granted)
+            hcReadCategories = HealthConnectImporter.selectedCategories(context)
+            val selectedPermissions = HealthConnectImporter.permissionsFor(hcReadCategories)
+            if (granted.any { it in selectedPermissions } &&
+                !HealthConnectImporter.hasUnaskedPermissions(context, hcReadCategories)
             ) {
                 runImport { HealthConnectImporter.import(context, viewModel.repo, ProfileStore.from(context).heightCm) }
             } else {
                 // Marked before launching so the request is made ONCE per permission set: a user who
                 // declines is not asked again on every visit (#949).
-                HealthConnectImporter.markPermissionsAsked(context)
-                hcPermissionLauncher.launch(HealthConnectImporter.PERMISSIONS)
+                HealthConnectImporter.markPermissionsAsked(context, hcReadCategories)
+                hcPermissionLauncher.launch(selectedPermissions)
             }
         }
     }
@@ -870,6 +897,15 @@ private fun ImportStep(viewModel: AppViewModel) {
                         icon = Icons.Filled.MonitorHeart,
                         enabled = !busy && healthConnectAvailable,
                     ) { startHealthConnect() }
+                    if (healthConnectAvailable) {
+                        HealthConnectCategorySelector(
+                            selected = hcReadCategories,
+                            onSelectionChange = { categories ->
+                                hcReadCategories = categories
+                                HealthConnectImporter.setSelectedCategories(context, categories)
+                            },
+                        )
+                    }
                     OnboardingActionButton(
                         label = uiString(R.string.l10n_onboarding_screen_import_apple_health_export_077b5624),
                         icon = Icons.Filled.FavoriteBorder,

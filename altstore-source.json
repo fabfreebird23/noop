@@ -20,6 +20,78 @@
       "screenshotURLs": [],
       "versions": [
         {
+          "version": "12.0.0",
+          "buildVersion": "435",
+          "date": "2026-10-04",
+          "localizedDescription": "NOOP 12.0.0. See the release notes for what changed.",
+          "downloadURL": "https://github.com/ryanbr/noop/releases/download/v12.0.0/NOOP-ios-unsigned-v12.0.0.ipa",
+          "size": 21936724,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "11.8.0",
+          "buildVersion": "400",
+          "date": "2026-09-17",
+          "localizedDescription": "NOOP 11.8.0. See the release notes for what changed.",
+          "downloadURL": "https://github.com/ryanbr/noop/releases/download/v11.8.0/NOOP-ios-unsigned-v11.8.0.ipa",
+          "size": 21442326,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "11.7.0",
+          "buildVersion": "387",
+          "date": "2026-09-14",
+          "localizedDescription": "NOOP 11.7.0. See the release notes for what changed.",
+          "downloadURL": "https://github.com/ryanbr/noop/releases/download/v11.7.0/NOOP-ios-unsigned-v11.7.0.ipa",
+          "size": 20280838,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "11.6.0",
+          "buildVersion": "371",
+          "date": "2026-09-11",
+          "localizedDescription": "NOOP 11.6.0. See the release notes for what changed.",
+          "downloadURL": "https://github.com/ryanbr/noop/releases/download/v11.6.0/NOOP-ios-unsigned-v11.6.0.ipa",
+          "size": 20179424,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "11.5.0",
+          "buildVersion": "356",
+          "date": "2026-09-09",
+          "localizedDescription": "NOOP 11.5.0. See the release notes for what changed.",
+          "downloadURL": "https://github.com/ryanbr/noop/releases/download/v11.5.0/NOOP-ios-unsigned-v11.5.0.ipa",
+          "size": 19998667,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "11.1.0",
+          "buildVersion": "299",
+          "date": "2026-09-02",
+          "localizedDescription": "NOOP 11.1.0. See the release notes for what changed.",
+          "downloadURL": "https://github.com/ryanbr/noop/releases/download/v11.1.0/NOOP-ios-unsigned-v11.1.0.ipa",
+          "size": 19387496,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "11.0.0",
+          "buildVersion": "292",
+          "date": "2026-09-01",
+          "localizedDescription": "NOOP 11.0.0. See the release notes for what changed.",
+          "downloadURL": "https://github.com/ryanbr/noop/releases/download/v11.0.0/NOOP-ios-unsigned-v11.0.0.ipa",
+          "size": 19362325,
+          "minOSVersion": "17.0"
+        },
+        {
+          "version": "10.6.0",
+          "buildVersion": "241",
+          "date": "2026-08-25",
+          "localizedDescription": "NOOP 10.6.0. See the release notes for what changed.",
+          "downloadURL": "https://github.com/ryanbr/noop/releases/download/v10.6.0/NOOP-ios-unsigned-v10.6.0.ipa",
+          "size": 19019520,
+          "minOSVersion": "17.0"
+        },
+        {
           "version": "10.5.0",
           "buildVersion": "230",
           "date": "2026-08-20",
@@ -1384,12 +1456,12 @@
           "NSMotionUsageDescription": "NOOP reads your iPhone's step count for a walking or running workout to show steps in the activity summary. It stays on your device. Nothing leaves it."
         }
       },
-      "version": "10.5.0",
-      "buildVersion": "230",
-      "versionDate": "2026-08-20",
-      "versionDescription": "NOOP 10.5.0. See the release notes for what changed.",
-      "downloadURL": "https://github.com/ryanbr/noop/releases/download/v10.5.0/NOOP-ios-unsigned-v10.5.0.ipa",
-      "size": 18867317,
+      "version": "12.0.0",
+      "buildVersion": "435",
+      "versionDate": "2026-10-04",
+      "versionDescription": "NOOP 12.0.0. See the release notes for what changed.",
+      "downloadURL": "https://github.com/ryanbr/noop/releases/download/v12.0.0/NOOP-ios-unsigned-v12.0.0.ipa",
+      "size": 21936724,
       "minOSVersion": "17.0"
     }
   ],

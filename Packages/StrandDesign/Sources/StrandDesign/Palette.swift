@@ -31,23 +31,42 @@ public extension Color {
     /// at every one of its call sites when the colour scheme flips — no per-view environment plumbing.
     /// This is the whole light-theme strategy: only the token definitions change, never the call sites.
     init(light: String, dark: String) {
+        // #2393: parse BOTH hexes ONCE, here, and let the provider pick between two ready tuples.
+        //
+        // The provider closure is not called once per token — it is called once per RESOLUTION, and the
+        // liquid layer resolves on every frame: `Color.liquidComponents()` asks for
+        // `NSColor(self).usingColorSpace(.sRGB)` (`LiquidCore.swift`), which re-invokes this closure,
+        // which used to run `trimmingCharacters` + `Scanner.scanHexInt64` over a string. A reporter
+        // profiling NOOP at a third to half a CPU core on macOS found `Color.sRGBComponents(hex:)` and
+        // `closure #1 in Color.init(light:dark:)` among the hot leaves (#2393).
+        //
+        // A cache would also have removed the cost, and a cache is the wrong shape for it: it needs a
+        // key, a lock (a dynamic provider can resolve off the main thread) and an eviction story, to
+        // re-derive per frame a value that cannot change after this line. The tokens are `static let`
+        // (`NoopVisualStyle`, `StrandPalette`), so this runs once per token for the life of the process.
+        // One declaration rather than two `let`s: watchOS resolves straight to the dark hex, so a separate
+        // `lightComponents` would be unused on that platform and warn. A pair that is always read as a
+        // whole has no such half.
+        let components = (light: Color.sRGBComponents(hex: light), dark: Color.sRGBComponents(hex: dark))
         #if os(watchOS)
         // watchOS has no UITraitCollection / dynamic-provider UIColor, and our watch app is effectively
         // always dark, so a token resolves straight to its dark hex. No per-scheme plumbing on the wrist.
-        self.init(hex: dark)
+        self.init(.sRGB, red: components.dark.r, green: components.dark.g,
+                  blue: components.dark.b, opacity: components.dark.a)
         #elseif canImport(UIKit)
         self.init(UIColor { trait in
-            let c = Color.sRGBComponents(hex: trait.userInterfaceStyle == .dark ? dark : light)
+            let c = trait.userInterfaceStyle == .dark ? components.dark : components.light
             return UIColor(red: CGFloat(c.r), green: CGFloat(c.g), blue: CGFloat(c.b), alpha: CGFloat(c.a))
         })
         #elseif canImport(AppKit)
         self.init(nsColor: NSColor(name: nil) { appearance in
             let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            let c = Color.sRGBComponents(hex: isDark ? dark : light)
+            let c = isDark ? components.dark : components.light
             return NSColor(srgbRed: CGFloat(c.r), green: CGFloat(c.g), blue: CGFloat(c.b), alpha: CGFloat(c.a))
         })
         #else
-        self.init(hex: dark)
+        self.init(.sRGB, red: components.dark.r, green: components.dark.g,
+                  blue: components.dark.b, opacity: components.dark.a)
         #endif
     }
 }
@@ -276,6 +295,16 @@ public enum StrandPalette {
     public static var restDeep: Color      { isClassic ? Color(light: "#203E73", dark: "#2A4C8F") : Color(light: "#234F9E", dark: "#2F6FCB") }
     public static var restBright: Color    { isClassic ? Color(light: "#6A4FC0", dark: "#8E6FD6") : Color(light: "#5790DA", dark: "#6FA8E8") }
     public static var restGlow: Color      { isClassic ? Color(light: "#3A80D6", dark: "#6FA8E8") : Color(light: "#3A80D6", dark: "#4A90E2") }
+    /// The Rest family's most legible LINE colour — for strokes that must read on a busy or translucent
+    /// surface, such as the body-clock dial's arcs over a custom background image.
+    ///
+    /// Introduces no new value: it selects the existing token that is the bright blue in each palette.
+    /// The families are not parallel — classic's `restBright` is a PURPLE accent while modern's is the
+    /// blue, and classic's `restColor` is the blue where modern's is a muted steel — so a card naming
+    /// either token directly gets the right colour in one palette and the wrong one in the other. Both
+    /// resolve to #6FA8E8 in dark.
+    public static var restLine: Color { isClassic ? restColor : restBright }
+
     public static var restGradient: Gradient { Gradient(colors: [restDeep, restBright]) }
 
     /// Stress — blue→gold→orange world / Classic green→amber→red.

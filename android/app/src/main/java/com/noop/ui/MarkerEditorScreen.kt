@@ -43,7 +43,7 @@ import com.noop.analytics.LabMarkerCategory
 import com.noop.analytics.MarkerCatalog
 import com.noop.analytics.MarkerDefinition
 import com.noop.data.LabMarkerRow
-import java.text.Normalizer
+import com.noop.ingest.LabMarkerCsvImport
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -259,8 +259,7 @@ fun MarkerEditorScreen(
             }
 
             Text(
-                uiString(R.string.l10n_marker_editor_screen_lab_book_keeps_your_own_numbers_9085ce2c) +
-                    "advice. Everything stays on this phone.",
+                uiString(R.string.l10n_marker_editor_screen_lab_book_keeps_your_own_numbers_9085ce2c),
                 style = NoopType.footnote,
                 color = Palette.textTertiary,
             )
@@ -436,13 +435,11 @@ object MarkerUnits {
     fun toCanonical(markerKey: String, value: Double, from: String): Double =
         factorToCanonical(markerKey, from)?.let { value * it } ?: value
 
-    /** A lower-cased, underscored slug for a custom marker name → its stable key. */
-    fun slug(name: String): String {
-        val lowered = Normalizer.normalize(name, Normalizer.Form.NFC).trim().lowercase()
-        val mapped = lowered.map { if (it.isLetterOrDigit()) it else '_' }.joinToString("")
-        val collapsed = mapped.replace("__", "_").trim('_')
-        return "custom_$collapsed"
-    }
+    /**
+     * A lower-cased, underscored slug for a custom marker name → its stable key. Delegates to the CSV
+     * importer's `customKey` so a hand-added custom marker and an imported one always share one key.
+     */
+    fun slug(name: String): String = LabMarkerCsvImport.customKey(name).ifEmpty { "custom_" }
 }
 
 /** "yyyy-MM-dd" LOCAL day key for the reading's takenAt millis (the projection key). */

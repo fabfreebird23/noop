@@ -41,14 +41,14 @@ The package contains more analytics than the app currently surfaces. This sectio
 | `StrainScorer` | `StrainScorer.swift` | **Live.** Computes the **Effort** score (0–100). Day load is computed on-device for nights the strap offloaded; the imported `day_strain` column still wins for imported days. APPROXIMATE. |
 | `SleepStager` | `SleepStager.swift` | **Live.** Stages each offloaded night inside `analyzeDay`; the per-night stages feed the **Rest** composite. Computed sessions are persisted under the `"-noop"` source, with imported sleeps taking precedence. APPROXIMATE. |
 | `Baselines` | `Baselines.swift` | **Live.** Seeds the recovery baseline in `IntelligenceEngine.analyzeRecent` (two-pass cold-start). The illness early-warning in `AppModel` still uses its own trailing-window baseline math inline (see below). |
-| `WorkoutDetector` / `Calories` | `WorkoutDetector.swift` | **Live.** Runs inside `AnalyticsEngine.analyzeDay`; detected bouts are persisted as `workout` rows under the computed `"<deviceId>-noop"` source (sport `"detected"`), de-duplicated against imported WHOOP workouts. All intensity/calorie fields are APPROXIMATE. Not yet surfaced in the Workouts screen. |
-| `AnalyticsEngine` | `AnalyticsEngine.swift` | **Live orchestrator.** `analyzeDay(...)` is called by `Strand/Data/IntelligenceEngine.swift` — every 15 minutes while connected, and from the Intelligence screen — and its `DailyMetric`, sleep sessions and detected workouts are persisted under the `"-noop"` source. |
+| `WorkoutDetector` / `Calories` | `WorkoutDetector.swift` | **Live analytics helper.** Runs inside `AnalyticsEngine.analyzeDay`; its bouts contribute diagnostics and may fill missing metrics on an overlapping manual/imported workout. It no longer creates or reconciles generic `sport="detected"` rows. All intensity/calorie fields are APPROXIMATE. |
+| `AnalyticsEngine` | `AnalyticsEngine.swift` | **Live orchestrator.** `analyzeDay(...)` is called by `Strand/Data/IntelligenceEngine.swift` — every 15 minutes while connected, and from the Intelligence screen. `DailyMetric` and sleep-session results are persisted under the `"-noop"` source; workout output is limited to non-destructive enrichment of already logged sessions. |
 | `HRZones` | `HRZones.swift` | **Library-only** (display zone model). The app's live zone coaching computes `%HRmax` inline in `AppModel.coachZone(_:)`. |
 | `CorrelationEngine` | `CorrelationEngine.swift` | **Live.** Used by `InsightsView`, `CompareView`, `MetricExplorerView`. |
 | `BehaviorInsights` | `BehaviorInsights.swift` | **Live.** Used by `InsightsView` (`rank` + `sentence`). |
 | `ComparisonEngine` | `ComparisonEngine.swift` | **Live.** Used by `MetricExplorerView`. |
 
-**In short:** the *interactive data-interrogation* engines (correlation, behavior effects, period comparison) are wired into screens, and the *recompute-from-raw-streams* engines that produce the three daily scores — Charge (recovery), Effort (strain), Rest (sleep), plus workout detection — run live too: `IntelligenceEngine` calls `analyzeDay` for every night the strap offloaded and persists the APPROXIMATE results under the `"-noop"` source, merged under any imported rows — a WHOOP export still wins wherever it covers a day. The live BLE app additionally runs four small inline analytics in `AppModel`: HR smoothing, RMSSD, HR-zone coaching, an illness/strain early-warning, and a resting-stress nudge.
+**In short:** the *interactive data-interrogation* engines (correlation, behavior effects, period comparison) are wired into screens, and the *recompute-from-raw-streams* engines that produce the three daily scores — Charge (recovery), Effort (strain), and Rest (sleep) — run live too. `IntelligenceEngine` calls `analyzeDay` for every night the strap offloaded and persists those APPROXIMATE results under the `"-noop"` source, merged under any imported rows — a WHOOP export still wins wherever it covers a day. Its workout detector remains an analytics/enrichment helper; only the opt-in confirmation flow can create a new workout, after the user saves it. The live BLE app additionally runs four small inline analytics in `AppModel`: HR smoothing, RMSSD, HR-zone coaching, an illness/strain early-warning, and a resting-stress nudge.
 
 ---
 
@@ -188,9 +188,9 @@ HRV is the dominant driver, and NOOP needs a few nights to learn your personal b
 | yellow | `34 … 67` |
 | green | `≥ 67` |
 
-### Resting HR (`restingHR`)
+### Resting HR
 
-"Lowest sustained HR" during the in-bed window = the **minimum of 5-minute non-overlapping bin means** of HR samples in `[start, end]`. This rejects single-beat dips while capturing the night's true floor.
+`recovery(...)` takes the sleeping resting HR as an input; it does not compute one. The number the apps show comes from the sleep path — see [Per-session resting HR and HRV](#per-session-resting-hr-and-hrv).
 
 ---
 
@@ -205,8 +205,10 @@ Source: `StrainScorer.swift`. Produces **Effort** — *"how hard did your heart 
 1. **Heart-Rate Reserve (Karvonen 1957):** `HRR = HRmax − RHR`.
 2. **Per-sample intensity** as `%HRR = (HR − RHR) / HRR × 100`, clamped `[0, 100]`.
 3. **TRIMP accumulation** over the window, by one of two methods:
-   - **Edwards (1993) 5-zone summation (default):** each sample contributes its zone weight (`1…5` at the `50 / 60 / 70 / 80 / 90 %HRR` cut-offs) × duration.
-   - **Banister (1991) exponential:** each sample contributes `duration × x × 0.64 × e^(b·x)`, where `x = %HRR/100` and `b = 1.92` (men) / `1.67` (women).
+   - **Edwards-*style* 5-zone summation (default):** each sample contributes its zone weight (`1…5` at the `50 / 60 / 70 / 80 / 90 %HRR` cut-offs) × duration.
+     - ***Style*, not Edwards.** Edwards (1993) defines its five zones on **%HRmax**; these cut-offs are read off **%HRR** (#2835). With HRmax 190 and RHR 50, 133 bpm is 70 %HRmax and so zone 3 by the source, against 59 %HRR and zone 1 here. The %HRR reading is deliberate — it is the quantity the whole pipeline is built on — and re-cutting the zones on %HRmax would move every Effort number, so it stays. What was wrong was calling it Edwards without the qualifier.
+   - **Banister (1991) exponential:** each sample contributes `duration × x × a × e^(b·x)`, where `x = %HRR/100` and the coefficient pair is `a = 0.64, b = 1.92` (men) / `a = 0.86, b = 1.67` (women).
+     - **Both halves are sex-selected together (#2835).** This read `0.64` for everyone until then, so a woman was scored with the women's exponent and the men's multiplier, which is neither published pair. The two now travel as one value, `BanisterCoefficients`, so selecting half of a pair cannot be expressed. Effort moves by at most **+1.6 points** for women on this method, largest in the light-activity middle and zero at both ends of the axis; Edwards, the default, is untouched.
 4. **Logarithmic compression** onto `[0, 100]`:
 
 ```
@@ -236,11 +238,58 @@ Given `(TRIMP, reference_strain)` pairs, fits `D` via a through-origin least-squ
 
 ---
 
+## `SleepDebt` — actionable next-night sleep target
+
+The displayed debt is a planning estimate, not an hour-for-hour bank of every
+minute missed over the last fortnight. For each usable night, NOOP carries 55%
+of the complete unmet need into the following night's target:
+
+```text
+currentNeed = personalizedBaseNeed + currentDebt
+nextDebt    = 0.55 × max(0, currentNeed − creditedSleep)
+```
+
+`creditedSleep` is the main night's asleep time plus separately recorded nap
+sleep. A calculated debt below 10 minutes is treated as balanced; exactly 10
+minutes remains debt. Meeting the complete current need clears the displayed
+debt, and extra sleep never creates a positive bank. The chart bars remain the
+raw nightly difference from base need so the underlying nights stay visible.
+
+The coefficient is an interoperability approximation, not a physiological
+constant. It was selected against one contributor's 853 consecutive exported
+WHOOP nights: the 0.55 recurrence was within 15 minutes of WHOOP's following-day
+debt on 93.0% of pairs and within 20 minutes on 94.5%. That contributor also used
+WHOOP's sleep-debt target for daily sleep planning for approximately 800 days.
+This is useful longitudinal field evidence, but it is single-user validation,
+not a population study or clinical claim.
+
+A bounded, recency-weighted planning estimate is also more honest than treating
+sleep loss as interchangeable hours. Controlled restriction studies find that
+sleep physiology, subjective sleepiness, and cognitive performance accumulate
+and recover on different timescales; recovery depends on sleep dose and intensity,
+and some performance effects can remain after extended recovery sleep:
+
+- Van Dongen et al. (2003), chronic restriction dose-response:
+  <https://pubmed.ncbi.nlm.nih.gov/12683469/>
+- Banks et al. (2010), recovery-sleep dose response:
+  <https://pmc.ncbi.nlm.nih.gov/articles/PMC2910531/>
+- Doty et al. (2020), differential recovery across neurobehavioral measures:
+  <https://pubmed.ncbi.nlm.nih.gov/33274389/>
+
+The estimate therefore answers the narrow product question “how much should I
+add to tonight's base sleep target?”, not “have all physiological and cognitive
+effects of prior sleep restriction disappeared?”. Swift and Kotlin implement the
+same constants, recurrence, deadband, nap credit, and 14-usable-night bound.
+
 ## `SleepStager` — sleep/wake detection + approximate 4-class staging (feeds **Rest**)
 
 Source: `SleepStager.swift`. Detects in-bed sessions from gravity/HR/RR/respiration and produces a 30-second hypnogram of `{wake, light, deep, rem}`. These stages and the AASM roll-up below are the raw material the **Rest** score composite consumes (see *The Rest score composite* immediately after this section).
 
-> **Honest hedging.** These stages are **approximations**, not PSG-validated, not medical advice. The EEG-free 4-class ceiling is ~65–73% epoch agreement (Walch 2019). **Light/deep separation is the weakest link — deep-minute estimates are the least reliable output.**
+> **Honest hedging.** These stages are **approximations**, not PSG-validated, not medical advice. **Light/deep separation is the weakest link — deep-minute estimates are the least reliable output.**
+>
+> **What the EEG-free literature actually measures, and why it flatters us (#2835).** This note used to read "the EEG-free 4-class ceiling is ~65–73% epoch agreement (Walch 2019)". Walch et al. (2019) report a **three-class** task — wake / NREM / REM, about 72% — alongside a separate **two-class** sleep/wake result near 90%. It attempts **no** light/deep separation, so it publishes no four-class ceiling, and the range was attributed to a task the paper did not run.
+>
+> The correction makes this hedge **stronger**, not weaker. The four classes NOOP outputs are a harder problem than the three Walch scored, so ~72% is an **upper bound from an easier task** rather than a ceiling for ours — and the sentence immediately above, that light/deep is the weakest link, is precisely about the class that literature never had to separate. No four-class figure is quoted here because the cited work has none to quote.
 
 ### Stage 0 — gravity-stillness sleep/wake spine (`detectSleep`)
 
@@ -285,6 +334,14 @@ Consecutive same-stage epochs are merged into `StageSegment`s tiling `[start, en
 
 - `SleepSession` — `start`, `end`, `efficiency` (AASM `asleep / in-bed`, where `asleep = in-bed − wake`), `stages`, per-session `restingHR` (lowest 5-min rolling-mean HR) and `avgHRV` (mean RMSSD over 5-min tumbling windows).
 - `hypnogramMetrics(_:)` — AASM-style roll-up: TIB / TST / SPT / SOL / REM latency / WASO / efficiency / disturbances, plus deep/REM/light minutes and percentages.
+
+### Per-session resting HR and HRV
+
+`sessionRestingHR` is the **minimum of 5-minute non-overlapping bin means** of the HR samples in `[start, end]` — "lowest sustained HR", which rejects single-beat dips while capturing the night's true floor. A bin qualifies to win only when it holds at least 5 samples and its mean is at least 25 bpm (#1943), so a one-sample bin at the edge of a wear gap or a dropout-driven sub-physiological dip cannot become the night's resting HR. When no bin qualifies, the floor falls back to the lowest of all bin means (ungated), then the all-sample mean, so a session with data never scores nil. `sessionHrvWindows` tumbles the same 5-minute grid over the RR series, cleans each bucket (range filter + Malik ectopic rejection, gap-aware) and emits one window per bin tagged with the stage at its center; `sessionAvgHRV` is the mean of those window RMSSDs. These two are the shipped source of the per-session `restingHR` / `avgHRV`, of the HRV nightly trace and of the last-deep-run comparator.
+
+**Window endpoint rule.** The session window is closed at both ends, so the binning is too: bins are `[t, t + 300)` except the last one, which is `[t, end]`. A sample or beat sitting exactly on an aligned `end` passes the `[start, end]` prefilter, so it must land in a bin rather than be admitted and then dropped. A zero-length window (`start == end`) is that single closed bin. Bin start times, the stage-tagging center and the RMSSD math are unaffected.
+
+Because these two functions are the shipped path, the rule can move a displayed number on a night whose session length is an exact multiple of 300 s with a sample on `end`: per-session `restingHR`/`avgHRV` and the HRV trace. Stored rows keep the old value until that night is re-scored (`MetricsCache` overwrites both on every recompute).
 
 ### Motion-corroborated wake — elevated-but-motionless HR is not wake (default ON)
 

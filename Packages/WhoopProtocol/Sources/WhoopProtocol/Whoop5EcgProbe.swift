@@ -132,11 +132,11 @@ public enum Whoop5EcgProbe {
 
     /// The gate verdict, kept separate from the report text so it is assertable in a test.
     public enum Verdict: Equatable, Sendable {
-        /// Frames that PASS THE STRUCTURAL TRIAGE arrived. Not proof: the triage is a heuristic over
-        /// four booleans, three enum ranges and a length agreement (see
-        /// `Whoop5Ecg.plausibleFilteredPayload`), run against ordinary live 5/MG traffic, so an
-        /// unrelated packet can match. The verdict says "candidate", and confirming it needs the raw
-        /// bytes in the log — never this count alone.
+        /// Revision-17 Labrador records arrived. Stronger than it used to be: the old structural
+        /// heuristic could match an unrelated packet, whereas `Whoop5Ecg.isLabradorR17Frame` requires
+        /// both CRCs, `inner[0] == 43`, `inner[1] == 17` and a sample block that fits. Still called a
+        /// candidate, because what the samples MEAN remains unvalidated here — and confirming a run
+        /// needs the raw bytes in the log, never this count alone.
         case ecgCandidatesArrived(packets: Int)
         /// At least one command that ASKED FOR DATA came back FAILURE: the opcode exists and execution
         /// was refused. WHY it was refused is not on the wire — the reply carries a result code and
@@ -163,9 +163,10 @@ public enum Whoop5EcgProbe {
         public var headline: String {
             switch self {
             case .ecgCandidatesArrived(let packets):
-                return "\(packets) frame(s) matched the ECG structural triage. That is a CANDIDATE, not proof: "
-                    + "the triage is a shape heuristic and unrelated traffic can match it. Confirm against the "
-                    + "raw bytes below before concluding anything about whether the feature is blocked."
+                return "\(packets) revision-17 ECG packet(s) decoded. The strap IS producing the filtered "
+                    + "trace: each one arrived as type 43 revision 17 with both CRCs intact. What the samples "
+                    + "MEAN is still unvalidated here — check the per-packet progress and presence below to see "
+                    + "whether a reading actually advanced, rather than reading the count alone."
             case .dataRequestRefused(let commands):
                 return "DATA REQUEST REFUSED — the firmware returned FAILURE for \(commands.joined(separator: ", ")), "
                     + "which asked it to produce ECG data: it knows the opcode and refused to run it. "
@@ -198,6 +199,82 @@ public enum Whoop5EcgProbe {
                 return "INCONCLUSIVE — the result codes do not match a known pattern. The raw replies below are the record."
             }
         }
+    }
+
+    /// How long one run listens, in seconds, chosen by what started it.
+    ///
+    /// `capture` is 60 rather than 30 because of @meta1971's field timing in #891: across five MG
+    /// sessions the strap's terminal frame (classifier state 2, progress 100) landed 38 to 39 s after the
+    /// first live frame, so a 30 s window could not reach a completed reading on ANY strap or firmware.
+    /// The verdict sheet landing at 30 s made that worse than a missed deadline: Stop is the next control
+    /// a person reaches for, so the window trained people to end the session 8 to 9 s before the
+    /// classifier would have answered, and the probe then reported the silence it had caused.
+    ///
+    /// `selectOrStop` stays at 30. Those runs wait for a COMMAND_RESPONSE rather than for a reading, so
+    /// the longer window would be dead time in front of an answer that already arrived.
+    ///
+    /// `terminalGrace` is how long a run keeps listening AFTER the terminal frame instead of ending on
+    /// it, so that a probe stopping on that frame does not pin the still-unset variability field as the
+    /// reading's own. It also means a run that ends early reports early: a terminal frame at 12 s renders
+    /// the verdict at 22 s rather than holding the sheet for the rest of the window.
+    ///
+    /// **AN EVIDENCE WINDOW, NOT A GUARANTEE, and 10 s does not cover the measured spread.** The first
+    /// figure here came from @meta1971's original five MG sessions, where the field cleared 2 to 9 s past
+    /// the terminal frame. Their later 16-run series on the same firmware is much wider: the first valid
+    /// value landed between 3 s BEFORE and 17 s after the verdict frame in 9 runs, at +113 and +120 s in
+    /// 2, and never at all before the recording ended in 5 (those recordings ran 20 to 144 s past the
+    /// verdict). By their own count a 10 s window would have caught 4 of the 16 and a 20 s window 9, and
+    /// their reading of it is that the delay is not fixed on this firmware.
+    ///
+    /// The constant stays at 10 regardless, and the honest reason is that no number here is right: 20 s
+    /// buys five more runs out of sixteen and still misses the +113 s pair and the five that never
+    /// filled, while every second of it is a sheet held shut in front of a reading that is already over.
+    /// What the window must not do is let an unset field be reported as a value, and that is a property
+    /// of the reader rather than of the duration. An `0xffff` at the end of the grace is UNAVAILABLE: not
+    /// zero, and not a reading that failed to complete.
+    public enum Window {
+        public static let selectOrStop = 30
+        public static let capture = 60
+        public static let terminalGrace = 10
+    }
+
+    /// Cap on the per-packet candidate lines one run records. Each line is rendered into both the report
+    /// and the strap log, so a chatty stream must not grow either without bound.
+    public static let maxCandidateLines = 12
+
+    /// Slots a run keeps in reserve for TERMINAL frames once `maxCandidateLines` is spent.
+    ///
+    /// R17 arrives at about one frame a second, so a flat cap keeps seconds 1 to 12 and discards
+    /// everything after. Per #891 the result, average HR and reason mask populate only on the terminal
+    /// frame, which means the flat cap threw away the single frame carrying the answer and kept twelve
+    /// that could not. A reserve rather than a bigger cap: the point is not more evidence, it is the RIGHT
+    /// evidence, and the ceiling stays bounded at `maxCandidateLines + maxTerminalCandidateLines`.
+    public static let maxTerminalCandidateLines = 4
+
+    /// Whether a decoded frame's line is kept, given what the run has already recorded.
+    ///
+    /// A terminal frame inside the first `maxCandidateLines` is kept by the ordinary rule and still spends
+    /// one reserve slot, so a run can never record more than the ceiling either way.
+    ///
+    /// Kotlin twin: `Whoop5EcgProbe.retainsCandidate`.
+    public static func retainsCandidate(linesKept: Int,
+                                        terminalLinesKept: Int,
+                                        isTerminal: Bool) -> Bool {
+        if linesKept < maxCandidateLines { return true }
+        return isTerminal && terminalLinesKept < maxTerminalCandidateLines
+    }
+
+    /// Seconds to wait before rendering the verdict once a terminal frame lands, or nil to leave the
+    /// run's existing deadline alone.
+    ///
+    /// ONCE per run (`alreadyExtended`), because the strap sends more than one terminal frame: extending
+    /// on each would let a terminal stream push the verdict out indefinitely and the report would never
+    /// render.
+    ///
+    /// Kotlin twin: `Whoop5EcgProbe.terminalGraceSeconds`.
+    public static func terminalGraceSeconds(isTerminal: Bool, alreadyExtended: Bool) -> Int? {
+        guard isTerminal, !alreadyExtended else { return nil }
+        return Window.terminalGrace
     }
 
     /// Classify the run.
@@ -244,9 +321,9 @@ public enum Whoop5EcgProbe {
 
     /// The full report: verdict, per-command outcomes, the ECG-packet tally, and the raw replies.
     ///
-    /// `candidateFrames` are the type/length lines for frames that passed the structural triage in
-    /// `Whoop5Ecg.plausibleFilteredPayload` — the empirical answer to "which packet type do these arrive
-    /// under", which no table in this repo yet holds.
+    /// `candidateFrames` are the per-packet lines for frames `Whoop5Ecg.r17FromFrame` decoded — the
+    /// sequence, progress and presence of each accepted record, which is what tells a clean run apart
+    /// from one the electrodes kept dropping.
     public static func report(steps: [Step],
                               ecgPacketsSeen: Int,
                               candidateFrames: [String],
@@ -282,9 +359,9 @@ public enum Whoop5EcgProbe {
                 + "the zero.\n"
         }
         if candidateFrames.isEmpty {
-            sb += "Candidate packet types: none — no frame passed the structural triage.\n"
+            sb += "Revision-17 packets decoded: none — no frame arrived as type 43 revision 17.\n"
         } else {
-            sb += "Candidate packet types (structural triage only, NOT a confirmed mapping):\n"
+            sb += "Revision-17 packets decoded (type 43, revision 17, both CRCs checked):\n"
             for line in candidateFrames { sb += "  \(line)\n" }
         }
         let replies = steps.compactMap { step in step.replyHex.map { "  \(step.label): \($0)" } }

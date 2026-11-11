@@ -35,14 +35,33 @@ public struct CachedSleepSession: Equatable, Codable {
     /// of presenting the short total as fact. nil for imported nights and pre-migration rows (unknown, not
     /// flagged). Set per session to the DAY's value; only NOOP-computed nights populate it. Byte-parity twin.
     public let stagingSparse: Bool?
+    /// Which device's row this is, when the read that produced it knew.
+    ///
+    /// The Kotlin `SleepSession` entity has carried `deviceId` all along; this type never did, so a caller
+    /// holding a block had no way to say where it came from and had to ask the store which device owned it,
+    /// once per block. That probe is the expensive half of the Sleep screen's load.
+    ///
+    /// Optional, and defaulted, for two reasons. Seventy-six construction sites build these by hand, and a
+    /// required field would churn every one of them to state something most of them do not know. And the
+    /// honest value for a hand-built session IS absent: claiming a device it was never read from would be
+    /// worse than saying nothing. Readers treat nil as "ask", so provenance is a shortcut where the store
+    /// supplied it and never a silent wrong answer where it did not. `Codable` decodes a missing key to nil,
+    /// so persisted payloads written before this field stay readable.
+    ///
+    /// The WRITE never reads it. `upsertSleepSessions` takes its device as a separate argument, so
+    /// setting this on a session being stored cannot route the row into another device's namespace,
+    /// and a row always reads back stamped with the id it was actually written under.
+    public let deviceId: String?
     public init(startTs: Int, endTs: Int, efficiency: Double?, restingHr: Int?,
                 avgHrv: Double?, stagesJSON: String?, userEdited: Bool = false,
-                startTsAdjusted: Int? = nil, stagingSparse: Bool? = nil) {
+                startTsAdjusted: Int? = nil, stagingSparse: Bool? = nil,
+                deviceId: String? = nil) {
         self.startTs = startTs; self.endTs = endTs
         self.efficiency = efficiency; self.restingHr = restingHr
         self.avgHrv = avgHrv; self.stagesJSON = stagesJSON
         self.userEdited = userEdited
         self.startTsAdjusted = startTsAdjusted
+        self.deviceId = deviceId
         self.stagingSparse = stagingSparse
     }
 
@@ -52,7 +71,10 @@ public struct CachedSleepSession: Equatable, Codable {
     public func withStartTs(_ newStartTs: Int) -> CachedSleepSession {
         CachedSleepSession(startTs: newStartTs, endTs: endTs, efficiency: efficiency, restingHr: restingHr,
                            avgHrv: avgHrv, stagesJSON: stagesJSON, userEdited: userEdited,
-                           startTsAdjusted: startTsAdjusted, stagingSparse: stagingSparse)
+                           startTsAdjusted: startTsAdjusted, stagingSparse: stagingSparse,
+                           // Carried: a re-keyed session is the same row from the same device, and
+                           // dropping it here would turn a known provenance back into a store probe.
+                           deviceId: deviceId)
     }
 }
 
@@ -93,12 +115,28 @@ public struct DailyMetric: Equatable, Codable {
     /// compute it from the night's R-R (`HRVAnalyzer.sdnnIndex`); Apple rows mirror their own SDNN reading;
     /// Oura/other imports carry no SDNN so it stays nil.
     public let avgSdnn: Double?
+    /// Nightly ABSOLUTE skin temperature (°C) — the wear-gated mean over the night's detected sleep, the
+    /// value `skinTempDevC` is derived FROM (#1636).
+    ///
+    /// The engine already computed this on every scoring pass and threw it away once the deviation was
+    /// taken, so a wearer could see "+0.5 Δ°C" with no way to learn what it moved from — and a febrile
+    /// night reads as a small delta while the absolute reads as a fever. v40 column, nullable: nights
+    /// scored before it shipped stay nil until a re-score re-derives them from the same raw samples.
+    ///
+    /// Distinct from `skinTempDevC`, which is bimodal — CSV/Apple imports write an ABSOLUTE wrist °C into
+    /// that column and `SkinTempDisplay.isAbsoluteSkinTemp` separates them by magnitude. This column is
+    /// unambiguous: it is always an absolute, and only the strap pipeline writes it.
+    public let skinTempC: Double?
+    /// Kotlin twin: `DailyMetric.sleepHrOnly`. Every session that night staged from heart rate alone.
+    public let sleepHrOnly: Bool?
     public init(day: String, totalSleepMin: Double?, efficiency: Double?, deepMin: Double?,
                 remMin: Double?, lightMin: Double?, disturbances: Int?, restingHr: Int?,
                 avgHrv: Double?, recovery: Double?, strain: Double?, exerciseCount: Int?,
                 spo2Pct: Double? = nil, skinTempDevC: Double? = nil, respRateBpm: Double? = nil,
                 steps: Int? = nil, activeKcalEst: Double? = nil,
-                spo2Red: Int? = nil, spo2Ir: Int? = nil, avgSdnn: Double? = nil) {
+                spo2Red: Int? = nil, spo2Ir: Int? = nil, avgSdnn: Double? = nil,
+                skinTempC: Double? = nil,
+                sleepHrOnly: Bool? = nil) {
         self.day = day; self.totalSleepMin = totalSleepMin; self.efficiency = efficiency
         self.deepMin = deepMin; self.remMin = remMin; self.lightMin = lightMin
         self.disturbances = disturbances; self.restingHr = restingHr; self.avgHrv = avgHrv
@@ -106,6 +144,8 @@ public struct DailyMetric: Equatable, Codable {
         self.spo2Pct = spo2Pct; self.skinTempDevC = skinTempDevC; self.respRateBpm = respRateBpm
         self.steps = steps; self.activeKcalEst = activeKcalEst
         self.spo2Red = spo2Red; self.spo2Ir = spo2Ir; self.avgSdnn = avgSdnn
+        self.skinTempC = skinTempC
+        self.sleepHrOnly = sleepHrOnly
     }
 
     /// The freshest STRICTLY-PRIOR day that carries at least one overnight vital (HRV / resting HR /
@@ -138,6 +178,41 @@ public struct DailyMetric: Equatable, Codable {
     public nonisolated static func lastSkinTempDay(days: [DailyMetric], todayKey: String) -> DailyMetric? {
         days.last(where: { $0.skinTempDevC != nil && $0.day < todayKey })
     }
+
+    /// The freshest strictly-prior row carrying EITHER skin-temp number (#1844), so a surface can lead
+    /// with the absolute and fall back to the deviation from ONE night rather than mixing two.
+    ///
+    /// The OR here is deliberate and is NOT the #1842 defect. That bug read field X off a row selected on
+    /// (X or Y), so a row holding only Y blanked X. This selects a row for a value that is "whichever of
+    /// the two this night has", and the caller reads both fields off THAT row and lets
+    /// `SkinTempDisplay.leadReading` pick — so the chosen row always supplies the number shown, and an
+    /// absolute is never paired with another night's deviation. `lastSkinTempDay` stays as-is for the
+    /// deviation-only surfaces. Byte-twin of the Android `lastSkinTempReadingRow`.
+    public nonisolated static func lastSkinTempReadingDay(days: [DailyMetric], todayKey: String) -> DailyMetric? {
+        days.last(where: { ($0.skinTempC != nil || $0.skinTempDevC != nil) && $0.day < todayKey })
+    }
+
+    /// PER-FIELD HRV carry — the twin of `lastSpo2Day` for a field `lastVitalsDay` DOES check, which is
+    /// precisely why it needs one. That predicate is an OR across HRV / resting-HR / respiratory, so it
+    /// resolves the freshest row carrying ANY of the three — including a respiratory-only row whose
+    /// `avgHrv` is nil. The HRV card then reads that nil and renders "—" while a tile carrying a different
+    /// row shows a real number on the same screen (#1842). Resolving per field picks the freshest row that
+    /// actually holds an HRV, the same correction `lastSpo2Day` and `lastSkinTempDay` already make.
+    ///
+    /// Deliberately NOT staleness-bounded, unlike `Repository.lastRespDay`: an old HRV/RHR carry is
+    /// disclosed rather than suppressed — the call sites stamp the row's own date and `carriedCaption`
+    /// relabels a weeks-old one to "Latest sleep" (#779). Respiratory took a hard bound instead because a
+    /// single CSV import's value was reading as today's for a fortnight (#1331). Same `$0.day < todayKey`
+    /// future-clock guard; `days` is oldest→newest. Byte-twin of the Android `lastHrvRow`.
+    public nonisolated static func lastHrvDay(days: [DailyMetric], todayKey: String) -> DailyMetric? {
+        days.last(where: { $0.avgHrv != nil && $0.day < todayKey })
+    }
+
+    /// PER-FIELD resting-HR carry — twin of `lastHrvDay`, same OR-predicate cause and same unbounded-by-
+    /// design carry (#1842). Byte-twin of the Android `lastRestingHrRow`.
+    public nonisolated static func lastRestingHrDay(days: [DailyMetric], todayKey: String) -> DailyMetric? {
+        days.last(where: { $0.restingHr != nil && $0.day < todayKey })
+    }
 }
 
 extension WhoopStore {
@@ -145,11 +220,29 @@ extension WhoopStore {
     // MARK: - Upserts (idempotent by natural key; latest server value wins on conflict)
 
     /// Upsert cached sleep sessions. Natural key (deviceId, startTs). Returns rows changed.
+    ///
+    /// A non-user-edited candidate whose stage timeline is LESS complete than what's already stored for
+    /// the same (deviceId, startTs) is dropped whole rather than written: a device can serve the same
+    /// night's hypnogram more than once (a reconnect mid-day, a resumed drain), and a later, shorter
+    /// decode has no business overwriting an earlier, fuller one — the two would otherwise silently
+    /// disagree on `stagesJSON` vs. `efficiency`/`endTs` for the same row. `HypnogramCoverage`'s 0/1/2
+    /// richness rank (none / holed / covers-its-span) is the same scale `SleepMerge` already judges a
+    /// day's best session on for DISPLAY; this applies the identical comparison at WRITE time so it
+    /// protects every caller (BLE live sources, importers, recomputes), not just the ones a caller
+    /// happens to gate behind their own dedup toggle.
     @discardableResult
     public func upsertSleepSessions(_ sessions: [CachedSleepSession], deviceId: String) async throws -> Int {
         try syncWrite { db in
             var n = 0
             for s in sessions {
+                if !s.userEdited, let existing = try Self.storedSleepSession(db, deviceId: deviceId, startTs: s.startTs),
+                   !existing.userEdited {
+                    let candidate = CachedSleepSession(startTs: s.startTs, endTs: s.endTs, efficiency: nil,
+                                                       restingHr: nil, avgHrv: nil, stagesJSON: s.stagesJSON)
+                    if SleepMerge.richness(candidate) < SleepMerge.richness(existing) {
+                        continue   // a less-complete re-serve of this night must never clobber the stored one
+                    }
+                }
                 try db.execute(sql: """
                     INSERT INTO sleepSession
                         (deviceId, startTs, endTs, efficiency, restingHr, avgHrv, stagesJSON,
@@ -176,6 +269,19 @@ extension WhoopStore {
             }
             return n
         }
+    }
+
+    /// The stored row at (deviceId, startTs), or nil when there is none yet — the completeness check
+    /// `upsertSleepSessions` runs before deciding whether a candidate may overwrite it. Only the fields
+    /// that check needs are read; `efficiency`/`restingHr`/`avgHrv` are left nil since richness never
+    /// looks at them.
+    private static func storedSleepSession(_ db: Database, deviceId: String, startTs: Int) throws -> CachedSleepSession? {
+        guard let row = try Row.fetchOne(db, sql: """
+            SELECT endTs, stagesJSON, userEdited FROM sleepSession WHERE deviceId = ? AND startTs = ?
+            """, arguments: [deviceId, startTs]) else { return nil }
+        return CachedSleepSession(startTs: startTs, endTs: row["endTs"], efficiency: nil, restingHr: nil,
+                                  avgHrv: nil, stagesJSON: row["stagesJSON"], userEdited: row["userEdited"],
+                                  deviceId: deviceId)
     }
 
     /// Hand-correct a sleep session's bed (onset) and/or wake (end) time. Sets `userEdited = 1` so the
@@ -323,6 +429,28 @@ extension WhoopStore {
         }
     }
 
+    /// One device's session BOUNDS in a window, as `startTs -> endTs`, in a single lean read.
+    ///
+    /// Deliberately not `sleepSessions(deviceId:from:to:limit:)`, which selects `stagesJSON` among other
+    /// columns: a caller that only needs to know which blocks a device owns would haul every night's
+    /// staging blob, once per candidate device, to read two integers from each. On a browsable history
+    /// that is the same rows re-read several times over.
+    ///
+    /// `(deviceId, startTs)` is the primary key, so a start maps to exactly one end and the dictionary
+    /// loses nothing. Unpaged on purpose: the window bounds the result, and a page limit sized from a
+    /// caller's own list would silently drop rows for a caller that passed a sparse subset of a wide span.
+    public func sleepSessionBounds(deviceId: String, from: Int, to: Int) async throws -> [Int: Int] {
+        try syncRead { db in
+            var out: [Int: Int] = [:]
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT startTs, endTs FROM sleepSession
+                WHERE deviceId = ? AND startTs >= ? AND startTs <= ?
+                """, arguments: [deviceId, from, to])
+            for row in rows { out[row["startTs"]] = row["endTs"] }
+            return out
+        }
+    }
+
     /// Batched twin of `sessionMotion` for a SET of session starts: the persisted per-epoch motion series
     /// for each of `sessionStarts` that HAS one, in a SINGLE query, keyed by startTs. Same contract as the
     /// single-key accessor — a start whose column is NULL/absent (or an empty series) is simply omitted from
@@ -416,8 +544,8 @@ extension WhoopStore {
                     (deviceId, day, totalSleepMin, efficiency, deepMin, remMin, lightMin,
                      disturbances, restingHr, avgHrv, recovery, strain, exerciseCount,
                      spo2Pct, skinTempDevC, respRateBpm, steps, activeKcalEst,
-                     spo2Red, spo2Ir, avgSdnn)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     spo2Red, spo2Ir, avgSdnn, skinTempC, sleepHrOnly)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(deviceId, day) DO UPDATE SET
                     totalSleepMin = excluded.totalSleepMin,
                     efficiency = excluded.efficiency,
@@ -437,13 +565,15 @@ extension WhoopStore {
                     activeKcalEst = excluded.activeKcalEst,
                     spo2Red = excluded.spo2Red,
                     spo2Ir = excluded.spo2Ir,
-                    avgSdnn = excluded.avgSdnn
+                    avgSdnn = excluded.avgSdnn,
+                    skinTempC = excluded.skinTempC,
+                    sleepHrOnly = excluded.sleepHrOnly
                 """, arguments: [deviceId, d.day, d.totalSleepMin, d.efficiency, d.deepMin,
                                  d.remMin, d.lightMin, d.disturbances, d.restingHr, d.avgHrv,
                                  d.recovery, d.strain, d.exerciseCount,
                                  d.spo2Pct, d.skinTempDevC, d.respRateBpm,
                                  d.steps, d.activeKcalEst,
-                                 d.spo2Red, d.spo2Ir, d.avgSdnn])
+                                 d.spo2Red, d.spo2Ir, d.avgSdnn, d.skinTempC, d.sleepHrOnly])
             n += db.changesCount
         }
         return n
@@ -466,6 +596,23 @@ extension WhoopStore {
         }
     }
 
+    /// #1853: FILL-ONLY write of `skinTempC` for nights the backfill re-derived an absolute for.
+    /// Updates ONLY the `skinTempC` column of an existing row, and ONLY when that column is currently
+    /// NULL — never an upsert of a rebuilt row, never overwriting a measured value. A single-column
+    /// UPDATE is deliberate: the backfill must not touch `skinTempDevC` or any other scored field, and
+    /// a full-row upsert would risk clobbering a concurrent scoring pass's write. Returns rows filled.
+    @discardableResult
+    public func fillSkinTempC(deviceId: String, day: String, skinTempC: Double) async throws -> Int {
+        try syncWrite { db in
+            try db.execute(sql: """
+                UPDATE dailyMetric
+                SET skinTempC = ?
+                WHERE deviceId = ? AND day = ? AND skinTempC IS NULL
+                """, arguments: [skinTempC, deviceId, day])
+            return db.changesCount
+        }
+    }
+
     // MARK: - Reads
 
     /// Cached sleep sessions overlapping [from, to] (by startTs), oldest first.
@@ -482,7 +629,10 @@ extension WhoopStore {
                                        efficiency: $0["efficiency"], restingHr: $0["restingHr"],
                                        avgHrv: $0["avgHrv"], stagesJSON: $0["stagesJSON"],
                                        userEdited: $0["userEdited"], startTsAdjusted: $0["startTsAdjusted"],
-                                       stagingSparse: $0["stagingSparse"])
+                                       stagingSparse: $0["stagingSparse"],
+                                       // The read knows the device it queried, so every block it hands
+                                       // back carries it and no caller has to ask the store again.
+                                       deviceId: deviceId)
                 }
         }
     }
@@ -494,7 +644,7 @@ extension WhoopStore {
                 SELECT day, totalSleepMin, efficiency, deepMin, remMin, lightMin, disturbances,
                        restingHr, avgHrv, recovery, strain, exerciseCount,
                        spo2Pct, skinTempDevC, respRateBpm, steps, activeKcalEst,
-                       spo2Red, spo2Ir, avgSdnn FROM dailyMetric
+                       spo2Red, spo2Ir, avgSdnn, skinTempC, sleepHrOnly FROM dailyMetric
                 WHERE deviceId = ? AND day >= ? AND day <= ?
                 ORDER BY day ASC
                 """, arguments: [deviceId, from, to])
@@ -508,7 +658,9 @@ extension WhoopStore {
                                 spo2Pct: $0["spo2Pct"], skinTempDevC: $0["skinTempDevC"],
                                 respRateBpm: $0["respRateBpm"],
                                 steps: $0["steps"], activeKcalEst: $0["activeKcalEst"],
-                                spo2Red: $0["spo2Red"], spo2Ir: $0["spo2Ir"], avgSdnn: $0["avgSdnn"])
+                                spo2Red: $0["spo2Red"], spo2Ir: $0["spo2Ir"], avgSdnn: $0["avgSdnn"],
+                                skinTempC: $0["skinTempC"],
+                                sleepHrOnly: $0["sleepHrOnly"])
                 }
         }
     }

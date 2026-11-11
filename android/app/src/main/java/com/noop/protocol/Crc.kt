@@ -1,9 +1,11 @@
 package com.noop.protocol
 
+import java.util.zip.CRC32
+
 /**
  * Frame checksums for the WHOOP wire protocol.
  *
- * Ported verbatim from the hardware-verified Swift reference (Framing.swift):
+ * Matches the hardware-verified Swift reference (Framing.swift):
  *  - [crc8]: CRC-8 (poly 0x07), table-driven — guards the Whoop 4.0 frame length header.
  *  - [crc32]: standard zlib CRC-32 (reflected, poly 0xEDB88320) — guards the frame payload.
  *  - [crc16Modbus]: CRC16-Modbus (poly 0xA001, init 0xFFFF, reflected) — Whoop 5.0 header check.
@@ -33,17 +35,6 @@ object Crc {
         0xDE, 0xD9, 0xD0, 0xD7, 0xC2, 0xC5, 0xCC, 0xCB, 0xE6, 0xE1, 0xE8, 0xEF, 0xFA, 0xFD, 0xF4, 0xF3,
     )
 
-    // Standard zlib CRC-32 table (reflected, poly 0xEDB88320), built once at class init.
-    private val crc32Table: LongArray = LongArray(256).also { table ->
-        for (i in 0 until 256) {
-            var c = i.toLong() and 0xFFFFFFFFL
-            repeat(8) {
-                c = if ((c and 1L) != 0L) 0xEDB88320L xor (c ushr 1) else (c ushr 1)
-            }
-            table[i] = c and 0xFFFFFFFFL
-        }
-    }
-
     /**
      * CRC-8 (poly 0x07) over `data[from until to]`. Returns a value in 0..255. The [from]/[to] range
      * defaults to the whole array (existing callers unchanged); passing a range lets the frame
@@ -65,14 +56,9 @@ object Crc {
      * record or payload in place, skipping the per-frame copyOfRange on the offload path.
      */
     fun crc32(data: ByteArray, from: Int = 0, to: Int = data.size): Long {
-        var crc = 0xFFFFFFFFL
-        var i = from
-        while (i < to) {
-            val idx = ((crc xor (data[i].toLong() and 0xFFL)) and 0xFFL).toInt()
-            crc = crc32Table[idx] xor (crc ushr 8)
-            i++
-        }
-        return (crc xor 0xFFFFFFFFL) and 0xFFFFFFFFL
+        val checksum = CRC32()
+        checksum.update(data, from, to - from)
+        return checksum.value
     }
 
     /**

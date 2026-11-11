@@ -16,7 +16,13 @@ import android.content.SharedPreferences
  * The macOS app stored this in `UserDefaults` under the key `noopPuffinExperiments`; the Android
  * equivalent is [SharedPreferences]. The same key name is reused for parity.
  */
-class PuffinExperiment(private val prefs: SharedPreferences) {
+class PuffinExperiment(
+    private val prefs: SharedPreferences,
+    /** NoopPrefs, where the per-strap refusal latch lives. Required, not defaulted: a caller that omitted
+     *  it would silently re-arm into the very state #2135 is about, and [from] is the only construction
+     *  site there is, so nothing is served by making it skippable. */
+    private val noopPrefs: SharedPreferences,
+) {
 
     /** True if the user opted in to the WHOOP 5/MG protocol probes (default false). */
     var isEnabled: Boolean
@@ -38,9 +44,9 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
         get() = prefs.getBoolean(KEY_DEEP_DATA, false)
         set(v) = prefs.edit().putBoolean(KEY_DEEP_DATA, v).apply()
 
-    /** True if the user opted in to "Broadcast heart rate": NOOP writes the device-config flag
-     *  whoop_live_hr_in_adv_ind_pkt="1" so the strap advertises the standard Heart Rate Service
-     *  (0x180D) + its live HR, pairable by a Garmin/Zwift/gym HR client. Reversible. Default false.
+    /** True if the user opted in to "Broadcast heart rate": NOOP enables the family's reversible
+     *  direct-broadcast control so the strap advertises the standard Heart Rate Service (0x180D),
+     *  pairable by a Garmin/Zwift/gym HR client. Default false.
      *  Mirrors the macOS `PuffinExperiment.broadcastHrKey`. (#181) */
     var broadcastHr: Boolean
         get() = prefs.getBoolean(KEY_BROADCAST_HR, false)
@@ -60,6 +66,11 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
     var ecgRawData: Boolean
         get() = prefs.getBoolean(KEY_ECG_RAW_DATA, false)
         set(v) = prefs.edit().putBoolean(KEY_ECG_RAW_DATA, v).apply()
+
+    /** Whether the MG ECG probe may send its three session toggles. Twin of Apple's `ecgEnabled`. */
+    var ecgEnabled: Boolean
+        get() = prefs.getBoolean(KEY_ECG, false)
+        set(v) = prefs.edit().putBoolean(KEY_ECG, v).apply()
 
     /** True if the user opted in to "Experimental sleep staging (V2)": detected nights are re-staged with
      *  [com.noop.analytics.SleepStagerV2] (the transparent cardiorespiratory recipe, reimplemented from
@@ -112,13 +123,149 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
         set(v) = prefs.edit().putBoolean(KEY_MOTION_AWARE_WAKE, v).apply()
 
     /**
-     * Turn OFF every 5/MG-only experimental probe: protocol probes ([isEnabled]), raw capture
-     * ([isCaptureEnabled]), the R22 deep-data strap write ([isDeepDataEnabled]) and broadcast-HR
-     * ([broadcastHr]). Called on a strap FAMILY switch (WHOOP 4.0 ↔ 5/MG) so a 5/MG-only option can
-     * never linger enabled and get applied to a strap it doesn't belong to. One atomic edit.
+     * Send the CLIENT_HELLO even when the suppression latch says not to (default false, #1635).
      *
-     * The line is "does it SEND something to the strap": these four arm probes, raw-capture writes, the
-     * R22 deep-data write and the broadcast-HR write, all of which target hardware that may not support
+     * The latch exists because the hello was never once acknowledged and the drop is locked to it. But an
+     * HCI capture has since changed the premise it was reasoned from: the strap answers `createBond` with
+     * SMP `Pairing Not Supported` (0x05), so the encrypted bond the hello was waiting behind can NEVER
+     * arrive. With SMP unavailable and the hello suppressed, the app now attempts NEITHER handshake — the
+     * same capture shows zero writes to fd4b0002 other than DISABLE_ALARM, and zero puffin subscriptions.
+     *
+     * Whether the strap will answer a hello on a link it has explicitly refused to encrypt is unknown, and
+     * unknowable without asking. This switch asks. It is deliberately its own toggle rather than a change
+     * to the latch: the latch's reasoning is still sound for anyone whose strap DOES bond, and the failure
+     * mode it prevents (hello, drop at ~4.8s, reconnect, forever) is real. Opting in accepts that loop in
+     * exchange for the answer.
+     */
+    var helloDespiteBondRefusal: Boolean
+        get() = prefs.getBoolean(KEY_HELLO_DESPITE_REFUSAL, false)
+        set(v) = prefs.edit().putBoolean(KEY_HELLO_DESPITE_REFUSAL, v).apply()
+
+    /**
+     * Try the historical offload on a link that never bonded (#1635, default false).
+     *
+     * `beginBackfill` is gated on `connectHandshakeDone`, which for a 5/MG is set only behind the
+     * CLIENT_HELLO ack — so on a strap answering SMP `Pairing Not Supported` the offload is never even
+     * attempted. That gate is ours, and the assumption underneath it (that the puffin notify chars need an
+     * encrypted link) has never been measured on Android: the one attempt rode a false bond and the link
+     * died before any answer came back. See [shouldProbeUnbondedOffload] for the staged form.
+     *
+     * Its own switch because it SENDS to the strap and, if the strap answers, writes its clock — the same
+     * line every other state-changing probe here sits behind ([isDeepDataEnabled], [broadcastHr],
+     * [ecgRawData]). Nothing is written until the strap has proved it answers a read-only GET_CLOCK, and a
+     * refusal is latched per device and silence spends a bounded, persisted budget, so opting in costs at
+     * most [UNBONDED_PROBE_MAX_SILENT_LINKS] links on a strap and not a loop. It said "one link and not a
+     * loop" while costing 18 across 24 connects, which is the correction this doc exists to record.
+     *
+     * Turning it ON also clears every strap's silence budget ([unbondedProbeSilentLinksPrefKey]). That
+     * budget is now persisted, so without this a strap that spent it would never probe again — and
+     * silently, the give-up line having latched on a run the user may never have seen. This setter is the
+     * one place the intent is unambiguous: sampling the switch at connect cannot see it flipped off and
+     * on while the link sits idle, which is exactly what a user does after being told to turn it off.
+     */
+    var unbondedOffload: Boolean
+        get() = prefs.getBoolean(KEY_UNBONDED_OFFLOAD, false)
+        set(v) {
+            val rearms = unbondedProbeBudgetRearms(v, prefs.getBoolean(KEY_UNBONDED_OFFLOAD, false))
+            val e = prefs.edit().putBoolean(KEY_UNBONDED_OFFLOAD, v)
+            // Every strap, not just the connected one: the switch is global, so "try again" is too, and
+            // this setter is the only path that runs with no device in hand.
+            if (rearms) {
+                prefs.all.keys
+                    .filter { it.startsWith(UNBONDED_PROBE_SILENT_LINKS_KEY_PREFIX) }
+                    .forEach { e.remove(it) }
+                // #1804: clear the inconclusive budget too, so re-arming gives the probe a fresh
+                // start on a strap whose every link was torn down locally.
+                prefs.all.keys
+                    .filter { it.startsWith(UNBONDED_PROBE_INCONCLUSIVE_LINKS_KEY_PREFIX) }
+                    .forEach { e.remove(it) }
+                // #2135: and the refusal latch, the one retirement reason a sweep of THIS file cannot
+                // reach. Same prefix rule, same edge, other file, because it is written at connect time
+                // with a device in hand and so cannot live here.
+                val ne = noopPrefs.edit()
+                noopPrefs.all.keys
+                    .filter { it.startsWith(UNBONDED_OFFLOAD_REFUSED_KEY_PREFIX) }
+                    .forEach { ne.remove(it) }
+                ne.apply()
+            }
+            e.apply()
+        }
+
+    /**
+     * The probe's persisted silence budget for one strap — links that subscribed the puffin
+     * characteristics and drew no answer, capped by [UNBONDED_PROBE_MAX_SILENT_LINKS].
+     *
+     * It lives HERE, and not beside the refusal latch in `NoopPrefs`, on purpose. The setter above clears
+     * these by prefix because it has no device in hand, and a sweep can only reach its own prefs file:
+     * written to `NoopPrefs` and swept from `noop_experiments`, re-enabling the switch would clear nothing
+     * and the probe would stay retired forever, silently. Keeping the budget on the object that owns the
+     * switch makes that drift unrepresentable rather than merely documented.
+     *
+     * The refusal latch could not move here, being written at connect time with a device in hand, and it
+     * is exactly the "retired forever, silently" case this paragraph warns about: #2135. The setter is
+     * now handed `NoopPrefs` as well and sweeps the latch by its own prefix, so both files are reachable
+     * from the one place the intent is unambiguous.
+     *
+     * Unreadable prefs read as 0 — the probe's other gates bound it, and a prefs failure must not be the
+     * thing that keeps a spent budget spent.
+     */
+    fun unbondedProbeSilentLinks(peripheralId: String?): Int = runCatching {
+        unbondedProbeSilentLinksPrefKey(peripheralId)?.let { prefs.getInt(it, 0) } ?: 0
+    }.getOrDefault(0)
+
+    /** Record that budget. A null address (no device in hand) is a no-op, as the read is. */
+    fun setUnbondedProbeSilentLinks(peripheralId: String?, value: Int) {
+        runCatching {
+            unbondedProbeSilentLinksPrefKey(peripheralId)?.let {
+                prefs.edit().putInt(it, value).apply()
+            }
+        }
+    }
+
+    /**
+     * The probe's persisted inconclusive budget for one strap — links that ended in a LOCAL teardown
+     * (status=22), capped by [UNBONDED_PROBE_MAX_INCONCLUSIVE_LINKS].
+     *
+     * #1804: a local teardown is inconclusive about the strap (our own stack ended the link), so it
+     * does NOT charge the silence budget. But it charges THIS budget, so a strap whose every link is
+     * torn down locally does not retry forever. Larger cap than the silence budget because
+     * inconclusive is genuinely weaker evidence than silence.
+     *
+     * Lives HERE for the same reason the silence budget does: the switch's setter clears these by
+     * prefix and can only sweep its own prefs file.
+     */
+    fun unbondedProbeInconclusiveLinks(peripheralId: String?): Int = runCatching {
+        unbondedProbeInconclusiveLinksPrefKey(peripheralId)?.let { prefs.getInt(it, 0) } ?: 0
+    }.getOrDefault(0)
+
+    /** Record the inconclusive budget. A null address is a no-op, as the read is. */
+    fun setUnbondedProbeInconclusiveLinks(peripheralId: String?, value: Int) {
+        runCatching {
+            unbondedProbeInconclusiveLinksPrefKey(peripheralId)?.let {
+                prefs.edit().putInt(it, value).apply()
+            }
+        }
+    }
+
+    /** True if the user opted in to "Ask Android to pair" (#1635, default false): NOOP calls
+     *  `BluetoothDevice.createBond()` explicitly instead of relying on a write to the encrypted
+     *  characteristic to provoke pairing — which the #1639 bond-state trace showed never happens at all.
+     *  Its own switch, like every other probe that changes state outside the app: this one asks the OS to
+     *  form a PERSISTENT pairing and can surface a system pairing dialog. Android-only; CoreBluetooth has
+     *  no equivalent explicit API, which is likely why the implicit route was chosen originally. */
+    var explicitBond: Boolean
+        get() = prefs.getBoolean(KEY_EXPLICIT_BOND, false)
+        set(v) = prefs.edit().putBoolean(KEY_EXPLICIT_BOND, v).apply()
+
+    /**
+     * Turn OFF every 5/MG-only experimental probe — exactly the switches in [FIVE_MG_GATED_KEYS], which is
+     * the one list rather than a prose copy of it that drifts (this doc named four while the list already
+     * held six). Called on a strap FAMILY switch (WHOOP 4.0 ↔ 5/MG) so a 5/MG-only option can never linger
+     * enabled and get applied to a strap it doesn't belong to. One atomic edit.
+     *
+     * The line is "does it SEND something to the strap": these arm probes, raw-capture writes, the R22
+     * deep-data write, the broadcast-HR write, the ECG gate, an explicit pairing and the unbonded offload
+     * probe, all of which target hardware that may not support
      * them. Pure analysis flags are deliberately left alone even when they only do anything on one
      * family — [ppgHrSubLagInterp] only affects v26 optical records, which a 4.0 never sends, so it is
      * inert rather than misapplied. [experimentalSleepV2], [hrvReadiness] and [motionAwareWake] are
@@ -129,6 +276,15 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
         FIVE_MG_GATED_KEYS.forEach { editor.putBoolean(it, false) }
         editor.apply()
     }
+
+    /**
+     * "Clear a stale phone pairing" - may NOOP call removeBond() when the OS holds a pairing the strap
+     * no longer honours? Default OFF, like every other switch here that changes hardware or OS state.
+     * See [shouldRemoveStaleBond] for the gate and why the threshold is above the guide's.
+     */
+    var clearStaleBond: Boolean
+        get() = prefs.getBoolean(KEY_CLEAR_STALE_BOND, false)
+        set(v) { prefs.edit().putBoolean(KEY_CLEAR_STALE_BOND, v).apply() }
 
     companion object {
         /** Persisted preferences file. Internal so a UI screen can observe external writes to it. */
@@ -146,14 +302,42 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
         /** "Broadcast heart rate" opt-in (mirrors macOS `PuffinExperiment.broadcastHrKey`). */
         const val KEY_BROADCAST_HR = "noopBroadcastHr"
 
+        /**
+         * Opt-in "MG ECG probe" — the Kotlin twin of Apple's `PuffinExperiment.ecgKey`.
+         *
+         * SEPARATE from [KEY_ECG_RAW_DATA]: that one writes a persistent device-config value on the
+         * strap, this one only permits the three TOGGLE_LABRADOR session commands. Reusing one switch
+         * would let a persistent strap write ride in on consent given for a session probe, which is the
+         * same reason the raw-data gate has its own key.
+         *
+         * Default false, reversible in one tap, and additionally gated on MG at the call site: a plain
+         * 5.0 has no electrodes.
+         */
+        const val KEY_ECG = "noopWhoop5Ecg"
+
         /** "ECG raw-data gate" opt-in — the `enable_raw_data_w_ecg` strap write (mirrors macOS
          *  `PuffinExperiment.ecgRawDataKey`). (#891) */
         const val KEY_ECG_RAW_DATA = "noopEcgRawDataGate"
 
+        /** "Ask Android to pair" opt-in — the explicit `createBond()` experiment (#1635). Android-only,
+         *  so no macOS key to mirror. */
+        const val KEY_EXPLICIT_BOND = "noopWhoop5ExplicitBond"
+
+        /** "Clear a stale phone pairing" opt-in — see [shouldRemoveStaleBond]. */
+        const val KEY_CLEAR_STALE_BOND = "noopWhoop5ClearStaleBond"
+
+        /** "Try history sync without pairing" opt-in — the unbonded offload probe (#1635). Android-only,
+         *  so no macOS key to mirror. */
+        const val KEY_UNBONDED_OFFLOAD = "noopWhoop5UnbondedOffload"
+
+        /** #1635: send the CLIENT_HELLO even when the suppression latch is set. Default OFF. */
+        const val KEY_HELLO_DESPITE_REFUSAL = "noopWhoop5HelloDespiteRefusal"
+
         /** The 5/MG-only probe keys, in ONE place: [resetFiveMGGatedProbes] clears exactly these, and
          *  SettingsScreen watches exactly these for external writes. Two lists would drift. */
         internal val FIVE_MG_GATED_KEYS =
-            listOf(KEY, KEY_CAPTURE, KEY_DEEP_DATA, KEY_BROADCAST_HR, KEY_ECG_RAW_DATA)
+            listOf(KEY, KEY_CAPTURE, KEY_DEEP_DATA, KEY_BROADCAST_HR, KEY_ECG, KEY_ECG_RAW_DATA, KEY_EXPLICIT_BOND,
+                   KEY_UNBONDED_OFFLOAD, KEY_CLEAR_STALE_BOND)
 
         /** "Experimental sleep staging (V2)" opt-in (mirrors macOS `PuffinExperiment.experimentalSleepV2Key`). */
         const val KEY_EXPERIMENTAL_SLEEP_V2 = "noopExperimentalSleepV2"
@@ -168,6 +352,9 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
         const val KEY_MOTION_AWARE_WAKE = "noopMotionAwareWake"
 
         fun from(context: Context): PuffinExperiment =
-            PuffinExperiment(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE))
+            PuffinExperiment(
+                context.getSharedPreferences(PREFS, Context.MODE_PRIVATE),
+                context.getSharedPreferences(com.noop.ui.NoopPrefs.NAME, Context.MODE_PRIVATE),
+            )
     }
 }

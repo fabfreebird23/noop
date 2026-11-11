@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -98,6 +99,13 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
     // #628: the Oura ring's live wear/charge state (null for WHOOP / before evidence). Preferred by the
     // "Worn" stat below, so removing the ring or putting it on the charger flips it instead of lingering.
     val ouraWear by viewModel.ouraWearState.collectAsStateWithLifecycle()
+    // #2075: the console must read out the ACTIVE device, not whichever LiveState field is populated.
+    val activeIsWhoop by viewModel.activeIsWhoop.collectAsStateWithLifecycle()
+    val ouraBatteryPct by viewModel.ouraBatteryPct.collectAsStateWithLifecycle()
+    // #2305: a ring gets its own status line + reconnect in the slots the WHOOP picker / Connect row used
+    // to fill regardless of the active device.
+    val activeIsOura by viewModel.activeIsOura.collectAsStateWithLifecycle()
+    val ringPhase by viewModel.ouraLinkPhase.collectAsStateWithLifecycle()
     val bpm by viewModel.bpm.collectAsStateWithLifecycle()
     val selectedModel by viewModel.selectedModel.collectAsStateWithLifecycle()
     // Active band name (MW-6) — names the band whose live data the console shows; falls back to "WHOOP".
@@ -105,10 +113,9 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
     val activeWorkout by viewModel.activeWorkout.collectAsStateWithLifecycle()
     val lastWorkout by viewModel.lastWorkout.collectAsStateWithLifecycle()
 
-    // Imperial/Metric display preference (D#103). Live distance/pace are computed from metres + sec/km
-    // and re-labelled here. Display-only.
+    // Exercise-distance preference (#1913). Stored workout data remains SI.
     val context = LocalContext.current
-    val unitSystem = UnitPrefs.system(context)
+    val unitSystem = UnitPrefs.distanceSystem(context)
     // Effort display scale (#268) — routes the live + saved workout Effort read-outs. Display-only.
     val effortScale = UnitPrefs.effortScale(context)
     // Same day-cycle gate as the liquid Today (LiquidScreenSky.kt): the time-of-day sky settles behind the
@@ -131,7 +138,11 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
         if (live.bonded) viewModel.getBattery()
     }
 
-    val activeConnection = live.connected && live.bonded
+    // Gated on the active device actually BEING a WHOOP (#2075). LiveState is one object every live
+    // source writes into, so `connected && bonded` stays true for a bonded strap while an Oura ring is
+    // the device on screen. That showed the WHOOP pill, the WHOOP charge and WHOOP-only controls under
+    // the ring's name, and made the pill's own ring branch unreachable, because this one is tested first.
+    val activeConnection = activeIsWhoop && live.connected && live.bonded
 
     // Live HR zone for the focal readout's colour world (presentation only — same shared HrZones model
     // the live-workout screen uses). 0 = below Zone 1 / no HR yet.
@@ -228,19 +239,29 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
         // Console header — the pill + a connection-mode badge (+ a live SYNCING badge during a history
         // offload), with battery / worn / last-sync stats. Mirrors the macOS consoleHeader.
         item {
-        ConsoleHeader(live = live, activeConnection = activeConnection, ouraWear = ouraWear)
+        ConsoleHeader(live = live, activeConnection = activeConnection, ouraWear = ouraWear,
+            activeIsWhoop = activeIsWhoop, ouraBatteryPct = ouraBatteryPct)
         }
 
         // Primary Connect affordance, surfaced ABOVE the fold whenever there's no link — the real
         // Connect control otherwise lives far below, past the Signal Trust grid, so an offline user
         // saw only inert copy up top. Gated purely on `!live.connected`, so it disappears the instant
         // the radio connects. Mirrors the macOS offlineConnectCallout.
-        if (!live.connected) {
+        // WHOOP only (#2305): under a ring this card named the ring over a button that ran a WHOOP
+        // connect — the #2303 reporter's Re-scan ran a full 5/MG handshake with the ring active.
+        if (activeIsWhoop && !live.connected) {
             item {
             OfflineConnectCallout(
                 scanning = live.scanning,
                 onConnect = { requestConnect() },
             )
+            }
+        }
+        // The ring's own above-the-fold affordance: its link phase and a reconnect, shown until `auth OK`
+        // — the same "no link yet" slot the WHOOP callout fills.
+        if (activeIsOura && ringPhase != com.noop.ble.OuraLiveSource.LinkPhase.AUTHENTICATED) {
+            item {
+            RingConnectCallout(phase = ringPhase, onReconnect = { viewModel.reconnectOuraRing() })
             }
         }
 
@@ -333,12 +354,14 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
 
         // Body console — focal live HR VESSEL + live physiology (R-R thread, rolling RMSSD, frame/event).
         item {
-        BodyConsole(live = live, bpm = bpm, activeConnection = activeConnection, zone = liveZone, hrMax = profile.hrMax)
+        BodyConsole(live = live, bpm = bpm, activeConnection = activeConnection, zone = liveZone, hrMax = profile.hrMax,
+            activeIsOura = activeIsOura, ringPhase = ringPhase)
         }
 
         // Signal Trust rail — one tile per signal that has to be current for the console to be trusted.
         item {
-        SignalTrustRail(live = live, bpm = bpm, activeConnection = activeConnection)
+        SignalTrustRail(live = live, bpm = bpm, activeConnection = activeConnection,
+            activeIsWhoop = activeIsWhoop, ouraBatteryPct = ouraBatteryPct)
         }
 
         // Max HR + the top-zone entry threshold (read-only; manage coaching in Automations).
@@ -370,11 +393,20 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
             LaunchedEffect(w.startMs) {
                 while (true) { nowMs = System.currentTimeMillis(); delay(1000) }
             }
-            val elapsedS = ((nowMs - w.startMs) / 1000).coerceAtLeast(0)
+            val elapsedS = ActiveWorkoutClock.activeElapsedSeconds(
+                startMs = w.startMs, pausedAtMs = w.pausedAtMs,
+                pausedDurationMs = w.pausedDurationMs, nowMs = nowMs,
+            )
             NoopCard(tint = Palette.effortColor) {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                         Text(uiString(R.string.l10n_live_screen_w_sport_name_uppercase_e59bc678, w.sport.name.uppercase()), style = NoopType.overline, color = Palette.statusCritical)
+                        // A frozen clock alone is ambiguous with a STALLED one, so say which it is. Reuses
+                        // the string #1533 already localized rather than minting new copy for a tag.
+                        if (w.pausedAtMs != null) {
+                            Spacer(Modifier.width(Metrics.space8))
+                            Text(uiString(R.string.workout_action_paused), style = NoopType.overline, color = Palette.textSecondary)
+                        }
                         Spacer(Modifier.weight(1f))
                         Text(
                             // Shared clock: M:SS up to an hour, H:MM:SS past it (so a long session reads
@@ -397,14 +429,30 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
                             StatTile(modifier = Modifier.weight(1f), label = uiString(R.string.l10n_live_screen_pace_7a9a6226), value = w.paceSecPerKm?.let { livePace(it, unitSystem) } ?: "—")
                         }
                     }
-                    Button(
-                        onClick = { confirmingEnd = true },
-                        modifier = Modifier.fillMaxWidth(),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Palette.statusCritical, contentColor = Palette.surfaceBase,
-                        ),
-                    ) { Text(uiString(R.string.l10n_live_screen_end_workout_3e8d6238), style = NoopType.captionNumber) }
+                    // The card used to offer End and nothing else, so the only IRREVERSIBLE control was the
+                    // one reachable without opening the live overlay, while Pause — the reversible one —
+                    // was not. One toggle: a paused session has exactly one sensible next action.
+                    Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap), modifier = Modifier.fillMaxWidth()) {
+                        Button(
+                            onClick = { viewModel.toggleWorkoutPause() },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                        ) {
+                            Text(
+                                if (w.pausedAtMs != null) uiString(R.string.workout_action_resume)
+                                else uiString(R.string.workout_action_pause),
+                                style = NoopType.captionNumber,
+                            )
+                        }
+                        Button(
+                            onClick = { confirmingEnd = true },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Palette.statusCritical, contentColor = Palette.surfaceBase,
+                            ),
+                        ) { Text(uiString(R.string.l10n_live_screen_end_workout_3e8d6238), style = NoopType.captionNumber) }
+                    }
                 }
             }
             if (confirmingEnd) {
@@ -493,7 +541,9 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
         // Strap picker — choose the model before scanning so we look for exactly one device family.
         // Shown whenever we're not actively streaming, so a user with both a WHOOP 4 and a 5/MG can
         // switch between them (it used to hide once `bonded`, which stuck after the first pairing).
-        if (!(live.connected && live.bonded)) {
+        // WHOOP only (#2305): `connected && bonded` is never true for a ring, so without the brand gate the
+        // WHOOP picker was shown MORE readily under a ring than under a strap.
+        if (activeIsWhoop && !(live.connected && live.bonded)) {
             // Two siblings (picker Row + optional 5/MG guidance) that the eager column spaced by 20dp —
             // an inner `Column(spacedBy(20.dp))` reproduces that gap inside the single lazy item.
             item {
@@ -515,8 +565,7 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
             // nothing while it's still paired in the official WHOOP app. Shown the moment 5/MG is picked.
             if (selectedModel == WhoopModel.WHOOP5_MG) {
                 Text(
-                    uiString(R.string.l10n_live_screen_whoop_5_0_mg_pairs_with_b93143f2) +
-                        "the official WHOOP app and fully close that app, then Connect again.",
+                    uiString(R.string.l10n_live_screen_whoop_5_0_mg_pairs_with_b93143f2),
                     style = NoopType.footnote,
                     color = Palette.textSecondary,
                     modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
@@ -526,7 +575,10 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
             }
         }
 
-        // Controls.
+        // Controls. Connect / Buzz / Disconnect are the WHOOP path (`viewModel.connect()` →
+        // `ble.connect(selectedModel)`), so WHOOP only (#2305); a ring gets its own row; any other brand
+        // keeps the "Manage devices" row alone.
+        if (activeIsWhoop) {
         item {
         Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap), modifier = Modifier.fillMaxWidth()) {
             // Compact, single-line labels: with three weight(1f) buttons in a row, the default
@@ -612,14 +664,25 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
             }
         }
         }
+        } else if (activeIsOura) {
+        item {
+        RingControls(phase = ringPhase, streaming = live.connected && live.streamingLiveHR,
+            onReconnect = { viewModel.reconnectOuraRing() })
+        }
+        }
 
         // Manual "Sync now" — kick a historical offload on demand instead of waiting for the 15-min
-        // periodic timer (#93). Only meaningful once bonded (the offload needs the command channel), and
-        // disabled mid-session so a double-tap can't fight the in-flight offload — viewModel.syncNow()
-        // also no-ops in that case, this is just the matching UI state. While syncing, the button shows
+        // periodic timer (#93). Needs a strap that can actually hand over history, and disabled
+        // mid-session so a double-tap can't fight the in-flight offload — viewModel.syncNow() also
+        // no-ops in that case, this is just the matching UI state.
+        //
+        // `bonded` alone was NOT that condition and this comment used to say it was: the live-HR path
+        // sets it for a 5/MG that has never completed a handshake, so the button appeared, was pressed,
+        // and beginBackfill declined it in silence. historyReady is the client's own precondition, so
+        // the button can only vanish where the offload would have been refused anyway. While syncing, the button shows
         // an INDETERMINATE spinner (NEVER a percent — total pending records are unknowable from the
         // protocol); the "Syncing your strap history… N chunks pulled" line above carries the live count.
-        if (live.bonded) {
+        if (live.bonded && live.historyReady) {
             item {
             OutlinedButton(
                 onClick = { viewModel.syncNow() },
@@ -753,7 +816,16 @@ private fun ActiveBandRow(name: String, onManageDevices: () -> Unit) {
 }
 
 @Composable
-private fun ConsoleHeader(live: LiveState, activeConnection: Boolean, ouraWear: OuraWearState? = null) {
+private fun ConsoleHeader(
+    live: LiveState,
+    activeConnection: Boolean,
+    ouraWear: OuraWearState? = null,
+    /** Resolved by the caller (#2075), so the charge below belongs to the device being named.
+     *  NOT defaulted: a default would let a new call site silently fall back to WHOOP state, which is
+     *  precisely the bug this fixes. */
+    activeIsWhoop: Boolean,
+    ouraBatteryPct: Int?,
+) {
     NoopCard(padding = 14.dp) {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             // Badges row — pill + connection-mode badge + a live SYNCING badge during an offload.
@@ -787,7 +859,11 @@ private fun ConsoleHeader(live: LiveState, activeConnection: Boolean, ouraWear: 
                 // Charging bolt next to the battery % when the strap reports it's charging (PR #568 reimpl).
                 HeaderStat(
                     "Battery",
-                    live.batteryPct?.let { "${it.toInt()}%" } ?: "—",
+                    // The ACTIVE device's charge. A non-WHOOP active device never falls back to the
+                    // strap's number: an em dash says "not reported", where the strap's charge under
+                    // the ring's name is a confident lie, and was the reported bug (#2075).
+                    LiveConsoleReadout.batteryPercent(activeIsWhoop, live.batteryPct, ouraBatteryPct)
+                        ?.let { "$it%" } ?: "—",
                     charging = live.charging == true,
                 )
                 HeaderStat("Worn", wornLabel(live, activeConnection, ouraWear))
@@ -877,6 +953,92 @@ private fun OfflineConnectCallout(scanning: Boolean, onConnect: () -> Unit) {
     }
 }
 
+// MARK: - Ring controls (#2305)
+
+/**
+ * One line per ring link phase, shared by the console centrepiece caption, the above-the-fold callout and
+ * the controls row so the three never disagree about what the ring is doing. Twin of Swift `LiveRingCopy`.
+ */
+private fun ringStatusCopy(phase: com.noop.ble.OuraLiveSource.LinkPhase, streaming: Boolean): String = when (phase) {
+    com.noop.ble.OuraLiveSource.LinkPhase.DISCONNECTED -> uiString(R.string.l10n_live_screen_ring_not_connected_c2418ea8)
+    com.noop.ble.OuraLiveSource.LinkPhase.CONNECTING -> uiString(R.string.l10n_live_screen_connecting_to_the_ring_af2900ea)
+    com.noop.ble.OuraLiveSource.LinkPhase.AUTHENTICATING -> uiString(R.string.l10n_live_screen_connected_authenticating_fa9da040)
+    com.noop.ble.OuraLiveSource.LinkPhase.AUTHENTICATED ->
+        if (streaming) uiString(R.string.l10n_live_screen_live_heart_rate_is_flowing_from_f7f6c4fe)
+        else uiString(R.string.l10n_live_screen_connected_waiting_for_live_heart_rate_01d216bb)
+}
+
+/** Drops the current ring link, if any, and connects again — `OuraLiveSource.reconnect()` through the
+ *  coordinator, so it can only reach the ring that is the live source. Enabled in every phase: a ring
+ *  parked in AUTHENTICATING (#2303) is exactly the case this exists for. */
+@Composable
+private fun RingReconnectButton(onReconnect: () -> Unit) {
+    Button(
+        onClick = onReconnect,
+        modifier = Modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = Palette.accent,
+            contentColor = Palette.surfaceBase,
+        ),
+    ) {
+        Icon(
+            Icons.Filled.Refresh,
+            contentDescription = null,
+            modifier = Modifier.size(18.dp).padding(end = 4.dp),
+        )
+        Text(
+            uiString(R.string.l10n_live_screen_reconnect_ring_3111ab8f),
+            style = NoopType.captionNumber,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Clip,
+        )
+    }
+}
+
+/** The ring's above-the-fold card while it is not yet authenticated: the honest phase line and the only
+ *  ring reconnect in the app. Same slot and shape as [OfflineConnectCallout], which is WHOOP-only. */
+@Composable
+private fun RingConnectCallout(phase: com.noop.ble.OuraLiveSource.LinkPhase, onReconnect: () -> Unit) {
+    NoopCard(tint = Palette.accent) {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(
+                    Icons.Filled.Bluetooth,
+                    contentDescription = null,
+                    tint = Palette.accent,
+                    modifier = Modifier.size(20.dp),
+                )
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(ringStatusCopy(phase, streaming = false), style = NoopType.headline, color = Palette.textPrimary)
+                    Text(
+                        uiString(R.string.l10n_live_screen_reconnect_drops_the_current_link_if_afc27801),
+                        style = NoopType.subhead,
+                        color = Palette.textSecondary,
+                    )
+                }
+            }
+            RingReconnectButton(onReconnect)
+        }
+    }
+}
+
+/** The ring's row in the controls slot: one primary action. No Buzz (the ring has no haptic) and no
+ *  Disconnect (a stopped ring source would not reconnect for the night; Devices is where a ring is
+ *  deactivated). */
+@Composable
+private fun RingControls(phase: com.noop.ble.OuraLiveSource.LinkPhase, streaming: Boolean, onReconnect: () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap), modifier = Modifier.fillMaxWidth()) {
+        Text(ringStatusCopy(phase, streaming), style = NoopType.footnote, color = Palette.textSecondary)
+        RingReconnectButton(onReconnect)
+    }
+}
+
 /** #56: a non-WHOOP live source (the Oura ring, and on Android any external HR source that drives
  *  [LiveState.streamingLiveHR]) that is connected and actively streaming live HR. It streams without a
  *  WHOOP encrypted bond, so `bonded`/`activeConnection` never trip — which left the console reading
@@ -926,7 +1088,10 @@ private fun lastSyncLabel(live: LiveState): String =
 // MARK: - Body console (focal HR ring + live physiology)
 
 @Composable
-private fun BodyConsole(live: LiveState, bpm: Int?, activeConnection: Boolean, zone: Int, hrMax: Int) {
+private fun BodyConsole(
+    live: LiveState, bpm: Int?, activeConnection: Boolean, zone: Int, hrMax: Int,
+    activeIsOura: Boolean, ringPhase: com.noop.ble.OuraLiveSource.LinkPhase,
+) {
     // The liquid hero CARD: a translucent near-black that floats over the day-of-sky so the HR vessel + the
     // white count-up number stay crisp — the card does the contrast work, not a muted sky. A rounded 26
     // corner + a faint white hairline give it the frosted-glass edge of the liquid Today heroCard
@@ -940,7 +1105,8 @@ private fun BodyConsole(live: LiveState, bpm: Int?, activeConnection: Boolean, z
             .padding(20.dp),
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
-            HeartReadout(live = live, bpm = bpm, activeConnection = activeConnection, zone = zone, hrMax = hrMax)
+            HeartReadout(live = live, bpm = bpm, activeConnection = activeConnection, zone = zone, hrMax = hrMax,
+                activeIsOura = activeIsOura, ringPhase = ringPhase)
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -953,7 +1119,10 @@ private fun BodyConsole(live: LiveState, bpm: Int?, activeConnection: Boolean, z
 }
 
 @Composable
-private fun HeartReadout(live: LiveState, bpm: Int?, activeConnection: Boolean, zone: Int, hrMax: Int) {
+private fun HeartReadout(
+    live: LiveState, bpm: Int?, activeConnection: Boolean, zone: Int, hrMax: Int,
+    activeIsOura: Boolean, ringPhase: com.noop.ble.OuraLiveSource.LinkPhase,
+) {
     // Tint by the live HR zone when streaming, the Effort world otherwise — the workouts/live colour world
     // (UNCHANGED from the hand-drawn ring this replaced: same zone→colour math, same value-sampled tint).
     val tint = when {
@@ -1013,7 +1182,11 @@ private fun HeartReadout(live: LiveState, bpm: Int?, activeConnection: Boolean, 
             }
         }
         Text(
-            signalTrustSummary(live, activeConnection),
+            // A ring reads its OWN phase (#2305, #2304): `live.connected` is whichever source last wrote
+            // it, and under a ring parked in the nonce handshake it read "Connected, waiting for a
+            // streaming state" for an hour (#2303).
+            if (activeIsOura) ringStatusCopy(ringPhase, streaming = live.connected && live.streamingLiveHR)
+            else signalTrustSummary(live, activeConnection),
             style = NoopType.footnote,
             color = Palette.textTertiary,
             textAlign = TextAlign.Center,
@@ -1130,8 +1303,14 @@ private fun LiveProofMetric(modifier: Modifier, label: String, value: String, ti
 // MARK: - Signal Trust rail
 
 @Composable
-private fun SignalTrustRail(live: LiveState, bpm: Int?, activeConnection: Boolean) {
-    val tiles = signalTiles(live, bpm, activeConnection)
+private fun SignalTrustRail(
+    live: LiveState,
+    bpm: Int?,
+    activeConnection: Boolean,
+    activeIsWhoop: Boolean,
+    ouraBatteryPct: Int?,
+) {
+    val tiles = signalTiles(live, bpm, activeConnection, activeIsWhoop, ouraBatteryPct)
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
         SectionHeader(title = uiString(R.string.l10n_live_screen_signal_trust_4a91fe00), overline = "Proof that the console is current")
         // Two tiles per row (a LazyVerticalGrid can't live inside the scrolling ScreenScaffold —
@@ -1155,7 +1334,13 @@ private data class SignalTile(
     val tint: Color,
 )
 
-private fun signalTiles(live: LiveState, bpm: Int?, activeConnection: Boolean): List<SignalTile> = listOf(
+private fun signalTiles(
+    live: LiveState,
+    bpm: Int?,
+    activeConnection: Boolean,
+    activeIsWhoop: Boolean,
+    ouraBatteryPct: Int?,
+): List<SignalTile> = listOf(
     SignalTile(
         "Heart rate",
         bpm?.let { "$it bpm" } ?: "Missing",
@@ -1197,9 +1382,14 @@ private fun signalTiles(live: LiveState, bpm: Int?, activeConnection: Boolean): 
     ),
     SignalTile(
         "Battery",
-        live.batteryPct?.let { "${it.toInt()}%" } ?: "Unknown",
-        if (live.charging == true) "Charging" else "Last reported by strap",
-        batteryTint(live.batteryPct),
+        LiveConsoleReadout.batteryPercent(activeIsWhoop, live.batteryPct, ouraBatteryPct)
+            ?.let { "$it%" } ?: "Unknown",
+        // "by strap" only when a strap is what reported it (#2075).
+        if (live.charging == true) "Charging"
+        else if (activeIsWhoop) "Last reported by strap" else "Last reported by the ring",
+        batteryTint(
+            LiveConsoleReadout.batteryPercent(activeIsWhoop, live.batteryPct, ouraBatteryPct)?.toDouble(),
+        ),
     ),
     // Wear is only trustworthy on a live link: `worn` defaults true and is only updated by
     // WRIST_ON/OFF events, so while OFFLINE it would read a false-green "On wrist". Gate value + tint

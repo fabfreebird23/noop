@@ -63,7 +63,7 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
     val profile = remember { ProfileStore.from(context.applicationContext) }
     // Effort display scale (#268) — routes the live Effort read-out so it matches every other surface.
     val effortScale = UnitPrefs.effortScale(context)
-    val unitSystem = UnitPrefs.system(context)
+    val unitSystem = UnitPrefs.distanceSystem(context)
     val bpm by vm.bpm.collectAsStateWithLifecycle()
     val activeWorkout by vm.activeWorkout.collectAsStateWithLifecycle()
     // Additive: instantaneous speed/cadence/power from a connected standard fitness sensor (RSC/CSC/CPS),
@@ -102,12 +102,16 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
     // Guards the destructive End action behind a confirm (#517) — a stray tap on the full-width
     // button used to end the workout instantly with no way back.
     var showEndConfirm by remember { mutableStateOf(false) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
 
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(w.startMs) {
         while (true) { nowMs = System.currentTimeMillis(); delay(1000) }
     }
-    val elapsedS = ((nowMs - w.startMs) / 1000).coerceAtLeast(0)
+    val elapsedS = ActiveWorkoutClock.activeElapsedSeconds(
+        startMs = w.startMs, pausedAtMs = w.pausedAtMs,
+        pausedDurationMs = w.pausedDurationMs, nowMs = nowMs,
+    )
 
     // A scenic Effort-tinted backdrop behind the whole in-exercise screen — the live workout reads as
     // an Effort-world hero, not a flat panel.
@@ -145,7 +149,11 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
                         .padding(horizontal = 10.dp, vertical = 5.dp),
                 ) {
                     Box(Modifier.size(7.dp).clip(CircleShape).background(Palette.metricRose))
-                    Overline("Recording workout", color = Palette.metricRose)
+                    Overline(
+                        if (w.pausedAtMs != null) uiString(R.string.workout_action_paused)
+                        else uiString(R.string.workout_action_recording),
+                        color = Palette.metricRose,
+                    )
                 }
             }
 
@@ -157,7 +165,10 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
             ) {
                 Overline("Time", color = Palette.textSecondary)
                 Text(
-                    String.format("%d:%02d", elapsedS / 60, elapsedS % 60),
+                    // elapsedClock, not a local %d:%02d — that one had no hour roll-over, so this hero
+                    // read "90:00" for a 90-minute session while every card that opens this screen read
+                    // "1:30:00". The iOS twin had the identical local formatter and is fixed alongside.
+                    elapsedClock(elapsedS),
                     style = NoopType.number(56f), color = Palette.textPrimary,
                 )
             }
@@ -205,14 +216,21 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
             // and the button stays reachable by scrolling when the content overflows.
             Spacer(Modifier.height(12.dp))
 
-            Button(
-                onClick = { showEndConfirm = true },
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(vertical = 14.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Palette.statusCritical, contentColor = Palette.surfaceBase,
-                ),
-            ) { Text(uiString(R.string.l10n_live_workout_screen_end_workout_3e8d6238), style = NoopType.headline) }
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick = { vm.toggleWorkoutPause() }, modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(vertical = 14.dp),
+                ) { Text(if (w.pausedAtMs != null) uiString(R.string.workout_action_resume) else uiString(R.string.workout_action_pause), style = NoopType.headline) }
+                Button(
+                    onClick = { showDeleteConfirm = true }, modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(vertical = 14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Palette.statusCritical),
+                ) { Text(uiString(R.string.workout_action_delete), style = NoopType.headline) }
+                Button(
+                    onClick = { showEndConfirm = true }, modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(vertical = 14.dp),
+                ) { Text(uiString(R.string.workout_action_end), style = NoopType.headline) }
+            }
         }
     }
 
@@ -252,19 +270,39 @@ fun LiveWorkoutScreen(vm: AppViewModel, onClose: () -> Unit) {
             },
         )
     }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            containerColor = Palette.surfaceOverlay,
+            title = { Text(uiString(R.string.workout_delete_title), style = NoopType.title2, color = Palette.textPrimary) },
+            text = { Text(uiString(R.string.workout_delete_message), style = NoopType.subhead, color = Palette.textSecondary) },
+            confirmButton = {
+                TextButton(onClick = { showDeleteConfirm = false; vm.discardWorkout(); onClose() }) {
+                    Text(uiString(R.string.workout_action_delete), style = NoopType.body, color = Palette.statusCritical)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) {
+                    Text(uiString(R.string.l10n_live_workout_screen_cancel_77dfd213), style = NoopType.body, color = Palette.textSecondary)
+                }
+            },
+        )
+    }
 }
 
 /**
  * Additive readout for a connected standard fitness sensor (a footpod / bike speed-cadence sensor / power
  * meter) feeding RSC/CSC/CPS ALONGSIDE heart rate. Only the fields the sensor actually sent render — each
  * tile is dropped when its value is absent, and the whole row is hidden when nothing is present, so a plain
- * HR-only workout looks exactly as before. Honest units: speed km/h, cadence per-minute (steps for running
- * / rpm for cycling), power watts. Reuses the same metric tile as the HR stats grid; tinted with the Effort
+ * HR-only workout looks exactly as before. Speed follows the exercise-distance preference; cadence stays
+ * per-minute and power in watts. Reuses the same metric tile as the HR stats grid; tinted with the Effort
  * world so it reads as part of the hero. Nothing here touches HR / zone / effort.
  */
 @Composable
 private fun SensorRow(sensor: StandardHrSource.SensorMetrics) {
-    val speed = StandardHrSource.formatSpeedKmh(sensor.speedKmh)
+    val unitSystem = UnitPrefs.distanceSystem(LocalContext.current)
+    val speed = UnitFormatter.speedFromKilometersPerHour(sensor.speedKmh, unitSystem)
     val cadence = StandardHrSource.formatCadence(sensor.cadence)
     val power = StandardHrSource.formatPowerWatts(sensor.powerWatts)
     if (speed == null && cadence == null && power == null) return
@@ -272,7 +310,7 @@ private fun SensorRow(sensor: StandardHrSource.SensorMetrics) {
         Overline("Sensor")
         Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap), modifier = Modifier.fillMaxWidth()) {
             if (speed != null) {
-                StatTile(modifier = Modifier.weight(1f), label = uiString(R.string.l10n_live_workout_screen_speed_2d2cb022), value = "$speed km/h", accent = Palette.effortColor)
+                StatTile(modifier = Modifier.weight(1f), label = uiString(R.string.l10n_live_workout_screen_speed_2d2cb022), value = speed, accent = Palette.effortColor)
             }
             if (cadence != null) {
                 StatTile(modifier = Modifier.weight(1f), label = uiString(R.string.l10n_live_workout_screen_cadence_68af11f0), value = "$cadence/min", accent = Palette.effortColor)

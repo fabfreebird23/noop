@@ -30,6 +30,7 @@
   <a href="https://www.reddit.com/r/NoopBand/">👽&nbsp;Reddit</a> ·
   <a href="#features">Features</a> ·
   <a href="docs/PROTOCOL.md">Protocol</a> ·
+  <a href="docs/RAW_DATA_CAPTURE.md">Raw data capture</a> ·
 </p>
 
 <p align="center">
@@ -95,7 +96,11 @@ Pre-built apps you can run right now:
 
 Prefer to build it yourself? See [`docs/BUILD.md`](docs/BUILD.md).
 
-Everything runs **offline**. The only feature that ever uses the network is the optional **AI Coach**, and only with your own API key.
+Strap collection and analytics work **offline**. NOOP operates no server, account or telemetry service.
+The release check is **on by default** and sends no health data; turn off **Check automatically**
+in Settings → About to stop automatic checks. Optional features can send data when configured.
+See the canonical [network and privacy inventory](docs/PRIVACY_SECURITY.md#11-network-paths-canonical-inventory)
+for their defaults, destinations and payloads, including platform services such as Apple's route map.
 
 ---
 
@@ -105,8 +110,9 @@ own device in SQLite, imports your existing WHOOP and Apple Health history, and
 computes recovery, strain, HRV, and sleep **locally**, with no WHOOP account and
 no WHOOP cloud.
 
-There is also **experimental** support for the **Oura Ring (Gen 3)** — real overnight data from a ring
-you own, on iOS and Android, with real limits. See [Oura ring support](#oura-ring-support).
+There is also **experimental** support for the **Oura Ring** (measured on a Gen 3; a Ring 5 is
+reported working over the same path) — real overnight data from a ring you own, on iOS and Android,
+with real limits. See [Oura ring support](#oura-ring-support).
 
 It is built on prior community interoperability work and exists for one
 reason: to let someone who owns a WHOOP strap read **their own biometric data**
@@ -187,7 +193,7 @@ shared cross-platform code.
 | **Data Sources** | One-tap import of a WHOOP CSV export, an Apple Health export, or a **nutrition CSV** (Cronometer / MacroFactor), plus live-strap status. "Bring your history in once, then it's yours." |
 | **Notifications** | Configure local notifications and thresholds (`Strand/Data/NotificationSettingsStore.swift`). |
 | **Automations** | Turn the strap's physical inputs and live biometrics into Mac actions — all on-device (see below). |
-| **Coach** | An optional **AI Coach** you can ask about your data in plain language. It's the one feature that can ever use the network: off until you add your own key — Anthropic, OpenAI, or any OpenAI-compatible endpoint including a local/self-hosted model (Ollama, LM Studio) — and it sends only a short text summary of recent metrics plus your question, never raw streams or identifiers. With a local model the conversation never leaves your machine. Available on macOS, Android, and iOS. See [`docs/PRIVACY_SECURITY.md`](docs/PRIVACY_SECURITY.md). |
+| **Coach** | An optional **AI Coach** you can ask about your data in plain language. It is off until you add your own key — Anthropic, OpenAI, or any OpenAI-compatible endpoint including a local/self-hosted model (Ollama, LM Studio) — and it sends only a short text summary of recent metrics plus your question, never raw streams or identifiers. With a local model the conversation never leaves your machine. Available on macOS, Android, and iOS. See [`docs/PRIVACY_SECURITY.md`](docs/PRIVACY_SECURITY.md). |
 | **Settings** | Profile, preferences, **step calibration** (tune the stride/step estimate to your own walking), unit choices, the in-app **What's new** changelog, and an opt-in **Experimental** section (WHOOP 5/MG protocol probes). On **iOS**, also **Export for Shortcuts** — a HealthKit-free path that hands your metrics to Apple Health via the Shortcuts app. |
 
 There is also a **menu-bar extra** (`Strand/MenuBar/MenuBarContent.swift`) with a
@@ -244,7 +250,7 @@ NOOP is an independent, **experimental** project — capable, but a work in prog
 |---|---|
 | **WHOOP 4.0** | ✅ The tested, supported path. Live HR, recovery, strain, sleep, history offload — the full experience. (v1.95 also unlocked sleep + recovery on the newer "v25" 4.0 firmware layout that earlier versions could only read live HR from.) |
 | **WHOOP 5.0 / MG** | 🧪 **Live heart rate works** (confirmed on real hardware). Pick "WHOOP 5.0 / MG" before connecting — and see the pairing note below, because you can't just scan for it. Deeper 5/MG metrics (recovery, strain, sleep) are still being mapped; there's an opt-in **Settings → Experimental** toggle for 5/MG owners who want to help document the protocol. |
-| **Oura Ring (Gen 3)** | 🧪 **Experimental, not a supported strap.** Pairs on **iOS / Android only** and reads real overnight data — heart rate, sleep stages, skin temperature, SpO₂, motion — but a ring-only day does **not** produce a recovery/strain score yet, and some metrics are permanently out of reach. See **Oura ring support** below before you expect anything from it. |
+| **Oura Ring (Gen 3 measured; Ring 5 reported)** | 🧪 **Experimental, not a supported strap.** Pairs on **iOS / Android only** and reads real overnight data — heart rate, sleep stages, skin temperature, SpO₂, motion. The ring's night feeds the scorer, so a ring-only day gets a **Sleep** and a **Strain** score but **no Recovery** (it needs an HRV baseline the ring cannot provide), and some metrics are permanently out of reach. See **Oura ring support** below before you expect anything from it. |
 
 > ### WHOOP 5.0 / MG analysis limits
 >
@@ -296,31 +302,42 @@ The app always tells you what's live now versus still building, both in onboardi
 
 ### Oura ring support
 
-NOOP has **experimental, clean-room** support for the **Oura Ring (Gen 3)**. It is not a supported
-strap and it is not on the same footing as a WHOOP 4.0: it lives behind the experimental-device path
-in the pairing wizard, and parts of it are permanently limited by what the ring will hand over. It
-reads real data from a ring you own, over Bluetooth, with no Oura account and no Oura cloud — the
-same rules as everything else here.
+NOOP has **experimental, clean-room** support for the **Oura Ring**. It is not a supported strap and
+it is not on the same footing as a WHOOP 4.0: it lives behind the experimental-device path in the
+pairing wizard, and parts of it are permanently limited by what the ring will hand over. It reads real
+data from a ring you own, over Bluetooth, with no Oura account and no Oura cloud — the same rules as
+everything else here.
+
+**Which ring.** Every row in the table below was measured on a **Gen 3**. The framing, the auth
+handshake and the event-record dictionary are the same across Gen 3, Ring 4 and Ring 5
+([`docs/OURA_PROTOCOL.md` §7.2](docs/OURA_PROTOCOL.md)); what changes per generation is the MTU, which
+characteristics are discovered and the live-HR enable command set — verified on Gen 3, expected the same
+on 4/5. A **Ring 5** has been reported working over that path (#2075: pairing/auth, live HR and
+inter-beat intervals, skin temperature, battery), which is marked per row as *Ring 5 ✓*. Nothing has
+been run on a **Ring 4** yet. The two rows marked *not possible from this data* are about what the ring
+banks, not which ring banks it, so they hold across the three until a newer ring is shown transmitting
+true beat-to-beat intervals.
 
 > **Not affiliated with Oura.** Independent interoperability work with hardware you own. "Oura" is
 > used only to identify that hardware. NOOP does not use, decompile, or redistribute any Oura app
 > code, and does not bypass any login, paywall, or DRM.
 
-**📱 iOS / Android only.** Pairing an Oura ring **does not work on macOS** — `connect()` is issued
-cleanly and no CoreBluetooth callback ever arrives, so it hangs silently rather than failing. This is
-reproducible and independent of the pairing method. Documented in
+**⚠️ macOS pairing needs a factory-reset ring.** Pairing an Oura ring that is still Bluetooth-bonded
+to a phone (i.e. its only prior bond is with the official Oura app) reproducibly hangs on macOS —
+`connect()` is issued cleanly and no CoreBluetooth callback ever arrives. Factory-resetting the ring
+from the official Oura app first, then pairing with NOOP on macOS, works. Documented in
 [`docs/OURA_PROTOCOL.md` §3.8](docs/OURA_PROTOCOL.md).
 
 | Input / output | Status |
 |---|---|
-| **Overnight heart rate** | ✅ Works. Reconstructed from the ring's banked inter-beat intervals; validated against a WHOOP strap worn the same night. |
+| **Overnight heart rate** | ✅ Works. Reconstructed from the ring's banked inter-beat intervals; validated against a WHOOP strap worn the same night. *Ring 5 ✓* (intervals stream). |
 | **Sleep stages & timeline** | ✅ Works. Uses the **ring's own** hypnogram rather than re-staging it, so the stages are Oura's, shown in NOOP's Sleep screen. |
-| **Skin temperature** | ✅ Works. |
+| **Skin temperature** | ✅ Works. *Ring 5 ✓* |
 | **Motion** | ✅ Stored. |
 | **Live wear status** | ✅ Works — NOOP can tell whether the ring is on your finger. |
-| **Live heart rate** | 🟡 Partial. Only one of the ring's channels ever arrives near-live, and it is quality-filtered, so it does not tile continuously the way a chest-strap or WHOOP feed does. |
-| **SpO₂** | 🟡 Raw channel captured and stored; a **calibrated percentage** is still open (~47% of decoded samples read above 100%, which no ground truth yet explains — so NOOP does **not** surface a Blood Oxygen number it can't stand behind). |
-| **Recovery / strain score on a ring-only day** | 🚧 **Not yet.** The ring's night is stored and visible, but it does not currently feed the scorer, so a ring-only day shows no recovery or strain. This is the single biggest gap and it is actively being worked on. |
+| **Live heart rate** | 🟡 Partial. Only one of the ring's channels ever arrives near-live, and it is quality-filtered, so it does not tile continuously the way a chest-strap or WHOOP feed does. *Ring 5 ✓* |
+| **SpO₂** | 🟡 Mostly there. The ring's own overnight SpO₂ percentage is decoded, stored and drawn on the Deep Timeline, and NOOP can switch the ring's SpO₂ sensing on from its own Test Centre (iOS/macOS) — no Oura account needed. A nightly **Blood Oxygen** number (the per-sample ceiling-at-100 mean the wire's positive bias calls for) is available behind the SpO₂ candidate display toggle in Settings, default off; it has round-matched the value the Oura app displays on every paired night measured so far (4 of 4), which is why it is still labelled a candidate rather than promoted to a scored metric. |
+| **Recovery / strain score on a ring-only day** | 🟡 **Sleep and Strain, not Recovery.** The ring's own hypnogram feeds the scorer (#1183), so a ring-only day gets a Sleep score and a Strain score (from the ring's banked and live HR — light on exercise HR, which stays server-gated, see the last row). **Recovery does not score:** it requires an HRV baseline, and the ring's banked intervals cannot give one (see the HRV row), so the Today screen shows no Recovery on a ring-only day. |
 | **Step count** | 🚧 Estimated only, and not shown as a step count. The ring does **not** transmit a step total NOOP can read; what exists is a research estimate derived from activity intensity, which over-reads badly on very active days. |
 | **HRV (RMSSD / SDNN) and the Rhythm screen** | ❌ **Not possible from this data.** The ring banks its intervals in records rather than sending true beat-to-beat values, which inflates HRV spread beyond anything physiological. NOOP **refuses** to show a number here rather than showing a plausible-looking wrong one. |
 | **Respiratory rate** | ❌ **Not possible from this data**, for the same reason — it is derived from beat timing, and the ring's banked intervals carry no breathing signal (shuffling them at random produces the identical answer). The Oura app shows respiration because it computes it from data the ring does not transmit. |
@@ -521,9 +538,16 @@ Every arrow stays on your machine.
 
 ## Privacy
 
-**Offline by design.** NOOP has no server, no telemetry, and no account. Your
-strap data, imports, and computed metrics live in a local SQLite database on your
-device and never leave it.
+**Offline by default.** NOOP has no server, no telemetry, and no account. Your strap data, imports,
+and computed metrics live in a local SQLite database on your device. They leave only through an
+export or optional network feature you deliberately configure, including Android's default-off
+Experimental one-way push to your own endpoint; see
+[`docs/PRIVACY_SECURITY.md`](docs/PRIVACY_SECURITY.md).
+
+The [canonical network inventory](docs/PRIVACY_SECURITY.md#11-network-paths-canonical-inventory)
+explains what each feature sends and how to control it. The default-on release check sends no
+health data and never installs an update. AI requests can include health summaries with your
+consent; exports and platform services have their own boundaries.
 
 ---
 
@@ -596,6 +620,7 @@ That's it — copy away.
 - [`CHANGELOG.md`](CHANGELOG.md) — release history and what to expect (also shown in-app under **What's new**).
 - [`DISCLAIMER.md`](DISCLAIMER.md) — trademark, interoperability, and medical/legal notice.
 - [`ATTRIBUTION.md`](ATTRIBUTION.md) — full credits and licensing notes.
+- [`docs/SCOPE.md`](docs/SCOPE.md) — which WHOOP-app features stay out of scope (and why) versus their local, on-device equivalents.
 - [`project.yml`](project.yml) — XcodeGen project definition (source of `Strand.xcodeproj`).
 
 ---

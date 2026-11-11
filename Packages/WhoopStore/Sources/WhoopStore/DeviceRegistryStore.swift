@@ -23,9 +23,23 @@ public struct DeviceRegistryStore: Sendable {
         }
     }
 
+    /// The one query that answers "which strap is active".
+    ///
+    /// Shared rather than retyped because the answer is load-bearing beyond this accessor: the WHOOP 5
+    /// R-R policy resolves a legacy `my-whoop` alias through it, so this decides whose unit rules a
+    /// wearer's older history is judged by. Two copies of that could drift into disagreeing about which
+    /// strap a night belongs to, and the Android twin already keeps it in exactly one place
+    /// (`DeviceRegistryDao`).
+    ///
+    /// `LIMIT 1` with no `ORDER BY` is deliberate but only safe because single-active is an invariant
+    /// the writers maintain (demote every active row, then promote one, in that order). If two rows were
+    /// ever active at once the pick would be arbitrary, so the invariant is what makes this total, not
+    /// the query.
+    static let activeDeviceIdSQL = "SELECT id FROM pairedDevice WHERE status = 'active' LIMIT 1"
+
     public func activeDeviceId() throws -> String? {
         try dbQueue.read { db in
-            try String.fetchOne(db, sql: "SELECT id FROM pairedDevice WHERE status = 'active' LIMIT 1")
+            try String.fetchOne(db, sql: Self.activeDeviceIdSQL)
         }
     }
 
@@ -108,6 +122,11 @@ public struct DeviceRegistryStore: Sendable {
         }
     }
 
+    /// Suffix of the COMPUTED sibling every device id owns — the engine writes its derived days, detected
+    /// workouts and metric series under `<deviceId>-noop`. Spelled here so the adoption can carry it with
+    /// the pairing; the Kotlin twin is `WhoopRepository.computedDeviceId`.
+    public static let computedSuffix = "-noop"
+
     /// Every table whose rows are keyed by `deviceId` (the per-device sample/derived tables). This is
     /// the authoritative list `deleteAllData` clears — kept in sync with the `deviceId`-keyed tables in
     /// `Database.swift`. The `pairedDevice` registry row itself is NOT here (a delete-data operation
@@ -132,9 +151,12 @@ public struct DeviceRegistryStore: Sendable {
         // "delete all of this device's data" leaves the raw waveform behind (the same privacy defect
         // this list exists to close).
         "ppgWaveformSample",
+        // v48-ecg-waveform (#2847): the banked MG ECG records are deviceId-keyed per-second rows like
+        // every stream above, and they are the most personal of them, so "delete all of this device's
+        // data" must clear them or a user's ECG readings survive the delete.
+        "ecgWaveformSample",
         // v28-raw-imu (#423): the opt-in 5/MG raw-IMU offload capture is deviceId-keyed too — "delete all
         // of this device's data" must clear it, or the raw inertial samples survive deletion (same defect).
-        "rawImuSample",
         // v31-deep-capture-channels: the banked 5/MG v18 auxiliary fields are deviceId-keyed per-second
         // rows like every stream above, so a "delete all of this device's data" must clear them too.
         "v18AuxSample",
@@ -142,6 +164,13 @@ public struct DeviceRegistryStore: Sendable {
         // so forgetting that source must clear them — otherwise an imported phone's hour-by-hour step
         // history survives the delete (the same privacy defect this list exists to close).
         "appleStepHour",
+        // v46-lift-log: every table in the strength log is deviceId-keyed, including the child rows
+        // (liftProgramItem, liftSet). They are joined to their parents by id, not by a foreign key, so
+        // if the children were left off this list a "delete all of this device's data" would strip the
+        // programs and sessions and leave every exercise line and every logged set behind — the exact
+        // privacy defect this list exists to close, and one the deviceId-column guard test could not
+        // catch for a child table keyed only by its parent.
+        "liftExercise", "liftProgram", "liftProgramItem", "liftSession", "liftSet",
     ]
 
     /// Permanently delete every recorded sample/derived row belonging to one device, across all
@@ -199,9 +228,19 @@ public struct DeviceRegistryStore: Sendable {
                 """, arguments: [serialId, activeId])
             }
             // Move the active id's recordings onto the serial id (canonical wins a PK clash), then clear it.
-            for table in Self.deviceScopedTables {
-                try db.execute(sql: "UPDATE OR IGNORE \(table) SET deviceId = ? WHERE deviceId = ?", arguments: [serialId, activeId])
-                try db.execute(sql: "DELETE FROM \(table) WHERE deviceId = ?", arguments: [activeId])
+            //
+            // BOTH id shapes, not just the pairing's own. Every strap also owns a COMPUTED sibling keyed
+            // `<deviceId>-noop` — the scored days, detected workouts and metric series the engine derives
+            // — and that id is never equal to `activeId`, so an exact-match re-key silently left it behind.
+            // The next scoring pass then writes under `<serialId>-noop`, stranding the old computed
+            // history under an id nothing reads again: the orphaned-history failure this adoption exists
+            // to PREVENT, displaced onto the computed half. The ring path never hit it because a ring has
+            // no computed sibling to strand, which is why the shipped migration looked proven.
+            for (from, to) in [(activeId, serialId), (activeId + Self.computedSuffix, serialId + Self.computedSuffix)] {
+                for table in Self.deviceScopedTables {
+                    try db.execute(sql: "UPDATE OR IGNORE \(table) SET deviceId = ? WHERE deviceId = ?", arguments: [to, from])
+                    try db.execute(sql: "DELETE FROM \(table) WHERE deviceId = ?", arguments: [from])
+                }
             }
             // Drop ONLY the provisional CB-UUID registry rows; other oura-* pairings are left as-is.
             try db.execute(sql: "DELETE FROM pairedDevice WHERE id = ?", arguments: [activeId])

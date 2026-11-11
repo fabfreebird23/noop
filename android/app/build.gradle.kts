@@ -26,8 +26,8 @@ android {
         applicationId = "com.noop.whoop"
         minSdk = 26
         targetSdk = 34
-        versionCode = 350
-        versionName = "10.5.1"
+        versionCode = 558
+        versionName = "12.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -160,6 +160,16 @@ val roomSchemaDir = layout.buildDirectory.dir("generated/roomSchemas")
 ksp {
     arg("room.schemaLocation", roomSchemaDir.get().asFile.absolutePath)
 }
+// Every KSP round for a Kotlin source set. Both users below start here and then diverge on the
+// UnitTest/AndroidTest rounds — in OPPOSITE directions, which is why this half is named rather than
+// spelled out twice:
+//   - [isMainSourceSetKspTask] EXCLUDES them, so Gradle is not told they output a directory they never
+//     write and then clears it out from under the round that did.
+//   - `syncRoomSchemaSnapshot`'s `mustRunAfter` INCLUDES them, because they still race the Sync (#1711).
+// Two near-identical predicates meaning opposite things is a trap; sharing the common half makes the
+// difference the thing the reader sees.
+fun isKspKotlinTask(name: String) = name.startsWith("ksp") && name.endsWith("Kotlin")
+
 // Room writes the export as a SIDE EFFECT of annotation processing, at a path Gradle knows nothing
 // about. Left undeclared, a KSP task that is UP-TO-DATE or restored FROM-CACHE leaves whatever the last
 // real execution wrote — so an entity edit that is later reverted keeps the stale export on disk and the
@@ -178,8 +188,7 @@ ksp {
 // wiped the export that `kspFullDebugKotlin` had just restored, and the test failed on a clean build with
 // a warm cache with the directory missing entirely.
 fun isMainSourceSetKspTask(name: String) =
-    name.startsWith("ksp") && name.endsWith("Kotlin") &&
-        !name.contains("UnitTest") && !name.contains("AndroidTest")
+    isKspKotlinTask(name) && !name.contains("UnitTest") && !name.contains("AndroidTest")
 
 tasks.matching { isMainSourceSetKspTask(it.name) }.configureEach {
     outputs.dir(roomSchemaDir).withPropertyName("roomSchemaExport")
@@ -208,8 +217,17 @@ val syncRoomSchemaSnapshot = tasks.register<Sync>("syncRoomSchemaSnapshot") {
     // variant's KSP round writes byte-identical JSON. Depending on all of them would make a single
     // `testFullDebugUnitTest` run four KSP rounds instead of one.
     dependsOn(tasks.matching { it.name == "kspFullDebugKotlin" })
-    // Unit-test KSP can clear the snapshot after Sync has copied it; order Sync after those tasks.
-    mustRunAfter(tasks.matching { it.name.startsWith("ksp") && it.name.contains("UnitTest") })
+    // Every KSP round writes `roomSchemaDir` — `room.schemaLocation` is set once, outside any variant
+    // block — so EVERY one of them is both a producer Sync must not race and a producer Gradle expects
+    // a declared relationship with. This was scoped to the UnitTest rounds, which covered the observed
+    // hazard (unit-test KSP clearing the snapshot after Sync copied it) but left `kspFullReleaseKotlin`
+    // out. It is normally absent from the graph; pull it in — `lintVitalFullRelease` in the same
+    // invocation as the debug test tasks does — and Gradle fails the build for an undeclared
+    // producer/consumer pair, with an error that reads like a Room problem (#1711).
+    //
+    // Ordering only, so nothing is forced to execute and the one-variant `dependsOn` above keeps its
+    // point: a `testFullDebugUnitTest` run still triggers exactly one KSP round.
+    mustRunAfter(tasks.matching { isKspKotlinTask(it.name) })
 }
 
 tasks.withType<Test>().configureEach {
@@ -280,6 +298,9 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
     testImplementation("org.json:json:20240303") // real org.json for JVM unit tests (android.jar ships throwing stubs)
     testImplementation("net.sf.kxml:kxml2:2.3.0") // real XmlPullParser for JVM tests (android.util.Xml is a throwing stub)
+    testImplementation("org.xerial:sqlite-jdbc:3.41.2.2") // execute DAO aggregate SQL in plain-JVM tests
+    testImplementation("androidx.room:room-testing:$roomVersion") // create a prior DB from exported schemas
+    testImplementation("org.robolectric:robolectric:4.13") // run the real Room open/migration in Linux CI (#1803)
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")

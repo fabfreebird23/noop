@@ -27,6 +27,8 @@ import androidx.glance.layout.fillMaxWidth
 import androidx.glance.layout.height
 import androidx.glance.layout.padding
 import androidx.glance.layout.width
+import androidx.glance.semantics.contentDescription
+import androidx.glance.semantics.semantics
 import androidx.glance.text.FontWeight
 import androidx.glance.text.Text
 import androidx.glance.text.TextStyle
@@ -35,22 +37,15 @@ import com.noop.R
 import com.noop.ui.MainActivity
 import java.text.DateFormat
 import java.util.Date
+import com.noop.analytics.ClockFormat
+import com.noop.ui.ClockPrefs
 
 /** Compact home-screen widget: Rest, Charge and Effort icon cells plus live HR and strap battery. */
 class NoopCompactGlanceWidget : GlanceAppWidget() {
 
     override suspend fun provideGlance(context: Context, id: GlanceId) {
         val snap = runCatching { WidgetSnapshotStore.load(context) }.getOrDefault(WidgetSnapshot())
-        val dark = runCatching {
-            when (context.getSharedPreferences("noop_prefs", Context.MODE_PRIVATE)
-                .getString("theme.appearance", "system")) {
-                "light" -> false
-                "dark" -> true
-                else -> (context.resources.configuration.uiMode and
-                    android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
-                    android.content.res.Configuration.UI_MODE_NIGHT_YES
-            }
-        }.getOrDefault(true)
+        val dark = WidgetTheme.isDark(context)
         provideContent { CompactWidgetContent(snap, dark) }
     }
 
@@ -128,11 +123,23 @@ private fun CompactWidgetContent(snap: WidgetSnapshot, dark: Boolean) {
             )
         }
         Spacer(modifier = GlanceModifier.height(6.dp))
+        // Same glyph-in-the-text problem as the standard widget: TalkBack gets a bare number with no
+        // name and no unit. The battery Image below has carried a contentDescription all along; this
+        // line never did. (#1799)
+        val hrLabel = uiString(R.string.l10n_noop_compact_glance_widget_heart_rate_410aa15c)
+        // Live-marked, not stale-marked, for the reason spelled out on the standard widget: the dimming
+        // below is colour-only, and "live" already exists in every locale so this needs no new copy.
+        val liveSuffix =
+            if (snap.heartRateStale) "" else " " + uiString(R.string.l10n_today_screen_sync_chip_live_98aadb37)
+        val hrDescription = snap.heartRate
+            ?.let { "$hrLabel ${uiString(R.string.l10n_today_screen_value_bpm_8f3a90c3, it)}$liveSuffix" }
+            ?: hrLabel
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 text = snap.heartRate?.let { "♥ $it" } ?: "♥ - ",
                 // Dim a carried-over reading so a stale HR can't masquerade as a live one.
                 style = TextStyle(color = if (snap.heartRateStale) textSecondary else textPrimary, fontSize = 13.sp),
+                modifier = GlanceModifier.semantics { contentDescription = hrDescription },
             )
             Spacer(modifier = GlanceModifier.width(10.dp))
             Image(
@@ -152,7 +159,10 @@ private fun CompactWidgetContent(snap: WidgetSnapshot, dark: Boolean) {
             text = when {
                 snap.connected -> "Connected"
                 snap.updatedAtMs > 0L ->
-                    DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(snap.updatedAtMs))
+                    java.text.SimpleDateFormat(   // #1821: the reader's chosen clock
+                        ClockFormat.hourMinutePattern(ClockPrefs.uses24Hour(androidx.glance.LocalContext.current)),
+                        java.util.Locale.getDefault(),
+                    ).format(Date(snap.updatedAtMs))
                 else -> "Open NOOP to connect"
             },
             style = TextStyle(color = textSecondary, fontSize = 11.sp),

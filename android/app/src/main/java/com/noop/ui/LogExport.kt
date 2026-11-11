@@ -137,9 +137,14 @@ object LogExport {
             val dynamic = com.noop.testcentre.AndroidDiagnostics.dynamicLines(context)
             val header = buildString {
                 appendLine("NOOP strap log (scheduled debug export)")
-                appendLine("App:     ${BuildConfig.VERSION_NAME} (${BuildConfig.TIER})")
-                for (line in com.noop.testcentre.AndroidDiagnostics.summaryLines(context)) appendLine(line)
-                for (line in dynamic) appendLine(line)
+                appendLine(com.noop.testcentre.AndroidDiagnostics.appIdentityLine)
+                // #453: the rolling BODY is scrubbed by WhoopBleClient.log(), but these HEADER lines never pass
+                // through it - and they carry device ids, which embed a BLE address for a re-added or second
+                // strap. Same redactor, so one export cannot be safe while the other leaks.
+                for (line in com.noop.testcentre.AndroidDiagnostics.summaryLines(context)) {
+                    appendLine(com.noop.ble.redactStrapLogPii(line))
+                }
+                for (line in dynamic) appendLine(com.noop.ble.redactStrapLogPii(line))
                 appendLine("─".repeat(40))
             }
             val text = body.ifBlank { "(rolling strap-log buffer is empty; connect to your strap so lines accrue)" }
@@ -152,7 +157,9 @@ object LogExport {
             // present when a 5/MG owner has the opt-in capture on and a history sync has run.
             val main = File(context.filesDir, com.noop.ble.WhoopBleClient.WHOOP5_CAPTURE_FILE)
             val prev = File(context.filesDir, "${com.noop.ble.WhoopBleClient.WHOOP5_CAPTURE_FILE}.1")
-            if (main.exists() || prev.exists()) {
+            // Same rule as the interactive share: content, not existence. An empty capture file would
+            // otherwise put a zero-byte `.bin` into every scheduled drop, forever.
+            if (captureHasFrames(main.length(), prev.length())) {
                 val rawFile = File(dir, rawCaptureFilename(nowMs))
                 rawFile.outputStream().bufferedWriter().use { w ->
                     for (f in listOf(prev, main)) if (f.exists()) f.bufferedReader().use { r -> r.copyTo(w) }
@@ -245,21 +252,25 @@ object LogExport {
         val dynamic = com.noop.testcentre.AndroidDiagnostics.dynamicLines(context)
         val header = buildString {
             appendLine("NOOP strap log")
-            appendLine("App:     ${BuildConfig.VERSION_NAME} (${BuildConfig.TIER})")
-            for (line in com.noop.testcentre.AndroidDiagnostics.summaryLines(context)) appendLine(line)
-            for (line in dynamic) appendLine(line)
+            appendLine(com.noop.testcentre.AndroidDiagnostics.appIdentityLine)
+            // #453: the rolling BODY is scrubbed by WhoopBleClient.log(), but these HEADER lines never pass
+            // through it - and they carry device ids, which embed a BLE address for a re-added or second
+            // strap. Same redactor, so one export cannot be safe while the other leaks.
+            for (line in com.noop.testcentre.AndroidDiagnostics.summaryLines(context)) {
+                appendLine(com.noop.ble.redactStrapLogPii(line))
+            }
+            for (line in dynamic) appendLine(com.noop.ble.redactStrapLogPii(line))
             appendLine("─".repeat(40))
         }
         val body = logText.ifBlank { "(strap log is empty; connect to your strap, reproduce the issue, then share again)" }
 
         // Append the last captured crash (if any) so a device-specific crash like the Insights
         // tab (#224/#267) arrives with its real stack trace instead of being unreachable.
-        val crash = com.noop.CrashCapture.lastCrash(context)
-        val crashSection = if (crash != null) "\n\n${"─".repeat(40)}\nLast crash:\n$crash" else ""
+        val crashText = crashSection(com.noop.CrashCapture.lastCrash(context))
 
         val dir = File(context.cacheDir, "logs").apply { mkdirs() }
         val file = File(dir, "noop-strap-log-${timestamp()}.txt")
-        file.writeText(header + "\n" + body + crashSection)
+        file.writeText(header + "\n" + body + crashText)
         return file
     }
 
@@ -271,7 +282,16 @@ object LogExport {
     private fun writeCaptureFile(context: Context): File? {
         val main = File(context.filesDir, com.noop.ble.WhoopBleClient.WHOOP5_CAPTURE_FILE)
         val prev = File(context.filesDir, "${com.noop.ble.WhoopBleClient.WHOOP5_CAPTURE_FILE}.1")
-        if (!main.exists() && !prev.exists()) return null
+        // An EMPTY capture is no capture. This used to gate on the files EXISTING, and existence is not
+        // evidence that anything was recorded: `startWhoop5BackfillCapture` opens in append mode, which
+        // CREATES the file the moment capture starts. A strap that never completes its handshake then
+        // produces a zero-byte capture that still exists — and the share emitted a 282-byte header with
+        // no frames under it, reporting success for a night that recorded nothing.
+        //
+        // Returning null here routes those to `noCaptureMsg`, which already knows how to explain the
+        // common cause: without the encrypted bond the puffin notify chars are never subscribed, so no
+        // frames can reach the writer at all.
+        if (captureHasFrames(main.length(), prev.length()).not()) return null
         val header = buildString {
             appendLine("# NOOP 5/MG raw backfill capture (JSONL; one frame per line)")
             appendLine("# App: ${BuildConfig.VERSION_NAME} (${BuildConfig.TIER}) · Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}) · ${Build.MANUFACTURER} ${Build.MODEL}")
@@ -320,7 +340,9 @@ object LogExport {
     private fun writeCaptureLogFile(context: Context): File? {
         val main = File(context.filesDir, com.noop.ble.WhoopBleClient.CAPTURE_LOG_FILE)
         val prev = File(context.filesDir, "${com.noop.ble.WhoopBleClient.CAPTURE_LOG_FILE}.1")
-        if (!main.exists() && !prev.exists()) return null
+        // Content, not existence — the same flaw the raw capture had. This writer opens on demand too,
+        // so a toggle switched on with nothing yet logged would share a header and no log under it.
+        if (captureHasFrames(main.length(), prev.length()).not()) return null
         val header = buildString {
             appendLine("# NOOP detailed capture — rolling strap log (PII-scrubbed at source)")
             appendLine("# App: ${BuildConfig.VERSION_NAME} (${BuildConfig.TIER}) · Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}) · ${Build.MANUFACTURER} ${Build.MODEL}")
@@ -359,13 +381,85 @@ object LogExport {
      * a 4.0 can never produce one (5/MG-only feature); a 5/MG needs the toggle on + a history sync;
      * if the toggle is already on, don't tell them to enable it again. `sharingLog` adds the log tail.
      */
-    private fun noCaptureMsg(context: Context, whoop5Connected: Boolean, sharingLog: Boolean): String {
+    private fun noCaptureMsg(
+        context: Context,
+        whoop5Connected: Boolean,
+        encryptedBond: Boolean,
+        sharingLog: Boolean,
+    ): String = noCaptureMsgText(
+        whoop5Connected = whoop5Connected,
+        captureEnabled = PuffinExperiment.from(context).isCaptureEnabled,
+        encryptedBond = encryptedBond,
+        sharingLog = sharingLog,
+    )
+
+    /**
+     * The trailing "Last crash" section of a shared strap log, with its PII scrubbed.
+     *
+     * The crash file is written by the uncaught-exception handler, so unlike the rolling body it never
+     * passes through `WhoopBleClient.log()`'s sink — an exception message that names a strap ("no device
+     * FD:..") would carry a real BLE address straight into a public issue, and this is the artifact
+     * people attach to one. Same rule the header lines above already follow (#453): one export cannot
+     * be safe while the other leaks. Pure so the redaction is assertable without a Context.
+     *
+     * A crash record survives updates, so the one printed here is routinely OLDER than the build that
+     * wrote the log. A 25-day-old record from build 382 arrived under a "build 534" header twice in one
+     * week of triage and read as a fresh crash both times. The record carries its own version code and
+     * the header carries the running one, but nothing put the two side by side, so catching it depended
+     * on the reader noticing. When they differ this says so, above the record, before it can alarm.
+     */
+    internal fun crashSection(crash: String?, runningVersionCode: Int = BuildConfig.VERSION_CODE): String {
+        if (crash == null) return ""
+        val stale = crashVersionCode(crash)?.takeIf { it != runningVersionCode }
+        val note = if (stale == null) "" else
+            "NOTE: this crash is from build $stale, not the build that wrote this log ($runningVersionCode).\n"
+        return "\n\n" + "─".repeat(40) + "\nLast crash:\n" + note + com.noop.ble.redactStrapLogPii(crash)
+    }
+
+    /**
+     * The version code out of a crash record's `app:` line (`app:    11.8.0-staging (382) · com.noop…`).
+     *
+     * Null when the record predates that line or is shaped differently: an unreadable record is left
+     * alone rather than guessed at, because a wrong build number in that note would be worse than no
+     * note at all. Pure, so both the match and the refusal to match are assertable.
+     */
+    internal fun crashVersionCode(crash: String): Int? =
+        Regex("^app:\\s+\\S+\\s+\\((\\d+)\\)", RegexOption.MULTILINE)
+            .find(crash)?.groupValues?.get(1)?.toIntOrNull()
+
+    /**
+     * Whether the on-disk capture holds any frames at all.
+     *
+     * `File.length()` is 0 for a file that does not exist, so this subsumes the old existence check and
+     * additionally rejects a file that was opened and never written. Pure so the rule is assertable
+     * without touching the filesystem.
+     */
+    internal fun captureHasFrames(mainBytes: Long, prevBytes: Long): Boolean = mainBytes + prevBytes > 0L
+
+    /**
+     * The no-capture copy, as a pure function of what we know.
+     *
+     * Split from the Context-reading wrapper so the wording is unit-testable — the repo's test classpath
+     * has no mocking framework, by preference: helpers worth asserting are made pure rather than mocked.
+     */
+    internal fun noCaptureMsgText(
+        whoop5Connected: Boolean,
+        captureEnabled: Boolean,
+        encryptedBond: Boolean,
+        sharingLog: Boolean,
+    ): String {
         val tail = if (sharingLog) " Sharing the strap log." else ""
         return when {
             !whoop5Connected ->
                 "Raw capture records WHOOP 5/MG history syncs and doesn't apply to WHOOP 4.0 (already fully decoded).$tail"
-            !PuffinExperiment.from(context).isCaptureEnabled ->
+            !captureEnabled ->
                 "No raw capture yet. Turn on \"Record 5/MG raw capture\" above, then let a history sync run.$tail"
+            // #1635: do NOT tell someone to wait for a history sync their strap cannot reach. Without the
+            // encrypted bond there is no puffin channel and no offload, so "let a sync run" names a remedy
+            // that will never arrive — the same confidently-wrong guidance this issue kept producing.
+            !encryptedBond ->
+                "Raw capture is on, but this strap is on live HR only — history sync needs the full " +
+                    "encrypted pairing, so there are no sync frames to capture yet.$tail"
             else ->
                 "Raw capture is on. Let a 5/MG history sync run, then try again.$tail"
         }
@@ -377,13 +471,13 @@ object LogExport {
      * covers cache/logs) and prepends a header with an informed-consent line: the file holds raw
      * biometric frames and the strap's own console text.
      */
-    suspend fun shareWhoop5Capture(context: Context, whoop5Connected: Boolean) {
+    suspend fun shareWhoop5Capture(context: Context, whoop5Connected: Boolean, encryptedBond: Boolean) {
         runCatching {
             // writeCaptureFile does blocking file IO (#646/#651) — keep it off whatever dispatcher the
             // caller is on (Main, for every UI call site today).
             val out = withContext(Dispatchers.IO) { writeCaptureFile(context) }
             if (out == null) {
-                Toast.makeText(context, noCaptureMsg(context, whoop5Connected, sharingLog = false), Toast.LENGTH_LONG).show()
+                Toast.makeText(context, noCaptureMsg(context, whoop5Connected, encryptedBond, sharingLog = false), Toast.LENGTH_LONG).show()
                 return
             }
             val send = Intent(Intent.ACTION_SEND).apply {
@@ -410,7 +504,7 @@ object LogExport {
      * buttons), so a large raw capture doesn't stall the UI. Only the "no capture" toast and the
      * [exportBundle] call (which does its own IO hop for the zip) run back on the caller's dispatcher.
      */
-    suspend fun shareRawAndLog(context: Context, logText: String, whoop5Connected: Boolean) {
+    suspend fun shareRawAndLog(context: Context, logText: String, whoop5Connected: Boolean, encryptedBond: Boolean) {
         runCatching {
             val (entries, hasCapture) = withContext(Dispatchers.IO) {
                 val logFile = writeStrapLogFile(context, logText)
@@ -420,7 +514,7 @@ object LogExport {
                 entries to (capture != null)
             }
             if (!hasCapture) {
-                Toast.makeText(context, noCaptureMsg(context, whoop5Connected, sharingLog = true), Toast.LENGTH_LONG).show()
+                Toast.makeText(context, noCaptureMsg(context, whoop5Connected, encryptedBond, sharingLog = true), Toast.LENGTH_LONG).show()
             }
             val name = "noop-export-${timestamp()}.zip"
             exportBundle(context, entries, name)

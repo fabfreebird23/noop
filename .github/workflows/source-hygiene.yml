@@ -38,3 +38,17 @@ jobs:
       # point — fix the comment instead.
       - name: Detached doc comments (regression gate)
         run: python3 Tools/doc_comment_lint.py
+
+      # The constructed arithmetic examples that docs/PROTOCOL_SENSORS.md and PROTOCOL_ECG.md tell
+      # readers to run. Stdlib-only and finishes in well under a second, so it rides along in this
+      # already-running job on every PR rather than behind a docs/** filter, which would need a
+      # workflow or runner of its own. Fails on any assertion, so a doc edit cannot break it silently.
+      - name: Protocol doc examples (arithmetic check)
+        run: python3 docs/protocol-examples/validate_examples.py
+
+      # docs/PROTOCOL_IMPLEMENTATION.md names client code as file plus symbol, without line numbers.
+      # Those references rot silently when code moves or is renamed: nobody re-reads the documentation
+      # during a Swift rename. The stdlib-only existence check covers both file and symbol in under a
+      # second, so it runs beside the validator on every PR rather than behind a docs/** filter.
+      - name: Protocol doc source references (existence check)
+        run: python3 docs/protocol-examples/check_source_references.py

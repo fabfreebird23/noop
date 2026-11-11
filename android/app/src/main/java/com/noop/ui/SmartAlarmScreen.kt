@@ -2,6 +2,7 @@ package com.noop.ui
 
 import com.noop.R
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.res.pluralStringResource
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -31,6 +32,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -60,6 +62,8 @@ fun SmartAlarmScreen(vm: AppViewModel) {
     val enabled by vm.phoneAlarmEnabled.collectAsStateWithLifecycle()
     val targetMinutes by vm.phoneAlarmTargetMinutes.collectAsStateWithLifecycle()
     val windowMinutes by vm.phoneAlarmWindowMinutes.collectAsStateWithLifecycle()
+    val phoneAlarmWeekdays by vm.phoneAlarmWeekdays.collectAsStateWithLifecycle()
+    val phoneAlarmDayOverrides by vm.phoneAlarmDayOverrides.collectAsStateWithLifecycle()
     val buzzWhoop4 by vm.buzzWhoop4Enabled.collectAsStateWithLifecycle()
     // #536: the hint adapts to bond state — the strap can only be armed when a WHOOP 4.0 is connected.
     val liveState = vm.live.collectAsStateWithLifecycle().value
@@ -83,7 +87,49 @@ fun SmartAlarmScreen(vm: AppViewModel) {
         subtitle = "Your wake window, the strap wake-alarm, and the evening wind-down reminder, in one place.",
     ) {
         // The guaranteed-wake card always shows so the safety promise is the first thing read.
-        item { WindowCard(enabled = enabled, targetMinutes = targetMinutes, windowMinutes = windowMinutes) }
+        item {
+            // #1858: the card names a specific time ("a backup alarm is set for 04:45"), so with per-day
+            // wake times it has to show the NEXT one rather than the default — on a day whose time was
+            // moved, the default is simply the wrong number, and this card is the one thing on the screen
+            // that makes a promise. Falls back to the default when no day is reachable.
+            // Ticks once a minute so the countdown cannot freeze at whatever it read when the screen
+            // opened, which is the one failure mode a countdown has. Only this card recomposes.
+            val nowMs by produceState(initialValue = System.currentTimeMillis()) {
+                while (true) {
+                    value = System.currentTimeMillis()
+                    kotlinx.coroutines.delay(60_000L)
+                }
+            }
+            // `nowMs` is a remember KEY, not just an argument to the countdown below: this card's window
+            // figures and its countdown must resolve from ONE clock. Keyed only on the settings, these
+            // stayed pinned to the instant the screen opened while the countdown moved with the tick, so
+            // leaving the screen open across the fire time left "06:30 → 07:00" describing today above a
+            // countdown already naming tomorrow. Two lines disagreeing about one fact is the whole defect
+            // this screen has been fixing.
+            val nextTargetMinutes = remember(
+                nowMs, targetMinutes, windowMinutes, phoneAlarmWeekdays, phoneAlarmDayOverrides,
+            ) {
+                com.noop.alarm.SmartAlarmScheduler.nextWindowStartMinutes(
+                    now = java.util.Calendar.getInstance().apply { timeInMillis = nowMs },
+                    weekdays = phoneAlarmWeekdays,
+                    windowMinutes = windowMinutes,
+                    defaultTarget = targetMinutes,
+                ) { phoneAlarmDayOverrides[it] ?: targetMinutes }
+            }
+            val countdown = alarmCountdown(
+                nowMs = nowMs,
+                armed = enabled && canSchedule,
+                weekdays = phoneAlarmWeekdays,
+                windowMinutes = windowMinutes,
+                targetForDay = { phoneAlarmDayOverrides[it] ?: targetMinutes },
+            )
+            WindowCard(
+                enabled = enabled,
+                targetMinutes = nextTargetMinutes,
+                windowMinutes = windowMinutes,
+                countdown = countdown,
+            )
+        }
 
         item {
         AlarmSettingsCard {
@@ -108,8 +154,7 @@ fun SmartAlarmScreen(vm: AppViewModel) {
             if (enabled && !canSchedule) {
                 RowDividerLocal()
                 Text(
-                    uiString(R.string.l10n_smart_alarm_screen_noop_doesn_t_have_permission_to_5b67cef0) +
-                        "Tap to allow it in system settings.",
+                    uiString(R.string.l10n_smart_alarm_screen_noop_doesn_t_have_permission_to_5b67cef0),
                     style = NoopType.footnote,
                     color = Palette.statusWarning,
                     modifier = Modifier
@@ -151,6 +196,30 @@ fun SmartAlarmScreen(vm: AppViewModel) {
                         onChange = { vm.setPhoneAlarmWindowMinutes(it) },
                     )
                 }
+
+                // Days this alarm fires on. The SAME shared picker the strap alarm below uses, and the
+                // same empty-means-every-day contract, so identical-looking circles behave identically on
+                // one screen. Lets a weekend be switched off without disabling the alarm and having to
+                // remember to switch it back on.
+                RowDividerLocal()
+                AlarmWeekdayPicker(
+                    selected = phoneAlarmWeekdays,
+                    onToggle = { dow ->
+                        vm.setPhoneAlarmWeekdays(toggledSmartAlarmWeekday(dow, phoneAlarmWeekdays))
+                    },
+                )
+                RowDividerLocal()
+                // #1858: per-day wake times, the SAME picker and the same contract the strap alarm below
+                // has had since #554. Both alarms sit on this one screen, so one of them supporting a
+                // different time on different days and the other not is read as the feature being broken —
+                // which is exactly how it was reported ("I want 04:45 on three days and 03:30 on two
+                // others… the smart alarm basically never works").
+                AlarmDayOverridePicker(
+                    defaultMinutes = targetMinutes,
+                    enabledDays = phoneAlarmWeekdays,
+                    overrides = phoneAlarmDayOverrides,
+                    onSetOverride = { dow, minutes -> vm.setPhoneAlarmDayOverride(dow, minutes) },
+                )
             }
 
             // #536: companion strap-buzz, always visible so it's discoverable. Arms the strap's own firmware
@@ -201,7 +270,7 @@ private fun StrapAlarmCard(vm: AppViewModel) {
     val live = vm.live.collectAsStateWithLifecycle().value
     // The firmware alarm is EXPERIMENTAL on a WHOOP 5/MG: it only arms when Experimental probes are on,
     // otherwise enabling it silently arms nothing (#111), so the UI says so instead of promising a wake.
-    val experimentalOn = PuffinExperiment.from(context).isEnabled
+    val protocolProbesOn = PuffinExperiment.from(context).isEnabled
 
     NoopCard(padding = 20.dp, tint = if (smartAlarm) Palette.accent else null) {
         Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -247,19 +316,19 @@ private fun StrapAlarmCard(vm: AppViewModel) {
                     onSetOverride = { dow, minutes -> vm.setSmartAlarmDayOverride(dow, minutes) },
                 )
                 RowDividerLocal()
-                if (live.whoop5Detected && !experimentalOn) {
+                if (live.whoop5Detected && !protocolProbesOn) {
                     Text(
-                        uiString(R.string.l10n_smart_alarm_screen_your_whoop_5_mg_won_t_75029bae) +
-                            "Experimental). Right now your wake time is saved but the strap is NOT armed.",
+                        uiString(R.string.l10n_smart_alarm_screen_your_whoop_5_mg_won_t_75029bae),
                         style = NoopType.footnote, color = Palette.statusWarning,
                     )
                 } else if (live.whoop5Detected) {
-                    // 5/MG with Experimental ON: the strap IS armed (experimental rev-4 payload) but a
-                    // strap-driven wake has NEVER been captured on 5/MG, so the "confirmed on 4.0" copy must
-                    // NOT show here (#864 honesty). Byte-identical wording to the Swift SmartAlarmView twin.
+                    // 5/MG with Protocol probes ON: the rev-4 command arms the strap. One wake was
+                    // captured on an MG (#864) and one reported on a 5.0 without a log (#2464);
+                    // neither repeated, so the copy simplifies both to "reported" and promises none.
+                    // Byte-identical wording to the Swift SmartAlarmView twin.
                     Text(
                         if (live.bonded)
-                            "Armed on the strap itself with the experimental 5/MG command. A strap-driven wake is still unconfirmed on 5/MG on our side (confirmed only on WHOOP 4.0), so keep a backup alarm for anything you truly can't miss."
+                            uiString(R.string.smart_alarm_5mg_armed_experimental)
                         else
                             "Connect your strap to arm this; it's set on the strap's own firmware alarm. Confirmed working on WHOOP 4.0; still experimental on 5.0 and MG. Keep a backup alarm for anything you truly can't miss.",
                         style = NoopType.footnote, color = Palette.textTertiary,
@@ -274,6 +343,22 @@ private fun StrapAlarmCard(vm: AppViewModel) {
                             "Connect your strap to arm this; it's set on the strap's own firmware alarm. Confirmed working on WHOOP 4.0; still experimental on 5.0 and MG. Keep a backup alarm for anything you truly can't miss.",
                         style = NoopType.footnote, color = Palette.textTertiary,
                     )
+                    // #1706: ask the strap what it actually has stored. The readback was previously only
+                    // reachable by ARMING, so anyone whose alarm is off could not produce the evidence
+                    // that explains a wrong reported time. 4.0 only — the 5/MG readback is not decoded.
+                    if (live.bonded) {
+                        RowDividerLocal()
+                        NoopButton(
+                            text = uiString(R.string.smart_alarm_check_strap_alarm),
+                            kind = NoopButtonKind.Secondary,
+                            fullWidth = true,
+                            onClick = { vm.ble.getStrapAlarm() },
+                        )
+                        Text(
+                            uiString(R.string.smart_alarm_check_strap_alarm_help),
+                            style = NoopType.footnote, color = Palette.textTertiary,
+                        )
+                    }
                 }
             }
         }
@@ -288,7 +373,12 @@ private fun StrapAlarmCard(vm: AppViewModel) {
  * Rest backdrop (it's about waking, so it lives in the indigo world, not the brand-green chrome).
  */
 @Composable
-private fun WindowCard(enabled: Boolean, targetMinutes: Int, windowMinutes: Int) {
+private fun WindowCard(
+    enabled: Boolean,
+    targetMinutes: Int,
+    windowMinutes: Int,
+    countdown: Pair<String, String>? = null,
+) {
     val deadline = (targetMinutes + windowMinutes) % (24 * 60)
     Box(
         modifier = Modifier
@@ -307,6 +397,12 @@ private fun WindowCard(enabled: Boolean, targetMinutes: Int, windowMinutes: Int)
                         Text("→", style = NoopType.title2, color = Palette.textTertiary)
                         Text(hhmm(deadline), style = NoopType.number(28f), color = DomainTheme.Rest.bright)
                     }
+                    // The countdown leads, with the absolute date and time under it, the way a clock
+                    // app pairs them. Both come from one resolver, so the two lines cannot disagree.
+                    countdown?.let { (relative, stamp) ->
+                        Text(relative, style = NoopType.number(22f), color = Palette.accent)
+                        Text(stamp, style = NoopType.footnote, color = Palette.textSecondary)
+                    }
                     Text(
                         uiString(R.string.l10n_smart_alarm_screen_a_backup_alarm_is_set_for_cf8b94fb, hhmm(deadline)),
                         style = NoopType.footnote, color = Palette.textSecondary,
@@ -321,6 +417,71 @@ private fun WindowCard(enabled: Boolean, targetMinutes: Int, windowMinutes: Int)
             }
         }
     }
+}
+
+/**
+ * "Alarm in 17 hours 47 minutes" plus "Mon 21 Sep 07:00", or null when nothing will actually fire.
+ *
+ * Twin of the Apple `SmartAlarmView` hero countdown. A wall-clock time says WHEN, not whether that is
+ * tonight or tomorrow, which is the thing you want at a glance; the stamp underneath carries the date,
+ * which is the half that settles it.
+ *
+ * Resolved through [SmartAlarmScheduler.nextDeadline], the same pure function the scheduler arms the OS
+ * alarm from, with the per-day overrides threaded in so a day with its own time counts down to THAT time.
+ * One resolver, so the readout cannot drift from what is actually armed.
+ *
+ * [armed] carries the honesty gate. A countdown is a promise, and without the exact-alarm permission the
+ * OS alarm is never scheduled, so the caller passes `enabled && canSchedule` and the card's existing
+ * permission warning stands alone rather than sitting under a promise it cannot keep.
+ *
+ * Long-form units rather than the app's compact "17h 47m" (`SleepFormatting.durationText`) on purpose:
+ * this is a headline, not a data cell, and it is read once at a glance. Long form also means the unit
+ * words must pluralise, which is why these are `plurals` and not interpolated text.
+ */
+@Composable
+private fun alarmCountdown(
+    nowMs: Long,
+    armed: Boolean,
+    weekdays: Set<Int>,
+    windowMinutes: Int,
+    targetForDay: (Int) -> Int,
+): Pair<String, String>? {
+    if (!armed) return null
+    val now = java.util.Calendar.getInstance().apply { timeInMillis = nowMs }
+    val next = com.noop.alarm.SmartAlarmScheduler.nextDeadline(
+        now = now,
+        weekdays = weekdays,
+        windowMinutes = windowMinutes,
+        targetForDay = targetForDay,
+    ) ?: return null
+
+    // DATE only, deliberately. The deadline time is already on this card twice, in the figures above and
+    // in the "a backup alarm is set for ..." sentence below, and a third copy is noise. What neither of
+    // those carries is WHICH DAY, which is the half that settles "tonight or tomorrow" and the only thing
+    // this line needs to add. `Locale.getDefault()` is the app language here: `AppLanguagePrefs.wrap` and
+    // `set` both call `Locale.setDefault`, which is why every other formatter on this screen uses it.
+    val stamp = java.text.SimpleDateFormat("EEE d MMM", java.util.Locale.getDefault()).format(next.time)
+
+    val totalMinutes = ((next.timeInMillis - nowMs) / 60_000L).toInt()
+    // Under a minute there is no useful number left, and "in 0 minutes" reads like a bug.
+    if (totalMinutes < 1) {
+        return stringResource(R.string.l10n_smart_alarm_screen_alarm_in_less_than_a_minute_9821dce0) to stamp
+    }
+    val days = totalMinutes / (24 * 60)
+    val hours = (totalMinutes % (24 * 60)) / 60
+    val minutes = totalMinutes % 60
+    // Days are carried because a weekday-restricted alarm can be a week out, and "151 hours" is not an
+    // answer. Zero units are dropped, so a same-day alarm stays "17 hours 47 minutes".
+    val parts = buildList {
+        if (days > 0) add(pluralStringResource(R.plurals.alarm_countdown_days, days, days))
+        if (hours > 0) add(pluralStringResource(R.plurals.alarm_countdown_hours, hours, hours))
+        if (minutes > 0) add(pluralStringResource(R.plurals.alarm_countdown_minutes, minutes, minutes))
+    }
+    if (parts.isEmpty()) return null
+    return uiString(
+        R.string.l10n_smart_alarm_screen_alarm_in_1_s_688166e3,
+        parts.joinToString(" "),
+    ) to stamp
 }
 
 @Composable
@@ -371,16 +532,11 @@ private fun ExplanationCard() {
                 Text(uiString(R.string.l10n_smart_alarm_screen_how_the_smart_wake_works_8cf34930), style = NoopType.headline, color = Palette.textPrimary)
             }
             Text(
-                uiString(R.string.l10n_smart_alarm_screen_while_you_re_inside_the_window_8700ca3b) +
-                    "sleep sits near your nightly low and stays steady; when your heart rate lifts above " +
-                    "that (a sign you're sleeping more lightly or starting to stir), NOOP wakes you a " +
-                    "little early so you come up from a lighter phase.",
+                uiString(R.string.l10n_smart_alarm_screen_while_you_re_inside_the_window_8700ca3b),
                 style = NoopType.footnote, color = Palette.textSecondary,
             )
             Text(
-                uiString(R.string.l10n_smart_alarm_screen_this_is_a_coarse_cue_from_d6bbabe7) +
-                    "isn't streaming (Bluetooth off, not worn, app killed), no early wake happens and the " +
-                    "guaranteed alarm at the window's end still wakes you.",
+                uiString(R.string.l10n_smart_alarm_screen_this_is_a_coarse_cue_from_d6bbabe7),
                 style = NoopType.footnote, color = Palette.textTertiary,
             )
         }

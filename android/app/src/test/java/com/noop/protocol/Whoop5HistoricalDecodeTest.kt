@@ -39,6 +39,14 @@ class Whoop5HistoricalDecodeTest {
         assertEquals(2, p["rr_count"])
         assertEquals(listOf(602, 613), p["rr_intervals"])
 
+        // A physiological sanity check cannot establish units; the complete native arrays match
+        // standard 0x2A37 raw tick arrays on firmware 50.41.1.0 (Swift twin).
+        @Suppress("UNCHECKED_CAST")
+        val rr = p["rr_intervals"] as List<Int>
+        assertTrue("no R-R decoded — the cross-check below would be vacuous", rr.isNotEmpty())
+        val meanRr = rr.sum().toDouble() / rr.size
+        assertEquals((p["heart_rate"] as Int).toDouble(), 60_000.0 / meanRr, 4.0)
+
         val gx = p["gravity_x"] as Double
         val gy = p["gravity_y"] as Double
         val gz = p["gravity_z"] as Double

@@ -91,6 +91,13 @@ private struct DevicesContent: View {
     /// has produced any clock signal - a routed frame, a clock correlation, or a data-range reply - so a
     /// generic HR strap or an idle card never shows a fabricated "waiting" state. One computation for
     /// both the line and the warning (the log scan is the cost worth paying once, not twice).
+    ///
+    /// #1818: the battery term reads `batterySamples.last`, NOT `batteryPct`. `batteryPct` deliberately
+    /// outlives the link (`clearBiometrics` leaves it) so Today/the widget can show a last-known charge,
+    /// and a 21 h old reading is indistinguishable from a fresh one there (#530). Withdrawing the "charge
+    /// it" advice on a stale 100% would suppress it in exactly the case it is right - a strap that ran
+    /// flat, which is what reset the RTC, reconnecting before its first battery event. `batterySamples`
+    /// is cleared on disconnect, so `.last` is a reading from THIS link or nothing.
     private var strapClockState: (line: String, warning: String?)? {
         guard live.connected else { return nil }
         let deviceClock = ConnectionReadout.clockCorrelatedDevice(logLines: live.log)
@@ -100,7 +107,8 @@ private struct DevicesContent: View {
         let frame = ConnectionReadout.lastFrameLabel(lastFrameUnix: live.lastFrameAtUnix,
                                                      nowUnix: Int(Date().timeIntervalSince1970))
         let warning = ConnectionReadout.rtcWarning(deviceClockUnix: deviceClock,
-                                                   strapNewestUnix: live.strapRange?.newestUnix)
+                                                   strapNewestUnix: live.strapRange?.newestUnix,
+                                                   batteryPct: live.batterySamples.last?.soc)
         return (String(localized: "Clock latched: \(latched) · last frame \(frame)"), warning)
     }
 
@@ -180,10 +188,21 @@ private struct DevicesContent: View {
                     pairingHint: device.status == .active ? live.pairingHint : nil,
                     // Reboot in flight + link currently down → "Reconnecting…" (#166).
                     isReconnecting: device.status == .active && live.rebootInProgress && !live.connected,
-                    // The live battery belongs to whichever device is ACTIVE + connected (the WHOOP, a
-                    // generic strap, or an FTMS machine all funnel into live.batteryPct). nil otherwise.
-                    liveBatteryPct: (device.status == .active && live.connected) ? live.batteryPct.map { Int($0.rounded()) } : nil,
+                    // The live battery belongs to whichever device is ACTIVE + connected. A WHOOP, a
+                    // generic strap and an FTMS machine all funnel into live.batteryPct, but an Oura ring
+                    // does NOT: it reports its own charge, so an active ring row used to draw the strap's
+                    // stale number under the ring's name (#2075). Asked PER ROW rather than of the active
+                    // device, which is the stronger question and the one this loop can actually answer.
+                    liveBatteryPct: (device.status == .active && live.connected)
+                        ? LiveConsoleReadout.batteryPercent(
+                            activeIsWhoop: SourceCoordinator.isWhoop(device),
+                            whoopPct: live.batteryPct, ringPct: live.ouraBatteryPct)
+                        : nil,
                     liveBatteryMv: (device.status == .active && live.connected) ? live.batteryMv : nil,
+                    livePackSocPct: (device.status == .active && live.connected
+                                     && DeviceFamily.isWhoop5Registry(model: device.model,
+                                                                      brand: device.brand))
+                        ? live.packSocPct : nil,
                     // Firmware version for the ACTIVE strap. It's a STABLE property (NOOP can't change a
                     // strap's firmware), so prefer the live handshake value but fall back to the last-known
                     // persisted firmware (written on connect in FrameRouter) when the live value is momentarily
@@ -193,10 +212,18 @@ private struct DevicesContent: View {
                     // handshake, so a non-WHOOP active device (Oura) must NOT inherit it. Single last-connected-
                     // strap key, so a not-yet-connected active strap can briefly show the other strap's build on
                     // a multi-WHOOP install until it republishes. Twin of Android.
-                    liveFirmware: device.status == .active
-                        ? (live.strapFirmware
-                            ?? (SourceCoordinator.isWhoop(device) ? UserDefaults.standard.string(forKey: "noop.lastFirmware") : nil))
-                        : nil,
+                    // #1633 follow-up: resolve against THIS device, never the last strap to connect. The old
+                    // fallback read one global key, so with two straps paired a 5/MG reported the 4.0's firmware.
+                    // The legacy key is honoured only when a single device is paired, where it cannot belong to
+                    // anything else.
+                    liveFirmware: FirmwareAttribution.resolve(
+                        live: device.status == .active ? live.strapFirmware : nil,
+                        perDevice: SourceCoordinator.isWhoop(device)
+                            ? FirmwareAttribution.prefKey(peripheralId: device.peripheralId)
+                                .flatMap { UserDefaults.standard.string(forKey: $0) } : nil,
+                        legacyGlobal: SourceCoordinator.isWhoop(device)
+                            ? UserDefaults.standard.string(forKey: "noop.lastFirmware") : nil,
+                        pairedCount: registry.devices.count),
                     // Historical record layout (v24/v25 on WHOOP 4.0) observed from this connection's
                     // backfill. Distinct from the strap firmware build shown as FW.
                     liveHistoryLayout: (device.status == .active && live.connected) ? live.strapRange?.firmwareLayout : nil,
@@ -618,7 +645,7 @@ private struct DeviceSyncStatusCard: View {
 
     var body: some View {
         switch SyncChipState.resolve(live: live) {
-        case .syncing(let chunks):
+        case .syncing(let chunks, _):
             statusCard(
                 systemImage: "arrow.triangle.2.circlepath",
                 detail: chunks > 0
@@ -725,6 +752,9 @@ private struct DeviceCard: View {
     var liveBatteryPct: Int? = nil
     /// #592: strap pack voltage (mV) for the active+connected strap; nil otherwise. Shown beside the percent.
     var liveBatteryMv: Int? = nil
+    /// The attached WHOOP 5/MG battery pack's own charge. nil before its pushed pack-info event arrives,
+    /// when no pack is attached, or for every other device family.
+    var livePackSocPct: Double? = nil
     /// The active+connected strap's firmware version (from the connect handshake). nil when not the
     /// active/connected device, or for a source that reports no firmware (e.g. a non-WHOOP strap).
     var liveFirmware: String? = nil
@@ -869,6 +899,14 @@ private struct DeviceCard: View {
                             .font(StrandFont.footnote)
                             .foregroundStyle(StrandPalette.textSecondary)
                             .accessibilityLabel("Battery voltage \(Double(mv) / 1000.0, specifier: "%.2f") volts")
+                    }
+                    // The pack and strap gauges are distinct facts. Show the pack once, only while the
+                    // live event says it exists; detach/disconnect clears the source value.
+                    if let soc = livePackSocPct {
+                        Text("·").font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
+                        Text("Battery pack \(soc, specifier: "%.1f")%")
+                            .font(StrandFont.footnote)
+                            .foregroundStyle(StrandPalette.textSecondary)
                     }
                     if let layout = liveHistoryLayout {
                         Text("·").font(StrandFont.footnote).foregroundStyle(StrandPalette.textTertiary)
@@ -1454,9 +1492,9 @@ private struct FeatureFlagProbeSheets: ViewModifier {
 /// the result sheet — isolated for the same iOS type-checker reason as `BodyLocationProbeSheets`.
 ///
 /// The wrist selection is deliberately a second, independent confirmation rather than a button inside
-/// the start flow: `SELECT_WRIST` writes strap state that survives a disconnect, and the right/left
-/// mapping is inferred from the client enum's order rather than confirmed on hardware. A persistent
-/// write nobody has verified is exactly the kind of thing that should cost a deliberate extra tap.
+/// the start flow: `SELECT_WRIST` writes strap state that survives a disconnect. The right/left mapping
+/// is no longer a guess (right=1/left=2, from the official parser and the firmware constructor), but a
+/// persistent write NOOP has not verified on its own hardware still costs a deliberate extra tap.
 private struct EcgProbeSheets: ViewModifier {
     @EnvironmentObject var model: AppModel
     @EnvironmentObject var live: LiveState
@@ -1543,8 +1581,8 @@ private struct FeatureFlagProbeResultView: View {
 
 /// The wrist-selection step: the one ECG command that writes strap state outliving the session, so it
 /// gets its own screen, its own warning, and its own confirmation rather than a button inside the start
-/// flow. The copy names both caveats plainly — that the value persists on the strap, and that the
-/// left/right mapping is read off the order in WHOOP's own app rather than verified on hardware.
+/// flow. The copy names both facts plainly — that the value persists on the strap, and where the
+/// left/right mapping comes from.
 private struct EcgWristSheet: View {
     let onPick: (Whoop5Ecg.WristSelection) -> Void
     let onCancel: () -> Void
@@ -1558,7 +1596,7 @@ private struct EcgWristSheet: View {
                 .font(StrandFont.subhead)
                 .foregroundStyle(StrandPalette.statusWarning)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("It is also not fully confirmed. Which value means “left” and which means “right” is read off the order they appear in WHOOP's own app, not verified on a strap — so it may set the opposite wrist. You can send it again with the other choice at any time, and it changes nothing about your recorded data.")
+            Text("Which value means “left” and which means “right” comes from WHOOP's own app and the strap firmware, not from a strap NOOP has tested. You can send it again with the other choice at any time, and it changes nothing about your recorded data.")
                 .font(StrandFont.caption)
                 .foregroundStyle(StrandPalette.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1737,7 +1775,8 @@ struct DeviceCardCatalog: View {
                            onMakeActive: {}, onRename: {}, onRemove: nil)
                 DeviceCard(device: Self.dev("whoop-5d", "WHOOP", "5.0 MG",
                                             Self.whoopCaps.union([.steps])),
-                           isActive: false, isLiveConnected: false,
+                           isActive: true, isLiveConnected: true,
+                           liveBatteryPct: 64, livePackSocPct: 56.9,
                            onMakeActive: {}, onRename: {}, onRemove: {})
                 // #221: a WHOOP 5/MG that's BLE-connected but whose encrypted bond was refused (#78) — no
                 // data flows despite the link being up. Renders the "Connected · not paired" pill + the

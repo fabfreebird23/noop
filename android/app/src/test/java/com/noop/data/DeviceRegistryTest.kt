@@ -97,7 +97,7 @@ class DeviceRegistryTest {
         override suspend fun deleteStepsFor(deviceId: String) { deletedTables += "stepSample" to deviceId }
         override suspend fun deletePpgHrFor(deviceId: String) { deletedTables += "ppgHrSample" to deviceId }
         override suspend fun deletePpgWaveformFor(deviceId: String) { deletedTables += "ppgWaveformSample" to deviceId }
-        override suspend fun deleteRawImuFor(deviceId: String) { deletedTables += "rawImuSample" to deviceId }
+        override suspend fun deleteEcgWaveformFor(deviceId: String) { deletedTables += "ecgWaveformSample" to deviceId }
         override suspend fun deleteV18AuxFor(deviceId: String) { deletedTables += "v18AuxSample" to deviceId }
         override suspend fun deleteEventsFor(deviceId: String) { deletedTables += "event" to deviceId }
         override suspend fun deleteBatteryFor(deviceId: String) { deletedTables += "battery" to deviceId }
@@ -120,6 +120,13 @@ class DeviceRegistryTest {
         override suspend fun deleteLiveSessionsFor(deviceId: String) { deletedTables += "liveSession" to deviceId }
         override suspend fun deleteDismissedWorkoutsFor(deviceId: String) { deletedTables += "dismissedWorkout" to deviceId }
         override suspend fun deleteDismissedSleepsFor(deviceId: String) { deletedTables += "dismissedSleep" to deviceId }
+        override suspend fun deleteLiftExercisesFor(deviceId: String) { deletedTables += "liftExercise" to deviceId }
+        override suspend fun deleteLiftProgramsFor(deviceId: String) { deletedTables += "liftProgram" to deviceId }
+        override suspend fun deleteLiftProgramItemsFor(deviceId: String) { deletedTables += "liftProgramItem" to deviceId }
+        override suspend fun deleteLiftSessionsFor(deviceId: String) { deletedTables += "liftSession" to deviceId }
+        override suspend fun deleteLiftSetsFor(deviceId: String) { deletedTables += "liftSet" to deviceId }
+        // Editing a finished session, not a device wipe: this fake models per-device deletes only.
+        override suspend fun deleteLiftSets(ids: List<String>) {}
 
         // #771 adopt-serial re-key: sample-table re-keys are unmodelled here (no per-table storage in
         // this fake), same as the delete*For no-ops above for those tables. dayOwnership IS modelled
@@ -134,7 +141,7 @@ class DeviceRegistryTest {
         override suspend fun reKeySteps(from: String, to: String) {}
         override suspend fun reKeyPpgHr(from: String, to: String) {}
         override suspend fun reKeyPpgWaveform(from: String, to: String) {}
-        override suspend fun reKeyRawImu(from: String, to: String) {}
+        override suspend fun reKeyEcgWaveform(from: String, to: String) {}
         override suspend fun reKeyV18Aux(from: String, to: String) {}
         override suspend fun reKeyEvents(from: String, to: String) {}
         override suspend fun reKeyBattery(from: String, to: String) {}
@@ -153,6 +160,11 @@ class DeviceRegistryTest {
         override suspend fun reKeyLiveSessions(from: String, to: String) {}
         override suspend fun reKeyDismissedWorkouts(from: String, to: String) {}
         override suspend fun reKeyDismissedSleeps(from: String, to: String) {}
+        override suspend fun reKeyLiftExercises(from: String, to: String) {}
+        override suspend fun reKeyLiftPrograms(from: String, to: String) {}
+        override suspend fun reKeyLiftProgramItems(from: String, to: String) {}
+        override suspend fun reKeyLiftSessions(from: String, to: String) {}
+        override suspend fun reKeyLiftSets(from: String, to: String) {}
 
         /** The registry row for [id], or null (#771 adopt-serial needs the active row's fields). */
         override suspend fun pairedDevice(id: String): PairedDeviceRow? = devices[id]
@@ -312,7 +324,7 @@ class DeviceRegistryTest {
         // were missing, leaving raw sleep-state, lab markers, live sessions and dismissed markers behind.
         val expectedTables = setOf(
             "hrSample", "rrInterval", "spo2Sample", "skinTempSample", "respSample", "gravitySample",
-            "stepSample", "ppgHrSample", "ppgWaveformSample", "rawImuSample", "v18AuxSample",
+            "stepSample", "ppgHrSample", "ppgWaveformSample", "ecgWaveformSample", "v18AuxSample",
             "event", "battery", "dailyMetric", "sleepSession",
             "journal", "workout", "appleDaily", "metricSeries", "dayOwnership",
             "scoreInputProvenance",
@@ -321,6 +333,10 @@ class DeviceRegistryTest {
             // `.noopbak` restored from iOS carries its rows — and THIS path is "Remove Apple Health
             // imported data", so leaving them behind would be the plainest form of the defect.
             "appleStepHour",
+            // v46-lift-log: the strength log, CHILD rows included. liftProgramItem and liftSet join to
+            // their parents by id rather than by a foreign key, so clearing only the parents would leave
+            // every logged set behind.
+            "liftExercise", "liftProgram", "liftProgramItem", "liftSession", "liftSet",
         )
         assertEquals(expectedTables, dao.deletedTables.map { it.first }.toSet())
         // Every delete was scoped to the requested device, not the seeded my-whoop.

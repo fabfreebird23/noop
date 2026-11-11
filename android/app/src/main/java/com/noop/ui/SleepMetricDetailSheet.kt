@@ -32,11 +32,18 @@ import androidx.compose.runtime.setValue
 // MARK: - Sleep metric detail sheet
 
 @Composable
-internal fun SleepMetricDetailSheetContent(vm: AppViewModel, key: String) {
+internal fun SleepMetricDetailSheetContent(
+    vm: AppViewModel,
+    key: String,
+    imported: ImportedSleepSeries = ImportedSleepSeries(),
+    napSleepMinByDay: Map<String, Double> = emptyMap(),
+) {
     val days by vm.recentDays.collectAsStateWithLifecycle()
     var range by remember { mutableStateOf(SleepMetricRange.MONTH) }
     val spec = remember(key) { sleepMetricSpec(key) }
-    val allPoints = remember(days, key) { buildSleepMetricPoints(days, key) }
+    val allPoints = remember(days, key, imported, napSleepMinByDay) {
+        buildSleepMetricPoints(days, key, imported, napSleepMinByDay)
+    }
     val filteredPoints = remember(allPoints, range) { filterSleepMetricPoints(allPoints, range) }
 
     Column(
@@ -111,6 +118,9 @@ internal fun SleepMetricDetailSheetContent(vm: AppViewModel, key: String) {
                     fill = true,
                     selectionEnabled = true,
                     selectionLabels = filteredPoints.map { shortDayLabel(it.first) },   // #691: hover shows date + value
+                    // #1662: the same `spec.format` + unit the max/avg/min column to the left renders,
+                    // so the tapped point and the column beside it read identically.
+                    formatValue = { "${spec.format(it)} ${spec.unit}".trim() },
                 )
             }
             Row(modifier = Modifier.fillMaxWidth()) {
@@ -138,4 +148,3 @@ internal fun SleepMetricDetailSheetContent(vm: AppViewModel, key: String) {
         }
     }
 }
-

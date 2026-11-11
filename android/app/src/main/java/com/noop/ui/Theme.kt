@@ -165,6 +165,17 @@ object Palette {
     val restBright get() = if (isClassic) classic.restBright else active.restBright
     val restGlow get() = if (isClassic) classic.restColor else active.restGlow
 
+    /**
+     * The Rest family's most legible LINE colour — for strokes that must read on a busy or translucent
+     * surface, such as the body-clock dial's arcs over a custom background image.
+     *
+     * Introduces no new value: it selects the existing token that is the bright blue in each palette. The
+     * families are not parallel — classic's restBright is a PURPLE accent while modern's is the blue, and
+     * classic's restColor is the blue where modern's is a muted steel — so a card naming either token
+     * directly gets the right colour in one palette and the wrong one in the other. Mirrors the Swift twin.
+     */
+    val restLine get() = if (isClassic) restColor else restBright
+
     val stressColor get() = if (isClassic) classic.stressColor else active.stressColor
     val stressDeep get() = if (isClassic) classic.stressDeep else active.stressDeep
     val stressBright get() = if (isClassic) classic.stressBright else active.stressBright
@@ -413,6 +424,7 @@ object Metrics {
     val dialogScrollableMaxHeight = 560.dp
     val divider = 1.dp
     val compactChartHeight = chartHeight - 90.dp
+    val chartAxisLabelWidth = 40.dp
     val selectorTopUp = sectionGap - screenRowSpacing
     val iconButton = 36.dp
     val iconSmall = 18.dp
@@ -511,14 +523,16 @@ object NoopType {
 
 /** Build the Material3 colour scheme from a token set. Dark/light differ only in the builder used
  *  (which sets sensible defaults for the slots we don't override); the NOOP surfaces are all driven
- *  by `Palette.*` directly, so this only feeds Material components (text fields, switches, etc.). */
-private fun noopColorScheme(t: PaletteTokens, dark: Boolean): ColorScheme {
+ *  by `Palette.*` directly, so this only feeds Material components (text fields, switches, etc.).
+ *  Resolve chrome accents through Palette too, so these controls honor the live accent preference.
+ *  NoopTheme installs [t] as Palette.active before building this scheme. */
+internal fun noopColorScheme(t: PaletteTokens, dark: Boolean): ColorScheme {
     val base = if (dark) darkColorScheme() else lightColorScheme()
     return base.copy(
-        primary = t.accent,
+        primary = Palette.accent,
         onPrimary = if (dark) t.surfaceBase else t.goldDeepText,
-        primaryContainer = t.accentMuted,
-        onPrimaryContainer = if (dark) t.accentHover else t.accent,
+        primaryContainer = Palette.accentMuted,
+        onPrimaryContainer = if (dark) Palette.accentHover else Palette.accent,
         secondary = t.metricPurple,
         onSecondary = if (dark) t.surfaceBase else Color(0xFFFFFFFF),
         background = t.surfaceBase,

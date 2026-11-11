@@ -267,7 +267,9 @@ just the most recent (step through earlier nights to compare):
   each as "Xh Ym · NN%", with time-in-bed, efficiency, and onset–wake times.
 - **Night detail** — a uniform tile grid, each with a sparkline and a "vs typical" caption: Sleep
   Performance, Efficiency, Consistency, Hours vs Needed, Restorative (deep + REM share),
-  Respiratory, and Sleep Debt (vs your personal sleep need, floored at 7.5 h).
+  Respiratory, and Sleep Debt. Debt is 55% of the current unmet personalized need, carried into the
+  next night's target; values below 10 minutes read as balanced instead of stacking into an
+  unrepayable 14-night hours bank.
 - **Stages vs typical** — Deep / REM / Light as horizontal bars, last-night minutes with a marker
   at your personal mean, so highs and lows pop.
 - **Asleep duration** — a trailing-30-night hours trend with avg / min / max.
@@ -508,6 +510,23 @@ of history. On-device and approximate — informational only, **not** a diagnosi
   figures read closer to reality.
 - **Units** — choose your preferred measurement units (metric / imperial) across the app.
 - **Strap** — connection status, battery, and Re-scan / Disconnect controls.
+- **Sync (iOS)** — its own section with **Keep screen on while syncing**: opt-in (off by default). Holds
+  the screen awake for as long as a strap history sync runs while NOOP is open, then lets it sleep
+  normally.
+- **Siri & Shortcuts (iOS)** — a **Sync Strap** action ("Sync my NOOP strap") starts the same on-demand
+  history sync as the Sync now button, from Siri, Spotlight, the Shortcuts app, a Back Tap or an
+  automation, **without opening NOOP**. If the strap link is already up (NOOP in the background) the
+  sync starts at once and the reply says so. If NOOP had to be launched for the shortcut and is still
+  connecting, the request is parked and runs the moment the connect handshake settles, and the reply
+  says NOOP is connecting and will sync when ready.
+- **Strap-sync Live Activity (iOS)** — while history syncs, the Lock Screen and Dynamic Island show
+  the same read-out as the Today sync control: Connecting… / Syncing… with the chunk count, the elapsed
+  time, and the strap's connect-time backlog when it reported one; then "Synced · N chunks" or "Sync
+  interrupted" for a few seconds. No progress bar, because the strap never says how much is pending. A
+  sync started from the app or the Sync Strap shortcut shows it; an automatic background sync can only
+  update one that is already showing (iOS does not let a background app start a Live Activity). Its own
+  switch in Settings → Strap ("Strap sync in Dynamic Island", default on), independent of the live
+  heart rate one.
 - **Export for Shortcuts (iOS)** — a **HealthKit-free** path that hands your NOOP metrics to Apple
   Health via the Shortcuts app, so an anonymous build (with no HealthKit entitlement) can still get
   data into Health on your terms.

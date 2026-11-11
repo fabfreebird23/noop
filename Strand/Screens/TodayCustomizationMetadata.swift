@@ -48,6 +48,8 @@ extension KeyMetric {
         case .steps: return "figure.walk"
         case .weight: return "scalemass"
         case .calories: return "flame.fill"
+        // Same glyph the sibling "Your Cards" tile (`DashboardCard.skinTemp`) already uses.
+        case .skinTemp: return "thermometer.medium"
         }
     }
 
@@ -59,7 +61,7 @@ extension KeyMetric {
         case .restingHr: return StrandPalette.metricRose
         case .bloodOxygen, .steps: return StrandPalette.metricCyan
         case .respiratory, .weight: return StrandPalette.accent
-        case .calories: return StrandPalette.metricAmber
+        case .calories, .skinTemp: return StrandPalette.metricAmber
         }
     }
 }
@@ -72,10 +74,11 @@ extension DashboardCard {
         case .vo2max: return StrandPalette.chargeColor
         case .vitality, .hrv: return StrandPalette.metricPurple
         case .restingHr: return StrandPalette.metricRose
-        case .steps, .bloodOxygen, .hydration: return StrandPalette.metricCyan
+        case .steps, .stepsAverage30, .bloodOxygen, .hydration: return StrandPalette.metricCyan
         case .skinTemp, .calories: return StrandPalette.metricAmber
         case .sleep: return StrandPalette.restColor
         case .coupled: return StrandPalette.chargeColor
+        case .coach: return StrandPalette.accent
         }
     }
 }

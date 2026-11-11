@@ -29,6 +29,12 @@ final class NavRouter: ObservableObject {
         case activeWorkout
         case liveSession
         case journal
+        /// #1862: the Coach screen, opened from the Today Coach launcher sheet once the user picks a
+        /// suggestion or submits the composer. The launcher deliberately owns no send/stream/consent
+        /// surface of its own — it hands the question to the one screen that already has them.
+        /// Also the K5 scheduled morning-brief notification's tap-through target.
+        case coach
+        case alarms
 
         var id: String { rawValue }
 
@@ -60,6 +66,10 @@ final class NavRouter: ObservableObject {
 
     /// Ask the shell to open the Devices manager (pair / switch bands). The shell decides how.
     func openDevices() { requestedDestination = .devices }
+    /// #1862: open Coach, optionally with a question the launcher already collected.
+    func openCoach() { requestedDestination = .coach }
+    /// Open the existing wake-alarm and wind-down settings from Sleep.
+    func openAlarms() { requestedDestination = .alarms }
     /// Open the v5 Insights hub (the n-of-1 "what moves your Charge" surface).
     func openInsightsHub() { requestedDestination = .insightsHub }
     /// Open the Lab Book (private health-records logbook).

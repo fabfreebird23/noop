@@ -1,5 +1,6 @@
 package com.noop.analytics
 
+import com.noop.data.DailyMetric
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -123,11 +124,65 @@ class RecoveryDriversTest {
                     value = 29.99117725828923,
                     baseline = 30.0,
                     unit = ChargeDriverUnit.MILLISECONDS,
-                    verdict = ChargeDriverVerdict.BELOW_BASELINE_LIMITING,
+                    verdict = ChargeDriverVerdict.SLIGHTLY_BELOW_BASELINE_LIMITING,
                 ),
             ),
             drivers,
         )
+    }
+
+    @Test fun verdictsMatchDisplayedPrecisionAndRoundedPoints() {
+        val cases = listOf(
+            VerdictCase(51.3, 50.8, 1, 0, ChargeDriverVerdict.SLIGHTLY_ABOVE_BASELINE_SUPPORTING),
+            VerdictCase(51.3, 50.8, -1, 0, ChargeDriverVerdict.SLIGHTLY_ABOVE_BASELINE_LIMITING),
+            VerdictCase(50.8, 51.3, 1, 0, ChargeDriverVerdict.SLIGHTLY_BELOW_BASELINE_SUPPORTING),
+            VerdictCase(50.8, 51.3, -1, 0, ChargeDriverVerdict.SLIGHTLY_BELOW_BASELINE_LIMITING),
+            VerdictCase(17.0, 16.0, 0, 1, ChargeDriverVerdict.ABOVE_BASELINE_TOO_SMALL),
+            VerdictCase(15.0, 16.0, 0, 1, ChargeDriverVerdict.BELOW_BASELINE_TOO_SMALL),
+            VerdictCase(51.3, 50.8, 0, 0, ChargeDriverVerdict.AT_BASELINE),
+        )
+
+        cases.forEach { case ->
+            assertEquals(
+                case.expected,
+                RecoveryDrivers.baselineVerdict(
+                    value = case.value,
+                    baseline = case.baseline,
+                    deltaPoints = case.points,
+                    fractionDigits = case.fractionDigits,
+                ),
+            )
+        }
+    }
+
+    @Test fun skinTempVerdictUsesRoundedPointEffect() {
+        assertEquals(
+            ChargeDriverVerdict.NEAR_BASELINE,
+            RecoveryDrivers.skinTempVerdict(dev = 0.2, deltaPoints = 0),
+        )
+        assertEquals(
+            ChargeDriverVerdict.WARMER_THAN_BASELINE_LIMITING,
+            RecoveryDrivers.skinTempVerdict(dev = 0.2, deltaPoints = -1),
+        )
+        assertEquals(
+            ChargeDriverVerdict.COOLER_THAN_BASELINE_LIMITING,
+            RecoveryDrivers.skinTempVerdict(dev = -0.2, deltaPoints = -1),
+        )
+    }
+
+    @Test fun restingHRRowCannotSayAboveWhenDisplayedValuesMatch() {
+        val drivers = RecoveryDrivers.chargeDrivers(
+            hrv = 50.0, rhr = 51.3, resp = null,
+            hrvBaseline = baseline(50.0, 6.0),
+            rhrBaseline = baseline(50.8, 0.1),
+            respBaseline = null, sleepPerf = null,
+        )
+        val rhr = drivers.first { it.label == ChargeDriverLabel.RESTING_HEART_RATE }
+
+        assertEquals(51L, Math.round(rhr.value))
+        assertEquals(51L, Math.round(rhr.baseline!!))
+        assertTrue(rhr.deltaPoints < 0)
+        assertEquals(ChargeDriverVerdict.SLIGHTLY_ABOVE_BASELINE_LIMITING, rhr.verdict)
     }
 
     @Test fun allTermsPresentYieldOneRowEachInOrder() {
@@ -275,5 +330,110 @@ class RecoveryDriversTest {
             hrvBaseline = BaselineState(50.0, 5.0, 2, 0, BaselineStatus.CALIBRATING),
             rhrBaseline = null, respBaseline = null, sleepPerf = 0.9,
         ))
+    }
+
+    @Test fun pass2SkinTempDeviationBeforeRecoveryScoring() {
+        val daily = recoveryDailyFixture()
+        val baselines = ProfileBaselines(
+            hrv = recoveryBaseline(50.0, 6.0), skinTemp = recoveryBaseline(34.5, 0.4),
+        )
+        val withoutSkin = expectedRecovery(daily, baselines, null)
+
+        for ((nightly, deviation) in listOf(34.804 to 0.3, 34.196 to -0.3)) {
+            val result = IntelligenceEngine.recomputeRecoveryDaily(daily, nightly, baselines)
+            val expected = requireNotNull(expectedRecovery(daily, baselines, deviation))
+            assertTrue("Fixture must distinguish a missing temperature term", expected != withoutSkin)
+            assertEquals(expected, result.recovery)
+            assertEquals(deviation, result.skinTempDevC)
+            assertEquals(nightly, result.skinTempC)
+            // Undo only the three intended substitutions; every other daily field must survive.
+            assertEquals(daily, result.copy(
+                recovery = daily.recovery, skinTempDevC = daily.skinTempDevC, skinTempC = daily.skinTempC,
+            ))
+        }
+    }
+
+    @Test fun pass2MissingOrUnusableSkinBaselineClearsStaleDeviation() {
+        val daily = recoveryDailyFixture().copy(recovery = 99.0, skinTempDevC = 9.0, skinTempC = 36.0)
+        val usable = recoveryBaseline(34.5, 0.4)
+        val cases = listOf(
+            null to usable, 34.8 to null,
+            34.8 to recoveryBaseline(34.5, 0.4, BaselineStatus.CALIBRATING),
+            34.8 to recoveryBaseline(34.5, 0.4, BaselineStatus.STALE),
+        )
+        for ((nightly, skinBaseline) in cases) {
+            val baselines = ProfileBaselines(hrv = recoveryBaseline(50.0, 6.0), skinTemp = skinBaseline)
+            val result = IntelligenceEngine.recomputeRecoveryDaily(daily, nightly, baselines)
+            assertNull(result.skinTempDevC)
+            assertEquals(nightly, result.skinTempC)
+            assertEquals(expectedRecovery(daily, baselines, null), result.recovery)
+        }
+    }
+
+    @Test fun pass2SkinTemperatureDoesNotBypassHrvColdStart() {
+        for (hrv in listOf(null, recoveryBaseline(50.0, 6.0, BaselineStatus.CALIBRATING))) {
+            val result = IntelligenceEngine.recomputeRecoveryDaily(
+                recoveryDailyFixture(), 34.8,
+                ProfileBaselines(hrv = hrv, skinTemp = recoveryBaseline(34.5, 0.4)),
+            )
+            assertNull(result.recovery)
+            assertEquals(0.3, result.skinTempDevC)
+        }
+    }
+
+    private fun recoveryBaseline(
+        mean: Double, spread: Double, status: BaselineStatus = BaselineStatus.TRUSTED,
+    ) = BaselineState(
+        baseline = mean, spread = spread, nValid = if (status == BaselineStatus.CALIBRATING) 3 else 14,
+        nightsSinceUpdate = if (status == BaselineStatus.STALE) 15 else 0, status = status,
+    )
+
+    private fun recoveryDailyFixture() = DailyMetric(
+        deviceId = "test-noop", day = "2026-09-09", totalSleepMin = 420.0, efficiency = 0.85,
+        deepMin = 80.0, remMin = 90.0, lightMin = 250.0, disturbances = 2,
+        restingHr = 58, avgHrv = 48.0, recovery = 99.0, strain = 61.0, exerciseCount = 2,
+        spo2Pct = 97.0, skinTempDevC = null, respRateBpm = 15.0, steps = 42, activeKcalEst = 1_840.0,
+        spo2Red = 100, spo2Ir = 200, avgSdnn = 44.0, skinTempC = null, sleepHrOnly = true,
+    )
+
+    private fun expectedRecovery(daily: DailyMetric, baselines: ProfileBaselines, skinDev: Double?) =
+        RecoveryScorer.recovery(
+            hrv = 48.0, rhr = 58.0, resp = 15.0, hrvBaseline = baselines.hrv!!, rhrBaseline = null,
+            respBaseline = null,
+            sleepPerf = RestScorer.restFromDaily(daily)?.let { it / 100.0 } ?: daily.efficiency,
+            skinTempDev = skinDev,
+        )
+
+    private data class VerdictCase(
+        val value: Double,
+        val baseline: Double,
+        val points: Int,
+        val fractionDigits: Int,
+        val expected: ChargeDriverVerdict,
+    )
+
+    /**
+     * Oracle for [RecoveryDrivers.displayRounded], generated by the Swift twin and pasted verbatim, so
+     * the two cannot drift. Exact equality, not a tolerance: this helper is what makes a row and its
+     * verdict agree, and an ULP of slack would let them disagree again. Halves round away from zero on
+     * both signs, which is why `Math.round`, being half-UP, is mirrored for negatives.
+     */
+    @Test
+    fun displayRounded_matchesSwift() {
+        val cases = listOf(
+            Triple(0.0, 0, 0.0), Triple(51.4, 0, 51.0), Triple(51.5, 0, 52.0),
+            Triple(50.8, 0, 51.0), Triple(-51.5, 0, -52.0),
+            Triple(0.0, 1, 0.0), Triple(8.25, 1, 8.3), Triple(15.25, 1, 15.3),
+            Triple(16.05, 1, 16.1), Triple(15.0, 1, 15.0), Triple(20.95, 1, 21.0),
+            Triple(-8.25, 1, -8.3), Triple(-0.35, 1, -0.4),
+        )
+        cases.forEach { (value, digits, expected) ->
+            assertEquals(
+                "displayRounded($value, $digits)",
+                expected,
+                RecoveryDrivers.displayRounded(value, digits),
+                0.0,
+            )
+        }
     }
 }

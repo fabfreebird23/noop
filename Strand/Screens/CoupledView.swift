@@ -46,9 +46,7 @@ struct CoupledView: View {
     /// the cold-start threshold, which keeps the broad overnight-band bonus.
     @State private var habitualMidsleepSec: Int? = nil
 
-    /// #614: TODAY's workout count from the SAME deduped/dismissed-filtered list the Workouts screen shows
-    /// (`repo.workoutRows`), not `DailyMetric.exerciseCount` (strap-DETECTED only — a Health-Connect import
-    /// with auto-detect off read as 0 while the Workouts screen showed it). Loaded in `.task`.
+    /// Today's all-source workout count materialized onto the same physiological cycle as the other cards.
     @State private var workoutsToday: Int = 0
 
     /// The day the coupled read describes, today's resolved row (the same `resolveToday` #304/#144 boundary
@@ -61,8 +59,8 @@ struct CoupledView: View {
     /// Recovery cold-start: nights banked so far while the HRV baseline still seeds, nil once recovery
     /// exists. The SAME pure helper Today's ring reads, so the two screens can't disagree.
     private var calibrationNights: Int? {
-        RecoveryScorer.calibrationNights(nightlyHrv: repo.days.map(\.avgHrv),
-                                         dayKeys: repo.days.map(\.day),
+        RecoveryScorer.calibrationNights(nightlyHrv: repo.chargeBaselines?.hrvHistory.values ?? [],
+                                         dayKeys: repo.chargeBaselines?.hrvHistory.dayKeys ?? [],
                                          hasRecovery: day?.recovery != nil)
     }
 
@@ -159,14 +157,7 @@ struct CoupledView: View {
         // bed→wake span below resolves identically (#294). Re-runs on a sync/import refresh.
         .task(id: repo.refreshSeq) {
             habitualMidsleepSec = await repo.habitualMidsleepSec()
-            // #614: count TODAY's workouts by their START's logical day (the SAME 04:00-rollover key
-            // DailyMetric.day uses), so the Coupled stat equals the Workouts overview for today.
-            let key = todayKey
-            // A short window is enough to count today's rows (the cross-source dedup is local to the set),
-            // and avoids loading the full history just for one number.
-            workoutsToday = await repo.workoutRows(days: 2).filter {
-                Repository.logicalDayKey(Date(timeIntervalSince1970: TimeInterval($0.startTs))) == key
-            }.count
+            workoutsToday = day?.exerciseCount ?? 0
         }
     }
 
@@ -339,7 +330,7 @@ struct CoupledView: View {
                                  caloriesText,
                                  tint: StrandPalette.metricAmber)
                         heroStat(String(localized: "Workouts"),
-                                 "\(workoutsToday)",   // #614: real workout count (all sources), not exerciseCount
+                                 "\(workoutsToday)",
                                  tint: StrandPalette.textPrimary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -417,8 +408,11 @@ struct CoupledView: View {
                         // Left: the SLEEP PERFORMANCE % as the liquid vessel (Rest world), with the score
                         // counting up over the fluid. Empty vessel when there's no scored performance.
                         ZStack {
+                            // heroCard opts its vessel out of hit testing so the Button owns the tap;
+                            // this ring keeps its splash instead and lets the NavigationLink run alongside.
                             LiquidVessel(value: sleepPerformance.map { max(0, min(1, $0 / 100)) },
-                                         tint: StrandPalette.restColor, animated: false)
+                                         tint: StrandPalette.restColor, animated: false,
+                                         tapPassesThrough: true)
                                 .frame(width: 88, height: 88)
                             if let p = sleepPerformance {
                                 CountUpText(value: p,
@@ -533,28 +527,16 @@ struct CoupledView: View {
         return carriedRecoveryDay
     }
 
-    /// The ordered Charge drivers for the displayed ring PLUS the confidence tier from the SAME folded HRV
-    /// baseline — the exact TodayView derivation (pure engine scoring against the folded personal
-    /// baselines). nil for a calibrating / cold-start night, which gates the sheet through to the countdown
-    /// instead. PERF: mirrors TodayView.chargeBreakdown() — the old `chargeDrivers` property plus the
-    /// sheet's inline confidence fold re-folded the full `repo.days` history four times per body eval of
-    /// the open sheet; one call now folds each series exactly once, guards before any fold.
+    /// The ordered Charge drivers for the displayed ring PLUS the confidence tier from the SAME HRV
+    /// baseline — the exact TodayView derivation (pure engine scoring against `repo.chargeBaselines`, the
+    /// personal baselines resolved with the engine's own rule, #2525). nil for a calibrating / cold-start
+    /// night, which gates the sheet through to the countdown instead. PERF: mirrors
+    /// TodayView.chargeBreakdown() — the baselines are resolved once per refresh, so a body evaluation of
+    /// the open sheet folds nothing.
     private func chargeBreakdown() -> (drivers: [ChargeDriver], confidence: ScoreConfidence)? {
-        guard let row = breakdownRow, let hrv = row.avgHrv, let rhr = row.restingHr else { return nil }
-        let hrvBase = Baselines.foldHistory(repo.days.map(\.avgHrv), cfg: Baselines.hrvCfg)
-        guard hrvBase.usable else { return nil }
-        let rhrBase = Baselines.foldHistory(repo.days.map { $0.restingHr.map(Double.init) },
-                                            cfg: Baselines.restingHRCfg)
-        let respBase = Baselines.foldHistory(repo.days.map(\.respRateBpm), cfg: Baselines.respCfg)
-        // Rest-quality term = the same sleep performance the sleep row shows, ÷100 (AnalyticsEngine's form).
-        let sleepPerf = sleepPerformance.map { $0 / 100.0 }
-        let drivers = RecoveryScorer.chargeDrivers(
-            hrv: hrv, rhr: Double(rhr), resp: row.respRateBpm,
-            hrvBaseline: hrvBase,
-            rhrBaseline: rhrBase.usable ? rhrBase : nil,
-            respBaseline: respBase.usable ? respBase : nil,
-            sleepPerf: sleepPerf, skinTempDev: row.skinTempDevC)
-        return (drivers, ScoreConfidence.charge(recovery: row.recovery, hrvBaseline: hrvBase))
+        guard let row = breakdownRow else { return nil }
+        guard let baselines = repo.chargeBaselines else { return nil }
+        return ChargeBreakdownWiring.breakdown(baselines: baselines, row: row, sleepPerfPercent: sleepPerformance)
     }
 
     @ViewBuilder
@@ -705,12 +687,9 @@ struct CoupledView: View {
         Self.clockFmt.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
     }
 
-    private static let clockFmt: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = AppLanguage.activeLocale
-        f.setLocalizedDateFormatFromTemplate("jmm")
-        return f
-    }()
+    /// #1821: routed through AppClock so the Clock format setting reaches this label. Was a `static
+    /// let`, which would have frozen the reader's choice at first use until the app relaunched.
+    private static var clockFmt: DateFormatter { AppClock.hourMinuteFormatter() }
 
     /// "6h 42m" from a minutes count, for the slept-vs-needed read. Mirror EXACTLY in Kotlin.
     static func hoursMinutes(_ minutes: Double) -> String {

@@ -1,5 +1,6 @@
 package com.noop.ble
 
+import com.noop.protocol.StandardHrContact
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -17,11 +18,36 @@ class StandardHeartRateTest {
     private fun bytes(vararg v: Int): ByteArray = ByteArray(v.size) { v[it].toByte() }
 
     @Test
+    fun contactOnlyBufferReachesFlushThreshold() {
+        assertTrue(standardHrBufferReachedFlushThreshold(
+            hrCount = 0,
+            rrCount = 0,
+            contactCount = 30,
+        ))
+    }
+
+    @Test
+    fun contactFlagsCoverAllCombinations() {
+        val cases = listOf(
+            0x00 to StandardHrContact.UNSUPPORTED,
+            0x02 to StandardHrContact.UNSUPPORTED,
+            0x04 to StandardHrContact.SUPPORTED_NOT_DETECTED,
+            0x06 to StandardHrContact.SUPPORTED_DETECTED,
+        )
+
+        for ((flags, expected) in cases) {
+            assertEquals("flags 0x${flags.toString(16)}", expected,
+                StandardHeartRate.parse(bytes(flags, 72))!!.contact)
+        }
+    }
+
+    @Test
     fun eightBitHrNoRr() {
         // flags=0x00 (8-bit HR, no R-R), HR=72.
         val r = StandardHeartRate.parse(bytes(0x00, 72))!!
         assertEquals(72, r.hr)
         assertTrue(r.rr.isEmpty())
+        assertTrue(r.rrRawTicks.isEmpty())
     }
 
     @Test
@@ -30,6 +56,7 @@ class StandardHeartRateTest {
         val r = StandardHeartRate.parse(bytes(0x01, 0x40, 0x01))!!
         assertEquals(320, r.hr)
         assertTrue(r.rr.isEmpty())
+        assertTrue(r.rrRawTicks.isEmpty())
     }
 
     @Test
@@ -38,6 +65,7 @@ class StandardHeartRateTest {
         val r = StandardHeartRate.parse(bytes(0x10, 60, 0x00, 0x04))!!
         assertEquals(60, r.hr)
         assertEquals(listOf(1000), r.rr)
+        assertEquals(listOf(1024), r.rrRawTicks)
     }
 
     @Test
@@ -46,6 +74,7 @@ class StandardHeartRateTest {
         val r = StandardHeartRate.parse(bytes(0x10, 58, 0x00, 0x02, 0x00, 0x04))!!
         assertEquals(58, r.hr)
         assertEquals(listOf(500, 1000), r.rr)
+        assertEquals(listOf(512, 1024), r.rrRawTicks)
     }
 
     @Test
@@ -55,6 +84,7 @@ class StandardHeartRateTest {
         val r = StandardHeartRate.parse(bytes(0x18, 65, 0xFF, 0x00, 0x00, 0x04))!!
         assertEquals(65, r.hr)
         assertEquals(listOf(1000), r.rr)
+        assertEquals(listOf(1024), r.rrRawTicks)
     }
 
     @Test

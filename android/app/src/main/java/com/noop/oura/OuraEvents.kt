@@ -128,6 +128,93 @@ data class OuraSpO2(
     val count: Int = 1,
 )
 
+/**
+ * Which physical quantity an [OuraSpO2.unit] tag describes.
+ *
+ * The ring sends TWO things down the same `.spo2` event and they are three orders of magnitude apart:
+ * 0x6F/0x7B carry a firmware-computed PERCENTAGE, and 0x77 carries a raw DC perfusion magnitude
+ * (-1,016 … 11,709,098 in one overnight capture). Only the unit tag survives decode to tell them
+ * apart, so anything that reports a value to a human has to ask this before it names it.
+ *
+ * WHY THIS TYPE EXISTS RATHER THAN A `unit == "raw"` CHECK AT EACH SITE. The strap log's
+ * "first SpO2 decoded" line printed whichever sample the drain happened to serve first, with no
+ * channel in the text — so on one reconnect it read `value 93 (raw)` and on the next
+ * `value 101144 (dc_raw)`, from the same ring, minutes apart. A reporter read the five-digit one as a
+ * percentage and opened a defect against SpO2 that was never wrong. A log line may only assert what it
+ * can attribute; this makes the attribution a value rather than a string comparison.
+ *
+ * Both known tags are matched EXACTLY; anything else is UNKNOWN, which names its tag and never claims a
+ * percentage. Treating "not perfusion" as a percentage would print a case variant or a future tag's
+ * magnitude with a `%` on it, which is the defect this type exists to stop. OuraStreamMapping (both
+ * platforms) keeps its own `unit == "raw"` allow-list for the same reason from the other side: it is a
+ * persistence gate, so an unrecognised unit falls on the "do not store" side there and on the "do not
+ * call it a percentage" side here. Twin of Swift `OuraSpO2Channel`.
+ */
+enum class OuraSpO2Channel {
+    /**
+     * 0x6F / 0x7B — a firmware-computed SpO2 percentage. (The unit tag is the legacy string `"raw"`,
+     * which names the CHANNEL, not the quantity; see `decodeSpO2Event`.)
+     */
+    PERCENTAGE,
+
+    /** 0x77 — a raw DC perfusion magnitude. Not a percentage, and never stored as one. */
+    PERFUSION,
+
+    /** A unit tag no decoder stamps today (a case variant, or a future tag). Named, never a percentage. */
+    UNKNOWN,
+    ;
+
+    /**
+     * How this channel is named in the strap log. Spelled out rather than printed as the unit tag:
+     * `"raw"` names the CHANNEL, not the quantity, and reads as "unprocessed" to everyone who has not
+     * read `decodeSpO2PerSample`. Twin of Swift `OuraSpO2Channel.logLabel`.
+     */
+    val logLabel: String get() = when (this) {
+        PERCENTAGE -> "SpO2 percentage"
+        PERFUSION -> "SpO2 raw DC perfusion (NOT a percentage)"
+        UNKNOWN -> "SpO2 sample on an unrecognised channel (NOT known to be a percentage)"
+    }
+
+    companion object {
+        /** The unit tag 0x6F and 0x7B stamp on their samples (`OuraSpO2`'s default). */
+        const val PERCENTAGE_UNIT = "raw"
+
+        /** The unit tag 0x77 stamps on its samples. */
+        const val PERFUSION_UNIT = "dc_raw"
+
+        /**
+         * Resolve a sample's channel from its unit tag. Both known tags match exactly (case-sensitive,
+         * like the tag); anything else is UNKNOWN rather than a guess. Twin of Swift
+         * `OuraSpO2Channel.forUnit`.
+         */
+        fun forUnit(unit: String): OuraSpO2Channel = when (unit) {
+            PERCENTAGE_UNIT -> PERCENTAGE
+            PERFUSION_UNIT -> PERFUSION
+            else -> UNKNOWN
+        }
+
+        /**
+         * The strap-log body for "the first sample of this channel arrived this session", WITHOUT
+         * either platform's `Oura: ` prefix (each source adds its own, as it does for every other line).
+         *
+         * It lives here, not at the two call sites, for the reason the whole type exists: the two
+         * platforms must not be able to disagree about what they call these numbers. The unit tag is
+         * still printed, so a log can be matched back to the decoder, and the `%` is appended ONLY on
+         * the percentage channel — a perfusion magnitude with a `%` on it is the original bug in a new
+         * costume. Twin of Swift `OuraSpO2Channel.firstDecodedLogLine`; `OuraSpO2ChannelOracleTest`
+         * asserts this against that function's own stdout.
+         */
+        fun firstDecodedLogLine(value: Int, unit: String): String {
+            val c = forUnit(unit)
+            val pct = if (c == PERCENTAGE) " %" else ""
+            return "first ${c.logLabel} decoded (last night) - $value$pct (channel \"$unit\")"
+        }
+    }
+}
+
+/** What this sample's number actually is. See [OuraSpO2Channel]. */
+val OuraSpO2.channel: OuraSpO2Channel get() = OuraSpO2Channel.forUnit(unit)
+
 /** One decoded skin-temperature sample in degrees C (value already / 100). */
 data class OuraTemp(val ringTimestamp: Long, val celsius: Double)
 
@@ -266,11 +353,13 @@ data class OuraTierBSummary(
 /**
  * One decoded `0x50` activity_info record: a `state` code (activity-category; meaning unconfirmed)
  * plus a per-sample MET (metabolic-equivalent) series. THIRD-PARTY FORMULA (OURA_PROTOCOL.md s6.13,
- * [oura-rs] - clean-room fact citation, no code copied): plausible against six real Gen 3 captures
- * from PR #960's investigation (resting ~0.9 MET through a vigorous-activity burst at 7.4 MET, all
- * physiologically sane), but NOT independently ground-truth-validated against the Oura app's own
- * numbers. It therefore stays Tier B: emitted only behind `OuraDriver.allowTierB`, and NEVER folded
- * into `OuraStreamMapping`/`Streams`/scoring (steps stay honest - no step count is minted from MET).
+ * [oura-rs] - clean-room fact citation, no code copied): the two-slope byte formula IS validated at
+ * DAY scale against Oura's own MET export (#2565 - day sums reproduce on 10/10 clean days within
+ * 1-8%), so it is no longer merely plausible. It stays Tier B for narrower reasons than being
+ * unverified: per MINUTE only 85% of values match the export exactly, and a workout the wearer
+ * CONFIRMS in the Oura app floors that session's minutes, so the app's own figure can sit well above
+ * the wire. Emitted only behind `OuraDriver.allowTierB`, and NEVER folded into
+ * `OuraStreamMapping`/`Streams`/scoring (steps stay honest - no step count is minted from MET).
  * Kotlin twin of the Swift `OuraActivityInfo` (met as List<Double> keeps structural equality).
  */
 data class OuraActivityInfo(val ringTimestamp: Long, val state: Int, val met: List<Double>)

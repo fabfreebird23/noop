@@ -55,6 +55,7 @@ struct DataSourcesView: View {
     // LOCAL Bluetooth only — nothing leaves the device. The toggle is persisted; the broadcaster is owned
     // here (a pure consumer of LiveState, isolated from the WHOOP/central path).
     @AppStorage(HrBroadcaster.defaultsKey) private var broadcastHrEnabled = false
+    @AppStorage(PuffinExperiment.broadcastHrKey) private var strapBroadcastHrEnabled = false
 
     // The broadcaster's diagnostic sink forwards to THIS box, which `onAppear` points at the screen's
     // `live`. A reference box lets the `@StateObject` capture a stable target at init even though the
@@ -914,15 +915,38 @@ struct DataSourcesView: View {
         // Three-state, consistent with the Live screen's connection pill — a connected-but-
         // not-yet-streaming strap (e.g. an experimental WHOOP 5/MG link) no longer reads as
         // "Not connected" on one screen and "Connected" on another (issue #8).
-        let (tone, label): (StrandTone, LocalizedStringKey) =
-            live.bonded ? (.positive, "Bonded, streaming.")
-            : live.connected ? (.warning, "Connected.")
-            : (.critical, "Not connected. Open Live to pair.")
+        // Written as statements rather than a ternary chain: five arms of (StrandTone,
+        // LocalizedStringKey) tuples is the shape that pushes this expression past the iOS type-check
+        // budget, and it fails in CI rather than here.
+        let tone: StrandTone
+        let label: LocalizedStringKey
+        if live.encryptedBond {
+            tone = .positive; label = "Bonded, streaming."
+        } else if live.bonded {
+            tone = .warning; label = "Live HR (not fully paired)"
+        } else if live.connected {
+            tone = .warning; label = "Connected."
+        } else {
+            tone = .critical; label = "Not connected. Open Live to pair."
+        }
         return card(title: String(localized: "WHOOP Strap (Live BLE)"), icon: "antenna.radiowaves.left.and.right",
              tint: StrandPalette.accent,
              status: StatePill(label, tone: tone, pulsing: live.connected && !live.bonded),
              subtitle: String(localized: "Pairs directly with your strap over Bluetooth: no WHOOP app, no cloud.")) {
-            EmptyView()
+            Toggle(isOn: $strapBroadcastHrEnabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Broadcast heart rate from the strap")
+                        .font(StrandFont.subhead)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                    Text("Broadcasts the strap's own live heart rate over Bluetooth.")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                }
+            }
+            .toggleStyle(.switch)
+            .tint(StrandPalette.accent)
+            .accessibilityLabel("Broadcast heart rate from the strap")
+            .onChangeCompat(of: strapBroadcastHrEnabled) { model.ble.setBroadcastHr($0) }
         }
     }
 

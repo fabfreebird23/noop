@@ -13,6 +13,10 @@ final class AutoWorkoutDetectorTraceTests: XCTestCase {
         (0..<durS).map { (ts: start + $0, bpm: bpm) }
     }
 
+    private func elapsedSpan(_ start: Int, _ elapsedS: Int, _ bpm: Int) -> [(ts: Int, bpm: Int)] {
+        (0...elapsedS).map { (ts: start + $0, bpm: bpm) }
+    }
+
     func testTraceResultsAreByteIdenticalToDetect() {
         let start = 1_000_000
         let durS = 20 * 60
@@ -51,6 +55,56 @@ final class AutoWorkoutDetectorTraceTests: XCTestCase {
         XCTAssertTrue(lines.contains { $0.contains("verdict=dropped why=overlapsSavedWorkout") })
     }
 
+    func testSavedOverlapEvidenceMatchesOracleAndPreservesPolicy() {
+        let start = 1_000_000
+        let end = start + 5400
+        let hr = elapsedSpan(start, 5400, 120)
+        let cases: [(String, [SavedWorkoutSpan])] = [
+            ("short", [SavedWorkoutSpan(startSec: start + 600, endSec: start + 780)]),
+            ("full", [SavedWorkoutSpan(startSec: start, endSec: end)]),
+            ("partialBefore", [SavedWorkoutSpan(startSec: start - 300, endSec: start + 180)]),
+            ("partialAfter", [SavedWorkoutSpan(startSec: end - 180, endSec: end + 300)]),
+            ("enclosing", [SavedWorkoutSpan(startSec: start - 300, endSec: end + 300)]),
+            ("touchStart", [SavedWorkoutSpan(startSec: start - 180, endSec: start)]),
+            ("touchEnd", [SavedWorkoutSpan(startSec: end, endSec: end + 180)]),
+            ("disjoint", [SavedWorkoutSpan(startSec: start - 180, endSec: start - 1)]),
+            ("multiple", [SavedWorkoutSpan(startSec: end, endSec: end + 180),
+                           SavedWorkoutSpan(startSec: start + 600, endSec: start + 780),
+                           SavedWorkoutSpan(startSec: start - 300, endSec: start + 180)]),
+        ]
+        var actual: [String] = []
+        for (name, saved) in cases {
+            let (results, trace) = AutoWorkoutDetector.detectTrace(hr: hr, restingBpm: 60, savedSpans: saved)
+            XCTAssertEqual(results, AutoWorkoutDetector.detect(hr: hr, restingBpm: 60, savedSpans: saved))
+            XCTAssertEqual(trace, AutoWorkoutDetector.detectTrace(
+                hr: hr, restingBpm: 60, savedSpans: Array(saved.reversed())).trace)
+            actual.append("\(name) results=\(results.count)")
+            actual += trace.filter { $0.hasPrefix("autoDetect savedOverlap ") }
+        }
+        // Verbatim standalone Swift oracle output, also pinned in the Kotlin twin.
+        XCTAssertEqual(actual.joined(separator: "\n"), """
+            short results=0
+            autoDetect savedOverlap candidateSec=5400 savedSec=180 overlapSec=180 savedToCandidate=180/5400
+            full results=0
+            autoDetect savedOverlap candidateSec=5400 savedSec=5400 overlapSec=5400 savedToCandidate=5400/5400
+            partialBefore results=0
+            autoDetect savedOverlap candidateSec=5400 savedSec=480 overlapSec=180 savedToCandidate=480/5400
+            partialAfter results=0
+            autoDetect savedOverlap candidateSec=5400 savedSec=480 overlapSec=180 savedToCandidate=480/5400
+            enclosing results=0
+            autoDetect savedOverlap candidateSec=5400 savedSec=6000 overlapSec=5400 savedToCandidate=6000/5400
+            touchStart results=0
+            autoDetect savedOverlap candidateSec=5400 savedSec=180 overlapSec=0 savedToCandidate=180/5400
+            touchEnd results=0
+            autoDetect savedOverlap candidateSec=5400 savedSec=180 overlapSec=0 savedToCandidate=180/5400
+            disjoint results=1
+            multiple results=0
+            autoDetect savedOverlap candidateSec=5400 savedSec=480 overlapSec=180 savedToCandidate=480/5400
+            autoDetect savedOverlap candidateSec=5400 savedSec=180 overlapSec=180 savedToCandidate=180/5400
+            autoDetect savedOverlap candidateSec=5400 savedSec=180 overlapSec=0 savedToCandidate=180/5400
+            """)
+    }
+
     func testTraceNamesMotionNotConfirmed() {
         // A real HR window but a flat (no-motion) series → motion-confirm gate drops it.
         let start = 1_000_000
@@ -62,6 +116,194 @@ final class AutoWorkoutDetectorTraceTests: XCTestCase {
         XCTAssertEqual(traced, plain)
         XCTAssertTrue(traced.isEmpty)
         XCTAssertTrue(lines.contains { $0.contains("verdict=dropped why=motionNotConfirmed") })
+    }
+
+    func testTraceUsesExplicitShadowPolicyWithoutChangingDefault() {
+        let start = 2_000_000
+        let hr = elapsedSpan(start, 10 * 60, 120)
+
+        XCTAssertTrue(AutoWorkoutDetector.detect(hr: hr, restingBpm: 60).isEmpty)
+        let (traced, lines) = AutoWorkoutDetector.detectTrace(
+            hr: hr, restingBpm: 60, minimumSustainedMinutes: 10.0, path: "shadow")
+
+        XCTAssertEqual(traced.count, 1)
+        XCTAssertTrue(lines.contains { $0.contains("path=shadow") })
+        XCTAssertTrue(lines.contains { $0.contains("minSustainedMin=10.0") })
+    }
+
+    func testShadowComparisonLinesAreExactAndDoNotSuppressLabels() {
+        let start = 3_000_000
+        let hr = elapsedSpan(start, 12 * 60, 120)
+        let labels = [SavedWorkoutSpan(startSec: start + 60, endSec: start + 11 * 60)]
+
+        let lines = AutoWorkoutDetector.shadowComparisonLines(
+            hr: hr, restingBpm: 60, savedSpans: labels)
+
+        XCTAssertEqual(lines, [
+            "workout shadow policy=10min candidates=1 matched=1 missed=0 unobservable=0 unmatched=0 "
+                + "medianOnsetErrorS=60 medianEndErrorS=60",
+            "workout shadow policy=12min candidates=1 matched=1 missed=0 unobservable=0 unmatched=0 "
+                + "medianOnsetErrorS=60 medianEndErrorS=60",
+            "workout shadow policy=15min candidates=0 matched=0 missed=1 unobservable=0 unmatched=0 "
+                + "medianOnsetErrorS=n/a medianEndErrorS=n/a",
+        ])
+        XCTAssertEqual(labels, [SavedWorkoutSpan(startSec: start + 60, endSec: start + 11 * 60)])
+    }
+
+    func testShadowComparisonCountsMatchedMissedAndUnmatchedIndependently() {
+        let candidates = [
+            DetectedWorkout(startSec: 100, endSec: 200, avgBpm: 120, peakBpm: 140, durationMin: 1),
+            DetectedWorkout(startSec: 500, endSec: 600, avgBpm: 125, peakBpm: 145, durationMin: 1),
+        ]
+        let labels = [
+            SavedWorkoutSpan(startSec: 200, endSec: 300), // endpoint-only contact is not a real overlap
+            SavedWorkoutSpan(startSec: 800, endSec: 900),
+        ]
+
+        XCTAssertEqual(
+            AutoWorkoutDetector.shadowComparisonLine(
+                policyMinutes: 10.0, candidates: candidates, savedSpans: labels),
+            "workout shadow policy=10min candidates=2 matched=0 missed=2 unobservable=0 unmatched=2 "
+                + "medianOnsetErrorS=n/a medianEndErrorS=n/a")
+    }
+
+    func testShadowComparisonPairsHighestOverlapOneToOneAndMediansErrors() {
+        let candidates = [
+            DetectedWorkout(startSec: 90, endSec: 210, avgBpm: 120, peakBpm: 140, durationMin: 2),
+            DetectedWorkout(startSec: 480, endSec: 640, avgBpm: 125, peakBpm: 145, durationMin: 2),
+            DetectedWorkout(startSec: 550, endSec: 615, avgBpm: 125, peakBpm: 145, durationMin: 1),
+        ]
+        let labels = [
+            SavedWorkoutSpan(startSec: 100, endSec: 200),
+            SavedWorkoutSpan(startSec: 500, endSec: 600),
+        ]
+
+        // Candidate 1 has the larger overlap with label 1 and wins it; candidate 2 remains unmatched.
+        // Pair errors are [10, 20] at onset and [10, 40] at end, giving medians 15 and 25.
+        let expected = "workout shadow policy=15min candidates=3 matched=2 missed=0 unobservable=0 unmatched=1 "
+            + "medianOnsetErrorS=15 medianEndErrorS=25"
+        XCTAssertEqual(
+            AutoWorkoutDetector.shadowComparisonLine(
+                policyMinutes: 15.0, candidates: candidates, savedSpans: labels),
+            expected)
+        XCTAssertEqual(
+            AutoWorkoutDetector.shadowComparisonLine(
+                policyMinutes: 15.0, candidates: Array(candidates.reversed()),
+                savedSpans: Array(labels.reversed())),
+            expected,
+            "shadow matching must not depend on database/union ordering")
+    }
+
+    func testShadowComparisonTieBreakIsInvariantToInputOrdering() {
+        let candidates = [
+            DetectedWorkout(startSec: 50, endSec: 150, avgBpm: 120, peakBpm: 140, durationMin: 1),
+            DetectedWorkout(startSec: 100, endSec: 150, avgBpm: 125, peakBpm: 145, durationMin: 1),
+            DetectedWorkout(startSec: 1_000, endSec: 1_100, avgBpm: 130, peakBpm: 150, durationMin: 1),
+        ]
+        let labels = [
+            SavedWorkoutSpan(startSec: 100, endSec: 200),
+            SavedWorkoutSpan(startSec: 950, endSec: 1_050),
+            SavedWorkoutSpan(startSec: 1_000, endSec: 1_050),
+        ]
+        // Equal-overlap optima use the canonical Hungarian tie-break: onset errors [0, 50],
+        // end errors [50, 50]. Reversing either source list must retain that same assignment.
+        let expected = "workout shadow policy=10min candidates=3 matched=2 missed=1 unobservable=0 unmatched=1 "
+            + "medianOnsetErrorS=25 medianEndErrorS=50"
+
+        XCTAssertEqual(
+            AutoWorkoutDetector.shadowComparisonLine(
+                policyMinutes: 10.0, candidates: candidates, savedSpans: labels),
+            expected)
+        XCTAssertEqual(
+            AutoWorkoutDetector.shadowComparisonLine(
+                policyMinutes: 10.0, candidates: Array(candidates.reversed()),
+                savedSpans: Array(labels.reversed())),
+            expected)
+    }
+
+    func testShadowComparisonMaximizesMatchCountBeforeOverlapPreference() {
+        let candidates = [
+            DetectedWorkout(startSec: 0, endSec: 600, avgBpm: 120, peakBpm: 140, durationMin: 10),
+            DetectedWorkout(startSec: 900, endSec: 1_500, avgBpm: 125, peakBpm: 145, durationMin: 10),
+        ]
+        let labels = [
+            SavedWorkoutSpan(startSec: 0, endSec: 1_000),
+            SavedWorkoutSpan(startSec: 0, endSec: 500),
+        ]
+
+        XCTAssertEqual(
+            AutoWorkoutDetector.shadowComparisonLine(
+                policyMinutes: 10.0, candidates: candidates, savedSpans: labels),
+            "workout shadow policy=10min candidates=2 matched=2 missed=0 unobservable=0 unmatched=0 "
+                + "medianOnsetErrorS=450 medianEndErrorS=300")
+    }
+
+    func testShadowComparisonMaximizesTotalOverlapAfterCardinality() {
+        let candidates = [
+            DetectedWorkout(startSec: 0, endSec: 100, avgBpm: 120, peakBpm: 140, durationMin: 1),
+            DetectedWorkout(startSec: 50, endSec: 110, avgBpm: 125, peakBpm: 145, durationMin: 1),
+        ]
+        let labels = [
+            SavedWorkoutSpan(startSec: 0, endSec: 100),
+            SavedWorkoutSpan(startSec: 90, endSec: 120),
+        ]
+
+        // The diagonal assignment overlaps for 100 + 20 seconds. The other maximum-cardinality
+        // assignment overlaps for only 10 + 50 seconds and must not skew the boundary medians.
+        XCTAssertEqual(
+            AutoWorkoutDetector.shadowComparisonLine(
+                policyMinutes: 10.0, candidates: candidates, savedSpans: labels),
+            "workout shadow policy=10min candidates=2 matched=2 missed=0 unobservable=0 unmatched=0 "
+                + "medianOnsetErrorS=20 medianEndErrorS=5")
+    }
+
+    func testShadowComparisonSeparatesLabelsWithoutRecordedHR() {
+        let start = 4_000_000
+        let hr = elapsedSpan(start, 12 * 60, 120)
+        let labels = [
+            SavedWorkoutSpan(startSec: start + 60, endSec: start + 11 * 60),
+            SavedWorkoutSpan(startSec: start + 5_000, endSec: start + 5_600),
+        ]
+
+        let lines = AutoWorkoutDetector.shadowComparisonLines(
+            hr: hr, restingBpm: 60, savedSpans: labels, policies: [12.0, 15.0])
+
+        XCTAssertEqual(lines, [
+            "workout shadow policy=12min candidates=1 matched=1 missed=0 unobservable=1 unmatched=0 "
+                + "medianOnsetErrorS=60 medianEndErrorS=60",
+            "workout shadow policy=15min candidates=0 matched=0 missed=1 unobservable=1 unmatched=0 "
+                + "medianOnsetErrorS=n/a medianEndErrorS=n/a",
+        ])
+    }
+
+    func testShadowComparisonDoesNotTreatTwoAdjacentSamplesAsCoverage() {
+        let sparseHR = [(ts: 5_000, bpm: 60), (ts: 5_001, bpm: 60)]
+        let label = SavedWorkoutSpan(startSec: 5_000, endSec: 5_600)
+
+        XCTAssertEqual(
+            AutoWorkoutDetector.shadowComparisonLine(
+                policyMinutes: 10.0,
+                candidates: [],
+                savedSpans: [label],
+                hrForObservability: sparseHR),
+            "workout shadow policy=10min candidates=0 matched=0 missed=0 unobservable=1 unmatched=0 "
+                + "medianOnsetErrorS=n/a medianEndErrorS=n/a")
+    }
+
+    func testShadowObservabilityUsesEachPoliciesQualificationWindow() {
+        let hr = elapsedSpan(0, 10 * 60, 60)
+        let label = SavedWorkoutSpan(startSec: 0, endSec: 15 * 60)
+
+        XCTAssertEqual(
+            AutoWorkoutDetector.shadowComparisonLine(
+                policyMinutes: 10.0, candidates: [], savedSpans: [label], hrForObservability: hr),
+            "workout shadow policy=10min candidates=0 matched=0 missed=1 unobservable=0 unmatched=0 "
+                + "medianOnsetErrorS=n/a medianEndErrorS=n/a")
+        XCTAssertEqual(
+            AutoWorkoutDetector.shadowComparisonLine(
+                policyMinutes: 15.0, candidates: [], savedSpans: [label], hrForObservability: hr),
+            "workout shadow policy=15min candidates=0 matched=0 missed=0 unobservable=1 unmatched=0 "
+                + "medianOnsetErrorS=n/a medianEndErrorS=n/a")
     }
 
     func testWorkoutsTraceLineShapes() {
@@ -79,14 +321,19 @@ final class AutoWorkoutDetectorTraceTests: XCTestCase {
             WorkoutsTrace.dedupLine(sportKey: "running", keptSource: "strap", droppedSource: "apple",
                                     keptRichness: 5, droppedRichness: 1),
             "dedup sport=running kept=strap(richness=5) dropped=apple(richness=1) (same activity, richer kept)")
-        // #975: the engine detected-bout decision line , persisted (no overlap) and dropped (overlaps a real).
+        // #1735/#2187: analytics bouts never create generic workout rows. They either remain analytics-only
+        // or enrich/drop against a real manual/imported workout.
         XCTAssertEqual(
-            WorkoutsTrace.detectedBoutLine(verdict: "persisted", durMin: 42, avgBpm: 148),
-            "detectedBout verdict=persisted durMin=42 avgBpm=148")
+            WorkoutsTrace.detectedBoutLine(verdict: "analyticsOnly", durMin: 42, avgBpm: 148),
+            "detectedBout verdict=analyticsOnly durMin=42 avgBpm=148")
         XCTAssertEqual(
             WorkoutsTrace.detectedBoutLine(verdict: "droppedOverlap", durMin: 42, avgBpm: 148,
                                                  overlapSource: "manual"),
             "detectedBout verdict=droppedOverlap durMin=42 avgBpm=148 overlapSource=manual")
+        XCTAssertEqual(
+            WorkoutsTrace.detectedBoutLine(verdict: "droppedOverlapBackfilled", durMin: 42, avgBpm: 148,
+                                            overlapSource: "apple"),
+            "detectedBout verdict=droppedOverlapBackfilled durMin=42 avgBpm=148 overlapSource=apple")
     }
 
     func testWorkoutsReadoutParsesLastSession() {

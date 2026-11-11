@@ -102,4 +102,35 @@ class HrvAnalyzerSampleOrdTest {
         assertEquals(38, HrvAnalyzer.pct(3, 8))
         assertEquals(0, HrvAnalyzer.pct(0, 0))
     }
+
+    /**
+     * `deliveryHistogram` feeds `pct` a whole night's BEAT-TIME IN MILLISECONDS, not a row count, and
+     * `part * 200` needs more than 32 bits past 10,737,418 ms. The numbers below are one real MG night
+     * (34,002 beats, meanNN 1044 ms, multiSec 23%): before the widening `part * 200` wrapped and this
+     * returned -16, a percentage of a positive subset of a positive total that cannot be negative.
+     *
+     * The existing cases above cannot reach it - the largest `rrMs` anywhere in this file is 1309.0 - so
+     * the overflow sat behind a green suite on Android while the 64-bit Swift twin read correctly.
+     */
+    @Test fun pctSurvivesAWholeNightOfBeatTime() {
+        assertEquals(43, HrvAnalyzer.pct(15_264_177, 35_498_088))
+        // The widest multi-delivery share in the same capture: 91% of a 39.9 M ms night (42,981 beats,
+        // meanNN 928 ms). Also wrapped to -16, which is what the log reported for that night.
+        assertEquals(91, HrvAnalyzer.pct(36_296_594, 39_886_368))
+    }
+
+    /**
+     * The 32-bit wrap did not always produce a NEGATIVE percentage, so "is it negative" was never a
+     * sound test for an affected capture - which matters for anyone re-reading pre-fix Android logs.
+     *
+     * These pin the exact boundary and the readable-wrong case. The bound is `part * 200 + total`
+     * exceeding `Int.MAX_VALUE`, not `part * 200` alone: 10,683,998 was still computed correctly in 32
+     * bits, 10,683,999 wrapped to -100, and a 100% multi-share 8 h night wrapped to 25 - positive,
+     * plausible, and wrong by 75 points. Twin of Swift `testPctWrapWasNotAlwaysNegative`.
+     */
+    @Test fun pctWrapWasNotAlwaysNegative() {
+        assertEquals(100, HrvAnalyzer.pct(10_683_998, 10_683_998)) // last total 32 bits still got right
+        assertEquals(100, HrvAnalyzer.pct(10_683_999, 10_683_999)) // first that wrapped, to -100
+        assertEquals(100, HrvAnalyzer.pct(28_800_000, 28_800_000)) // wrapped to 25, not to anything negative
+    }
 }
