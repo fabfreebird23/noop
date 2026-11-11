@@ -1002,7 +1002,7 @@ private fun MoreScreen(onNavigate: (String) -> Unit) {
         // Mirror the iOS More page: each group is a tappable UPPERCASE overline header (with a disclosure
         // chevron) over a single grouped white NoopCard whose rows are tight (accent icon + title +
         // chevron) and separated by inset hairlines (NOT loose NavigationDrawerItems on the bare surface).
-        drawerGroups.forEach { group ->
+        com.noop.onyx.OnyxFocus.moreGroups(drawerGroups).forEach { group -> // FORK: Onyx Focus
             val isOpen = expanded[group.header] ?: group.defaultExpanded
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 MoreGroupHeader(
@@ -1144,7 +1144,10 @@ private fun GlassBottomBar(
     // One binding, used by BOTH the slots and the More-lit predicate below. #2218's note applies here
     // twice over: a second copy of "which tabs exist" is what let Coach light two slots at once, and a
     // conditional tab makes that failure available again to anyone who filters in one place only.
-    val visibleTrailing = barTrailingTabsFor(BottomBarStyleStore.coachEnabled)
+    // FORK: Onyx Focus replaces the tab set; the More-lit predicate below follows automatically.
+    val leadingTabs = com.noop.onyx.OnyxFocus.barTabs ?: barLeadingTabs
+    val visibleTrailing = if (com.noop.onyx.OnyxFocus.barTabs != null) emptyList()
+        else barTrailingTabsFor(BottomBarStyleStore.coachEnabled)
     val barShape = RoundedCornerShape(50)
     Box(
         modifier = modifier
@@ -1184,7 +1187,7 @@ private fun GlassBottomBar(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
             ) {
-                barLeadingTabs.forEach { tab ->
+                leadingTabs.forEach { tab ->
                     BarSlot(
                         icon = tab.icon,
                         label = stringResource(tab.labelRes),
@@ -1212,7 +1215,7 @@ private fun GlassBottomBar(
                     // Derived from the bar's own lists rather than restated. Spelling the tabs out here
                     // is what made adding Coach a two-part change: the slot alone would have lit Coach
                     // AND More together, because this predicate had never heard of it. (#2218)
-                    active = barLeadingTabs.none { it.dest == current } &&
+                    active = leadingTabs.none { it.dest == current } &&
                         visibleTrailing.none { it.dest == current },
                     modifier = Modifier.weight(1f),
                     onClick = { onTabSelected(Destination.More) },

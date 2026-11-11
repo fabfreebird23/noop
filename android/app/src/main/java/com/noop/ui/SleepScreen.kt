@@ -418,7 +418,7 @@ fun SleepScreen(
             val lastPrompted = prefs.getString(NoopPrefs.KEY_LAST_JOURNAL_PROMPT, "")
             if (lastPrompted != today) {
                 prefs.edit().putString(NoopPrefs.KEY_LAST_JOURNAL_PROMPT, today).apply()
-                showJournalPrompt = true
+                if (com.noop.onyx.OnyxFocus.showsMorningJournalPrompt) showJournalPrompt = true // FORK: Onyx Focus
             }
         }
     }

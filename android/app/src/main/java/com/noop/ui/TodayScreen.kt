@@ -1642,7 +1642,7 @@ fun TodayScreen(
         // neighbours as it crosses their centres (the screen-level frame loop also auto-scrolls at the
         // viewport edges and keeps swapping while it does), and the order persists on drop. The stagger
         // index follows the section's live position.
-        sectionOrder.filterNot { it in hiddenSections }.forEach { section ->
+        com.noop.onyx.OnyxFocus.sections(sectionOrder.filterNot { it in hiddenSections }).forEach { section -> // FORK: Onyx Focus
             // Entrance stagger keyed on the section's FIXED default position, not its live position: the
             // stagger only matters on first appearance (staggeredAppear latches), and a live-position
             // stagger changes every moved section's content lambda on every mid-drag swap — recomposing
@@ -1735,7 +1735,7 @@ fun TodayScreen(
                             // #1001: the shared resolution, not a fourth hand-rolled copy of it. Stays null
                             // for a navigated past day so the caption is a TODAY-only explanation.
                             val todayEffort = if (selectedDayOffset == 0) effortForDay else null
-                            if (todayEffort != null && todayEffort < 1.0) {
+                            if (!com.noop.onyx.OnyxFocus.hidesCardioFootnote && todayEffort != null && todayEffort < 1.0) { // FORK: Onyx Focus
                                 Row(
                                     modifier = Modifier.padding(horizontal = 2.dp),
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -1775,7 +1775,12 @@ fun TodayScreen(
                         // The plain-English read-out, the Charge-tinted Synthesis card. Mirrors the iOS
                         // Synthesis InsightCard; carries the last scored day's read at the rollover (#543).
                         TodaySection.SYNTHESIS -> Box(modifier = Modifier.fillMaxWidth().staggeredAppear(stagger)) {
-                            SynthesisHeroCard(
+                            // FORK: Onyx Focus says it in one sentence instead of a card + chips.
+                            if (com.noop.onyx.OnyxFocus.active) com.noop.onyx.OnyxFocus.DailyLine(
+                                recovery = displayMetric?.recovery ?: lastScoredCharge?.value,
+                                target = optimalFractionRange(displayMetric?.recovery),
+                                strainMax = if (effortScale == EffortScale.WHOOP) 21.0 else 100.0,
+                            ) else SynthesisHeroCard(
                                 day = displayMetric,
                                 recoveryCalibration = recoveryCalibration,
                                 carriedDay = lastScoredRecoveryDay,
@@ -1832,7 +1837,7 @@ fun TodayScreen(
                                     stepsCalibrationPrompt = stepsCalibrationPrompt(context, profileStore),
                                     restScore = restScoreForDay,
                                     restSpark = restCompositeSpark,
-                                    enabledMetrics = enabledKeyMetrics,
+                                    enabledMetrics = com.noop.onyx.OnyxFocus.keyMetrics ?: enabledKeyMetrics, // FORK: Onyx Focus
                                     isToday = selectedDayOffset == 0,
                                     // #1164: today's Rest is provisional while the strap has banked records
                                     // not yet offloaded — the Rest tile shows "Pending sync" instead of a number.
@@ -1950,7 +1955,8 @@ fun TodayScreen(
         // Strap battery only while the link is up AND a real reading exists, a stale % from a
         // dropped connection must not present as live (#159).
         item {
-            TodaySourcesSection(
+            // FORK: Onyx Focus drops the provenance footer from Today; it stays in More → Data Sources.
+            if (!com.noop.onyx.OnyxFocus.hidesSourcesFooter) TodaySourcesSection(
                 footer,
                 // NOT routed through LiveConsoleReadout.batteryPercent, which substitutes the RING's charge
                 // for a non-WHOOP active device. That is right for a readout that names the active device,
