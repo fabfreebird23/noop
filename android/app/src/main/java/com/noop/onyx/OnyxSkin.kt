@@ -90,6 +90,10 @@ object OnyxSkin {
         0.667f to bandGreen, 1.000f to bandGreen,
     )
 
+    /** Sleep in its own violet, not on the recovery scale. NOOP tints the Sleep score with
+     *  recoveryColor; banded, a 94 Sleep turned the same green as Recovery and the two read as one. */
+    val sleepTint: Color? get() = if (active) Palette.restColor else null
+
     // MARK: - Type
 
     private val barlowCondensed by lazy {

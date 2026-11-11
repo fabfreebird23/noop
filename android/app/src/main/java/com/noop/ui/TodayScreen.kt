@@ -3168,7 +3168,7 @@ private fun ScoreHeroRow(
                             HeroScoreVessel(
                                 fraction = (restScore ?: 0.0) / 100.0,
                                 value = restScore ?: 0.0,
-                                tint = Palette.recoveryColor(restScore ?: 0.0),
+                                tint = com.noop.onyx.OnyxSkin.sleepTint ?: Palette.recoveryColor(restScore ?: 0.0), // FORK: Onyx sleep violet
                                 diameter = ring,
                                 showsValue = restScore != null,
                                 animated = heroVesselsAnimated,
@@ -6034,7 +6034,7 @@ private fun MetricGrid(
             // send — which on a continuously-banking strap is most of the day.
             value = restScore?.let { "${it.roundToInt()}" } ?: NO_DATA,
             unit = if (restScore != null) "%" else "",
-            tint = restScore?.let { Palette.recoveryColor(it) } ?: Palette.restColor,
+            tint = com.noop.onyx.OnyxSkin.sleepTint ?: (restScore?.let { Palette.recoveryColor(it) } ?: Palette.restColor), // FORK: Onyx sleep violet
             frac = restScore?.let { (it / 100.0).coerceIn(0.0, 1.0) },
             spark = restSpark,
             // Composed from the two shipped strings rather than a third one needing four translations.
