@@ -294,7 +294,16 @@ fun TrendsScreen(vm: AppViewModel) {
                     resolved = rhr,
                     fmt = { "${it.roundToInt()}" },
                 )
-                MetricTrendCard(
+                // FORK: Onyx Focus charts Sleep here; Strain's trend is in Week in review and the Strain tab.
+                if (com.noop.onyx.OnyxFocus.active) MetricTrendCard(
+                    title = stringResource(R.string.trends_rest), unit = "%",
+                    color = Palette.restColor,
+                    tint = Palette.restColor,
+                    tipColor = Palette.restBright,
+                    higherIsBetter = true,
+                    resolved = rest,
+                    fmt = { "${it.roundToInt()}" },
+                ) else MetricTrendCard(
                     // Plotted values stay on the stored 0–100 scale (line shape unchanged); only the displayed
                     // numbers + unit follow the Effort-scale toggle, converted inside `fmt`. (#268)
                     title = stringResource(R.string.trends_effort), unit = "/ ${UnitFormatter.effortScaleMax(effortScale)}",
@@ -312,12 +321,12 @@ fun TrendsScreen(vm: AppViewModel) {
         // --- Long-horizon training load (CTL/ATL/TSB). Full history, not the range window — chronic
         // load is inherently a 42-day horizon. Shows an honest "needs N more days" state until enough
         // contiguous Effort history exists. Twin of the Apple TrainingLoadCard. ---
-        item {
+        if (!com.noop.onyx.OnyxFocus.active) item { // FORK: Onyx Focus keeps Trends to the big four
             TrainingLoadCard(days = days, modifier = Modifier.staggeredAppear(index = 5))
         }
 
         // --- Recovery history strip (stands in for the macOS YearHeatStrip) ---
-        item {
+        if (!com.noop.onyx.OnyxFocus.active) item { // FORK: Onyx Focus
             Column(modifier = Modifier.staggeredAppear(index = 6)) {
                 RecoveryHistoryCard(days = days, range = range)
             }
@@ -326,7 +335,7 @@ fun TrendsScreen(vm: AppViewModel) {
         // --- Export trends report (#436) , the shareable offline PDF exporter. Mirrors the iOS
         // TrendsView.exportReportRow footer; the same composable Settings hosts, so both surfaces
         // offer it. Routed through NoopButton like every other CTA (no gold). ---
-        item {
+        if (!com.noop.onyx.OnyxFocus.active) item { // FORK: Onyx Focus (export also lives in Settings)
             Column(modifier = Modifier.staggeredAppear(index = 7)) {
                 TrendsReportExportSection(vm)
             }

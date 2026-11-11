@@ -133,6 +133,22 @@ object OnyxFocus {
         }
     }
 
+    // MARK: - Names
+
+    private val nameSwaps = listOf(
+        Regex("\\bCharge\\b") to "Recovery", Regex("\\bEffort\\b") to "Strain", Regex("\\bRest\\b") to "Sleep",
+        Regex("\\beffort\\b") to "strain",
+    )
+
+    /**
+     * WHOOP's score names over NOOP's, for text built in code rather than read from resources (the
+     * resource overlay in src/release covers those). Called ONLY at sites already checked to be about the
+     * scores: applied blindly it would rename the battery's "charge" and the interval timer's "Rest".
+     * Follows [OnyxSkin.ENABLED], the same switch as the overlay's names, not the layout switch.
+     */
+    fun scoreNames(text: String): String =
+        if (!OnyxSkin.ENABLED) text else nameSwaps.fold(text) { acc, (re, to) -> re.replace(acc, to) }
+
     // MARK: - Prompts
 
     /** The once-a-morning "Open Journal" sheet on the Sleep screen. */

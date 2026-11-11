@@ -166,7 +166,8 @@ fun WorkoutsScreen(vm: AppViewModel) {
     val lastHistorySyncAt by vm.lastHistorySyncAt.collectAsStateWithLifecycle()
     // Cached daily metrics — the Charge side of the post-log activity-cost note (#439).
     val recentDays by vm.recentDays.collectAsStateWithLifecycle()
-    var range by remember { mutableStateOf(WorkoutRange.All) }
+    // FORK: Onyx Focus opens the Strain tab on this week, not all-time history.
+    var range by remember { mutableStateOf(if (com.noop.onyx.OnyxFocus.active) WorkoutRange.Week else WorkoutRange.All) }
     // Pick the default range ONCE on first non-empty load; later mutations must not fight a range the
     // user chose. Mirrors macOS, which sets the default only in `.task` / first onAppear.
     var didPickDefaultRange by remember { mutableStateOf(false) }
@@ -242,7 +243,8 @@ fun WorkoutsScreen(vm: AppViewModel) {
     }
     LaunchedEffect(allRows) {
         if (!didPickDefaultRange && allRows.isNotEmpty()) {
-            range = defaultRange(allRows)
+            // FORK: Onyx Focus always opens on this week; upstream picks the tightest range with 2+ sessions.
+            range = if (com.noop.onyx.OnyxFocus.active) WorkoutRange.Week else defaultRange(allRows)
             didPickDefaultRange = true
         }
     }
@@ -736,7 +738,7 @@ private fun EffortHero(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(18.dp),
             ) {
-                Overline("Typical effort", color = Palette.effortColor)
+                Overline(com.noop.onyx.OnyxFocus.scoreNames("Typical effort"), color = Palette.effortColor) // FORK: Onyx names
                 Box(modifier = Modifier.size(140.dp), contentAlignment = Alignment.Center) {
                     LiquidVessel(
                         value = fraction,
@@ -1897,7 +1899,7 @@ private fun RecoveryTrendChart(
 private fun SessionEffortCard(strain: Double, effortScale: EffortScale) {
     val shown = UnitFormatter.effortValue(strain, effortScale)
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.space8)) {
-        SectionHeader("Effort", overline = "This session")
+        SectionHeader(com.noop.onyx.OnyxFocus.scoreNames("Effort"), overline = "This session") // FORK: Onyx names
         NoopCard(tint = Palette.effortColor) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -1920,7 +1922,7 @@ private fun SessionEffortCard(strain: Double, effortScale: EffortScale) {
                         color = Palette.effortBright,
                     )
                     Text(
-                        if (effortScale == EffortScale.WHOOP) "strain (0-21)" else "Effort (0-100)",
+                        if (effortScale == EffortScale.WHOOP) "strain (0-21)" else com.noop.onyx.OnyxFocus.scoreNames("Effort (0-100)"),
                         style = NoopType.footnote,
                         color = Palette.textTertiary,
                     )

@@ -1241,7 +1241,7 @@ private val LIQUID_HERO_RADIUS: Dp = 26.dp
 @Composable
 private fun RestHero(score: Double?, asleepMin: Double?, source: String, overline: String) {
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
-        SectionHeader("Sleep performance", overline = overline, trailing = "Rest")
+        SectionHeader("Sleep performance", overline = overline, trailing = com.noop.onyx.OnyxFocus.scoreNames("Rest")) // FORK: Onyx names
         Box(
             modifier = Modifier
                 .fillMaxWidth()

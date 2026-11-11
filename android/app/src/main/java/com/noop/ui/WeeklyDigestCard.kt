@@ -184,7 +184,7 @@ fun WeeklyDigestContent(digest: WeeklyDigest, compact: Boolean = false) {
         // Focal points — the plain-English read, most salient first.
         if (digest.focalPoints.isNotEmpty()) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                digest.focalPoints.forEach { FocalRow(it) }
+                digest.focalPoints.forEach { FocalRow(com.noop.onyx.OnyxFocus.scoreNames(it)) } // FORK: Onyx names
             }
         }
 
@@ -207,7 +207,7 @@ fun WeeklyDigestContent(digest: WeeklyDigest, compact: Boolean = false) {
                         color = Palette.textTertiary,
                     )
                 }
-                Text(digest.balance.sentence, style = NoopType.footnote, color = Palette.textTertiary)
+                Text(com.noop.onyx.OnyxFocus.scoreNames(digest.balance.sentence), style = NoopType.footnote, color = Palette.textTertiary)
                 Text(
                     uiString(R.string.l10n_weekly_digest_card_informational_only_not_medical_advice_593feb77),
                     style = NoopType.footnote,
