@@ -35,3 +35,19 @@ Fonts: `app/src/main/res/font/onyx_barlow_condensed_*.ttf`, SIL OFL 1.1 (`app/sr
 the repo's `fork-debug.keystore`, the same key upstream's staging builds use. So it installs over an
 upstream staging build in place, keeping all data, and an upstream staging build can later be installed
 back over it, provided its version code is not lower.
+
+## Onyx Focus (layout)
+
+`app/src/main/java/com/noop/onyx/OnyxFocus.kt`, its own switch (`OnyxFocus.ENABLED`), independent of the
+colours and applied in Light mode too. Hooks are tagged `// FORK: Onyx Focus` / `// FORK: Onyx names`:
+
+- **Today** (`TodayScreen.kt`): only Hero, a one-line read (in place of Synthesis), and five key metrics
+  (HRV, resting HR, respiratory, blood oxygen, skin temp). Cardio footnote and provenance footer off.
+- **Bar** (`AppRoot.kt`): Today · Sleep · Strain (Workouts) · Trends · More. Coach gets a More row.
+- **Trends** (`TrendsScreen.kt`): Week in review, Recovery, HRV, resting HR, Sleep. Training load,
+  calendar and export off the tab.
+- **Strain** (`WorkoutsScreen.kt`): opens on 7 days.
+- **Sleep** (`SleepScreen.kt`): no morning "Open Journal" sheet.
+- **Names in code** (`WeeklyDigestCard.kt`, Workouts, Sleep): `OnyxFocus.scoreNames(...)`, call sites only.
+
+Nothing is deleted and no preference is rewritten: switch it off and the wearer's saved layout returns.
