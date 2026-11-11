@@ -1776,11 +1776,15 @@ fun TodayScreen(
                         // Synthesis InsightCard; carries the last scored day's read at the rollover (#543).
                         TodaySection.SYNTHESIS -> Box(modifier = Modifier.fillMaxWidth().staggeredAppear(stagger)) {
                             // FORK: Onyx Focus says it in one sentence instead of a card + chips.
-                            if (com.noop.onyx.OnyxFocus.active) com.noop.onyx.OnyxFocus.DailyLine(
-                                recovery = displayMetric?.recovery ?: lastScoredCharge?.value,
-                                target = optimalFractionRange(displayMetric?.recovery),
-                                strainMax = if (effortScale == EffortScale.WHOOP) 21.0 else 100.0,
-                            ) else SynthesisHeroCard(
+                            if (com.noop.onyx.OnyxFocus.active) Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                com.noop.onyx.OnyxFocus.DailyLine(
+                                    recovery = displayMetric?.recovery ?: lastScoredCharge?.value,
+                                    target = optimalFractionRange(displayMetric?.recovery),
+                                    strainMax = if (effortScale == EffortScale.WHOOP) 21.0 else 100.0,
+                                )
+                                // FORK: Onyx Body Age, the stored weekly body_age + Pace of Aging.
+                                com.noop.onyx.OnyxBodyAge.Card(viewModel, days, profileStore)
+                            } else SynthesisHeroCard(
                                 day = displayMetric,
                                 recoveryCalibration = recoveryCalibration,
                                 carriedDay = lastScoredRecoveryDay,

@@ -231,14 +231,6 @@ object DashboardUploader {
         result
     }
 
-    /**
-     * Read the last [LOOKBACK_DAYS] of dailyMetric + sleepSession straight out
-     * of Room, as-is.
-     *
-     * Uses the EXISTING two-bounded queries with an open upper bound rather
-     * than adding `...Since` methods, specifically so `WhoopDao.kt` — a shared
-     * upstream file — stays untouched and rebases cleanly.
-     */
     /** Does the dashboard already hold rows for this source?
      *
      * Failing OPEN (returning true) on any error is deliberate: if the status
@@ -359,6 +351,14 @@ object DashboardUploader {
         )
     }
 
+    /**
+     * Read the last [lookbackDays] of dailyMetric + sleepSession straight out
+     * of Room, as-is.
+     *
+     * Uses the EXISTING two-bounded queries with an open upper bound rather
+     * than adding `...Since` methods, specifically so `WhoopDao.kt` — a shared
+     * upstream file — stays untouched and rebases cleanly.
+     */
     private suspend fun buildPayload(context: Context, lookbackDays: Long): String? {
         val dao = WhoopDatabase.get(context).whoopDao()
         val active = dao.activeDeviceId() ?: DEFAULT_DEVICE_ID
