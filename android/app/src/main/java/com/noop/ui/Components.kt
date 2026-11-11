@@ -145,6 +145,11 @@ fun Modifier.frostedCardSurface(
         .drawBehind {
             val radiusPx = cornerRadius.toPx()
             val corner = androidx.compose.ui.geometry.CornerRadius(radiusPx, radiusPx)
+            // FORK: Onyx draws every card as glass (com.noop.onyx.OnyxSkin.drawGlassCard).
+            if (com.noop.onyx.OnyxSkin.active) {
+                com.noop.onyx.OnyxSkin.drawGlassCard(this, corner, op, tint)
+                return@drawBehind
+            }
             val fill = Palette.surfaceRaised.copy(alpha = Palette.surfaceRaised.alpha * op)
             val border = Palette.hairline.copy(alpha = Palette.hairline.alpha * op)
 
@@ -975,7 +980,10 @@ fun BevelGauge(
  * "No Data" read with one consistent size + weight. Mirrors iOS `GlowRing.centerFont(diameter:)`.
  */
 fun glowRingCenterTextStyle(diameter: Dp, color: Color = Palette.textPrimary): TextStyle =
-    TextStyle(fontWeight = FontWeight.Bold, fontSize = (diameter.value * 0.36f).sp, color = color)
+    TextStyle(
+        fontFamily = com.noop.onyx.OnyxSkin.numeralFamily, // FORK: Onyx numerals
+        fontWeight = FontWeight.Bold, fontSize = (diameter.value * 0.36f).sp, color = color,
+    )
 
 @Composable
 fun GlowRing(
@@ -1093,6 +1101,8 @@ fun GlowRing(
                         // past each round cap: on a saturated arc (the gold Charge hero) it read as a misaligned
                         // double edge rather than a glow. Flat crisp arc only, exactly like iOS GlowRing.
                         //
+                        // FORK: Onyx's soft halo under the arc (no-op unless the skin is active).
+                        com.noop.onyx.OnyxSkin.drawArcGlow(this, color, tl, arcSize, stroke, sweep)
                         // The crisp, solid arc — from 12 o'clock clockwise.
                         drawArc(
                             color = color, startAngle = -90f, sweepAngle = sweep, useCenter = false,

@@ -109,7 +109,8 @@ object Palette {
 
     /** Ordered gradient stops for the recovery scale (Titanium gold, or Classic red→green). */
     val recoveryStops: List<Pair<Float, Color>>
-        get() = if (isClassic) classic.recovery
+        get() = com.noop.onyx.OnyxSkin.recoveryStopsOrNull() // FORK: Onyx banded recovery
+            ?: if (isClassic) classic.recovery
                 else listOf(0.00f to recovery000, 0.30f to recovery030, 0.55f to recovery055, 0.78f to recovery078, 1.00f to recovery100)
 
     // Strain / Effort ramp.
@@ -473,7 +474,8 @@ object NoopType {
     /** Display 64–80 / Bold — the recovery ring number. Tight tracking (≈ -0.04em),
      *  tabular figures so a changing value never reflows. Mirrors StrandFont.display. */
     fun display(size: Float = 72f) = TextStyle(
-        fontFamily = sans, fontWeight = FontWeight.Bold, fontSize = size.sp,
+        fontFamily = com.noop.onyx.OnyxSkin.numeralFamily ?: sans, // FORK: Onyx numerals
+        fontWeight = FontWeight.Bold, fontSize = size.sp,
         letterSpacing = displayTracking(size).sp, fontFeatureSettings = "tnum",
     )
 
@@ -501,7 +503,8 @@ object NoopType {
     /** A numeric style at an arbitrary size — the house sans with TABULAR figures
      *  ('tnum') so live values don't reflow. Mirrors StrandFont.number. */
     fun number(size: Float, weight: FontWeight = FontWeight.SemiBold) = TextStyle(
-        fontFamily = sans, fontWeight = weight, fontSize = size.sp, fontFeatureSettings = "tnum",
+        fontFamily = com.noop.onyx.OnyxSkin.numeralFamily ?: sans, // FORK: Onyx numerals
+        fontWeight = weight, fontSize = size.sp, fontFeatureSettings = "tnum",
     )
 
     fun mono(size: Float, weight: FontWeight = FontWeight.Normal) = TextStyle(
@@ -582,7 +585,8 @@ fun NoopTheme(content: @Composable () -> Unit) {
         AppearanceMode.DARK -> true
         AppearanceMode.SYSTEM -> isSystemInDarkTheme()
     }
-    val tokens = if (dark) DarkTokens else LightTokens
+    // FORK: Onyx skin (com.noop.onyx) replaces the dark scheme; light is untouched.
+    val tokens = com.noop.onyx.OnyxSkin.tokensFor(dark)
     if (Palette.active !== tokens) Palette.active = tokens
 
     // Status-/nav-bar icon appearance: light icons on the dark theme, dark icons on the warm-paper

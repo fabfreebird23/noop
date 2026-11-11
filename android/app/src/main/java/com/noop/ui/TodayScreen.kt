@@ -3084,6 +3084,8 @@ private fun ScoreHeroRow(
                         // diameter so the self-sizing hero row is untouched; the dim + the carried "Last
                         // night · <date>" caption mark it as carried, not today's fresh score. Mirrors iOS.
                         val carried = if (recovery == null && recoveryCalibration == null) lastScoredCharge else null
+                        // FORK: hand the band colour to Onyx's backdrop glow.
+                        com.noop.onyx.OnyxSkin.PublishHeroTint((recovery ?: carried?.value)?.let { Palette.recoveryColor(it) })
                         if (carried != null) {
                             HeroScoreVessel(
                                 modifier = Modifier.alpha(0.8f),
@@ -3383,7 +3385,7 @@ private fun HeroScoreVessel(
 ) {
     val context = LocalContext.current
     val ringGauges = remember { NoopPrefs.todayRingGauges(context) }
-    if (ringGauges) {
+    if (ringGauges || com.noop.onyx.OnyxSkin.forcesRings) { // FORK: Onyx always uses rings
         GlowRing(
             fraction = fraction.coerceIn(0.0, 1.0).toFloat(),
             value = value,

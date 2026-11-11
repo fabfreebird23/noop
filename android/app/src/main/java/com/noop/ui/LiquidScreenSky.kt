@@ -59,6 +59,7 @@ fun screenBackdropSlot(
     skyBehindCards: Boolean,
 ): (@Composable () -> Unit)? = when {
     BackgroundImageStore.isActive -> { { BackgroundImageBackdrop() } }
+    com.noop.onyx.OnyxSkin.active -> { { com.noop.onyx.OnyxSkin.Backdrop() } } // FORK: Onyx ambient glow
     showDayCycleBackground -> { { LiquidScreenSky(fillHeight = skyBehindCards) } }
     else -> null
 }
@@ -68,7 +69,8 @@ fun screenBackdropSlot(
 fun screenBackdropFullBleed(
     showDayCycleBackground: Boolean,
     skyBehindCards: Boolean,
-): Boolean = BackgroundImageStore.isActive || (showDayCycleBackground && skyBehindCards)
+): Boolean = BackgroundImageStore.isActive || com.noop.onyx.OnyxSkin.active || // FORK: Onyx glow bleeds full-screen
+    (showDayCycleBackground && skyBehindCards)
 
 /** The reusable liquid sky backdrop for a liquid screen's top region. Drop it into a scaffold's
  *  `topBackground` slot. [height] is the sky band; the sky fades into the theme canvas within it, so the
